@@ -1,0 +1,155 @@
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&family=Inter:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+/* Custom dark variant selector for Tailwind CSS v4 class strategy */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * "Cognitive Clarity" design tokens — clinical-calm editorial identity:
+ * muted sage, charcoal, deep navy headings, soft gray body, stone cards,
+ * mid-green CTA. Overriding Tailwind's built-in palette names (rather than
+ * inventing new ones) means every existing slate/violet/indigo/cyan
+ * utility across the app repaints automatically.
+ */
+@theme {
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-serif: 'Fraunces', 'Iowan Old Style', Georgia, 'Times New Roman', serif;
+
+  /* Stone/gray/navy — card bg (#F4F1EC), body gray (#4A4A4A), heading navy (#1E3A4C) */
+  --color-slate-50: #FAF8F5;
+  --color-slate-100: #F4F1EC;
+  --color-slate-200: #E4DED4;
+  --color-slate-300: #C9C0B0;
+  --color-slate-400: #8E8A82;
+  --color-slate-500: #6B6B6B;
+  --color-slate-600: #4A4A4A;
+  --color-slate-700: #383838;
+  --color-slate-800: #272727;
+  --color-slate-850: #1F2A30;
+  --color-slate-900: #1E3A4C;
+  --color-slate-950: #14252F;
+
+  /* Forest — deep sage accent for interactive/active states, replaces violet */
+  --color-violet-50: #EEF3F1;
+  --color-violet-100: #D4E3DE;
+  --color-violet-200: #A9C7BE;
+  --color-violet-300: #7DAA9D;
+  --color-violet-400: #588F80;
+  --color-violet-500: #3F7566;
+  --color-violet-600: #305C50;
+  --color-violet-700: #294A41;
+  --color-violet-800: #223D36;
+  --color-violet-900: #1C332D;
+  --color-violet-950: #0F1D19;
+
+  /* CTA green (#3D8B37), replaces indigo/brass */
+  --color-indigo-50: #EEF6ED;
+  --color-indigo-100: #D3EBD0;
+  --color-indigo-200: #A8D6A1;
+  --color-indigo-300: #7BC073;
+  --color-indigo-400: #55A94C;
+  --color-indigo-500: #3D8B37;
+  --color-indigo-600: #337030;
+  --color-indigo-700: #2A5A28;
+  --color-indigo-800: #234A22;
+  --color-indigo-900: #1D3D1D;
+  --color-indigo-950: #0F220F;
+
+  /* Sage/eucalyptus (#8CA6A0) — page background family, replaces cyan */
+  --color-cyan-50: #EEF3F1;
+  --color-cyan-100: #DCE7E3;
+  --color-cyan-200: #BFD3CC;
+  --color-cyan-300: #A2BFB6;
+  --color-cyan-400: #8CA6A0;
+  --color-cyan-500: #75948C;
+  --color-cyan-600: #5E7B73;
+  --color-cyan-700: #4B635C;
+  --color-cyan-800: #3A4C47;
+  --color-cyan-900: #2B3733;
+  --color-cyan-950: #1A211F;
+
+  /* Soft rounded corners throughout, 12-20px */
+  --radius-2xl: 0.75rem;
+  --radius-3xl: 1.25rem;
+}
+
+:root {
+  color-scheme: light;
+}
+
+:root.dark {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom smooth transition transitions for theme switches */
+.theme-transition {
+  transition: background-color 0.5s ease, border-color 0.3s ease, color 0.3s ease, box-shadow 0.3s ease;
+}
+
+/* Hide scrollbars for layouts where needed but maintain scrollability */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Flat "paper card" surfaces — replaces heavy glassmorphism blur */
+.glass-panel-light {
+  background: #FFFFFF;
+  border: 1px solid rgba(58, 50, 38, 0.1);
+}
+
+.glass-panel-dark {
+  background: #211C13;
+  border: 1px solid rgba(230, 223, 210, 0.08);
+}
+
+/* Fine paper-grain texture for hero/brand surfaces */
+.paper-grain {
+  background-image: radial-gradient(rgba(0, 0, 0, 0.35) 0.5px, transparent 0.5px);
+  background-size: 3px 3px;
+}
+
+/* Premium Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.5);
+}
+
+/* 3D Flashcard flip utility classes */
+.perspective-1000 {
+  perspective: 1000px;
+}
+.transform-style-3d {
+  transform-style: preserve-3d;
+}
+.backface-hidden {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+.rotate-y-180 {
+  transform: rotateY(180deg);
+}

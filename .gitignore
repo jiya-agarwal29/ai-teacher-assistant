@@ -1,0 +1,27 @@
+# Environment files
+.env
+
+# Python virtual environments
+venv/
+.venv/
+backend/venv/
+backend/.venv/
+
+# Node modules
+node_modules/
+frontend/node_modules/
+
+# Build folders
+dist/
+build/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code
+.vscode/
+
+# Local dev database (recreated automatically on first run)
+*.db
+*.sqlite3
