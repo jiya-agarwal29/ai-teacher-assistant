@@ -254,5 +254,34 @@ export const api = {
       const queryParams = new URLSearchParams({ topic });
       return request(`/generate-quiz?${queryParams.toString()}`);
     }
+  },
+
+  tools: {
+    /**
+     * POST /tools/summarize {text} — summarizes pasted text only, no retrieval.
+     */
+    summarize: (text) => request('/tools/summarize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    }),
+
+    /**
+     * POST /tools/flashcards {topic} — builds cards from the user's own documents.
+     */
+    flashcards: (topic) => request('/tools/flashcards', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic }),
+    }),
+
+    /**
+     * POST /tools/tutor {question} — same grounded pipeline as /chat, plain question.
+     */
+    tutor: (question) => request('/tools/tutor', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    }),
   }
 };

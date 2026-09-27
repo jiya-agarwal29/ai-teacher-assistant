@@ -10,7 +10,16 @@ from sqlalchemy.orm import Session
 import json
 
 from embeddings import create_embeddings
-from rag import generate_answer, generate_quiz, check_context_relevance, synthesize_educational_response
+from rag import (
+    generate_answer,
+    generate_quiz,
+    check_context_relevance,
+    synthesize_educational_response,
+    summarize_text_in_bullets,
+    extract_definitions_and_statements,
+    clean_pdf_text_for_quiz,
+    clean_extracted_text
+)
 from document_parsers import parse_document, chunk_parsed_document
 from retrieval import retrieve, invalidate_cache, user_has_documents
 
@@ -60,10 +69,24 @@ ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".pptx", ".doc", ".ppt", ".txt", "
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
 
+MAX_SUMMARIZE_CHARS = 20000
+
 
 class RegisterRequest(BaseModel):
     username: str
     password: str
+
+
+class SummarizeRequest(BaseModel):
+    text: str
+
+
+class FlashcardsRequest(BaseModel):
+    topic: str
+
+
+class TutorRequest(BaseModel):
+    question: str
 
 
 # -----------------------------
@@ -379,13 +402,12 @@ def semantic_search(
 # -----------------------------
 # AI CHAT
 # -----------------------------
-@app.get("/chat")
-def chat_with_pdf(
-    question: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-
+def _answer_question(question: str, current_user: User, db: Session):
+    """
+    Shared retrieval + grounded-answer pipeline used by both /chat and
+    /tools/tutor — same behaviour, just two different entry points for the
+    same plain question (no prefix is added anywhere in this pipeline).
+    """
     if not user_has_documents(db, current_user.id):
         return {
             "message": "No documents uploaded"
@@ -454,6 +476,110 @@ def chat_with_pdf(
         "answer": answer,
         "sources": sources
     }
+
+
+@app.get("/chat")
+def chat_with_pdf(
+    question: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    return _answer_question(question, current_user, db)
+
+
+# -----------------------------
+# AI TOOLS: SUMMARIZER, FLASHCARDS, TUTOR
+# -----------------------------
+@app.post("/tools/summarize")
+def summarize_notes(
+    payload: SummarizeRequest,
+    current_user: User = Depends(get_current_user)
+):
+    text = payload.text.strip()
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Please provide some text to summarize.")
+
+    if len(text) > MAX_SUMMARIZE_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Text is too long ({len(text)} characters). Maximum is {MAX_SUMMARIZE_CHARS} characters."
+        )
+
+    bullets = summarize_text_in_bullets(text)
+
+    return {"bullets": bullets}
+
+
+@app.post("/tools/flashcards")
+def generate_flashcards(
+    payload: FlashcardsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    topic = payload.topic.strip()
+
+    if not topic:
+        raise HTTPException(status_code=400, detail="Please provide a topic.")
+
+    if not user_has_documents(db, current_user.id):
+        return {"cards": [], "message": "No documents uploaded yet."}
+
+    top_pages = retrieve(db, current_user.id, topic, top_k=5, apply_threshold=True)
+
+    combined_text = "\n".join(page.content for _, page in top_pages)
+    if not combined_text.strip():
+        return {"cards": [], "message": "No relevant content found in your documents for this topic."}
+
+    cleaned = clean_pdf_text_for_quiz(combined_text)
+    definitions, statements = extract_definitions_and_statements(cleaned)
+
+    cards = []
+    seen_terms = set()
+
+    for d in definitions:
+        term = clean_extracted_text(d["term"])
+        key = term.lower()
+        if key in seen_terms:
+            continue
+        cards.append({
+            "term": term,
+            "definition": clean_extracted_text(d["explanation"]),
+            "source": clean_extracted_text(d["raw"])
+        })
+        seen_terms.add(key)
+        if len(cards) >= 10:
+            break
+
+    if len(cards) < 10:
+        for s in statements:
+            if len(cards) >= 10:
+                break
+            words = s.split()
+            term = " ".join(words[:3]) if len(words) > 3 else s
+            key = term.lower()
+            if key in seen_terms:
+                continue
+            cards.append({
+                "term": term,
+                "definition": clean_extracted_text(s),
+                "source": clean_extracted_text(s)
+            })
+            seen_terms.add(key)
+
+    if not cards:
+        return {"cards": [], "message": "No relevant content found in your documents for this topic."}
+
+    return {"cards": cards}
+
+
+@app.post("/tools/tutor")
+def ai_tutor(
+    payload: TutorRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    return _answer_question(payload.question, current_user, db)
 
 
 @app.get("/generate-quiz")

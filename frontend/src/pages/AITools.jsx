@@ -27,7 +27,8 @@ export default function AITools() {
     setQuizResult(null);
     setQuizQuestions([]);
     setSemanticResult(null);
-    setSummarizerResult('');
+    setSummarizerResult(null);
+    setFlashcardMessage('');
     setTutorResult('');
     setError('');
   };
@@ -38,7 +39,7 @@ export default function AITools() {
   // -----------------------------
   // TOOL 1: QUIZ GENERATOR STATE
   // -----------------------------
-  const [quizTopic, setQuizTopic] = useState('Database Indexing');
+  const [quizTopic, setQuizTopic] = useState('');
   const [quizResult, setQuizResult] = useState(null);
   const [quizQuestions, setQuizQuestions] = useState([]);
   const [selectedAnswers, setSelectedAnswers] = useState({}); // { questionId: selectedOptionLetter }
@@ -81,45 +82,6 @@ export default function AITools() {
     return { correctCount, totalCount, percentage };
   };
 
-  // Fallback interactive mock quiz in case Flan-T5 output is empty/unparseable
-  const sampleQuizQuestions = [
-    {
-      id: 1,
-      question: "Which Normal Form resolves multi-valued dependencies?",
-      options: [
-        "First Normal Form (1NF)",
-        "Third Normal Form (3NF)",
-        "Boyce-Codd Normal Form (BCNF)",
-        "Fourth Normal Form (4NF)"
-      ],
-      correctAnswer: "D",
-      explanation: "Fourth Normal Form (4NF) specifically targets and eliminates multi-valued dependencies, which occur when one attribute depends independently on multiple other attributes."
-    },
-    {
-      id: 2,
-      question: "In transaction management, what does the 'I' in ACID stand for?",
-      options: [
-        "Integrity",
-        "Isolation",
-        "Consistency",
-        "Idempotency"
-      ],
-      correctAnswer: "B",
-      explanation: "ACID stands for Atomicity, Consistency, Isolation, and Durability. Isolation ensures that concurrently executing transactions do not interfere with each other."
-    },
-    {
-      id: 3,
-      question: "Which schedule scheduler algorithm has the shortest average waiting time?",
-      options: [
-        "First-Come, First-Served (FCFS)",
-        "Shortest Job First (SJF)",
-        "Round Robin (RR)",
-        "Priority Scheduling"
-      ],
-      correctAnswer: "B",
-      explanation: "Shortest Job First (SJF) is mathematically optimal, proving the minimum average waiting time for a given set of processes."
-    }
-  ];
 
   // Quiz parsing helper
   const parseQuizText = (rawText) => {
@@ -263,20 +225,19 @@ export default function AITools() {
   // TOOL 3: NOTES SUMMARIZER STATE
   // -----------------------------
   const [summarizerText, setSummarizerText] = useState('');
-  const [summarizerResult, setSummarizerResult] = useState('');
+  const [summarizerResult, setSummarizerResult] = useState(null);
 
   const handleSummarize = async (e) => {
     e.preventDefault();
     if (!summarizerText.trim()) return;
 
     setIsLoading(true);
-    setSummarizerResult('');
+    setSummarizerResult(null);
     setError('');
 
     try {
-      // In the backend, summarizing can be done via chat context
-      const res = await api.chat.send(`Summarize this text in bullet points: ${summarizerText}`);
-      setSummarizerResult(res.answer || res.message);
+      const res = await api.tools.summarize(summarizerText);
+      setSummarizerResult(res.bullets || []);
     } catch (err) {
       setError(err.message || 'Summarization failed.');
     } finally {
@@ -303,33 +264,30 @@ export default function AITools() {
     });
   };
 
+  const [flashcardMessage, setFlashcardMessage] = useState('');
+
   const handleGenerateFlashcards = async (e) => {
     e.preventDefault();
     if (!flashcardTopic.trim()) return;
 
     setIsLoading(true);
     setError('');
+    setFlashcardMessage('');
 
     try {
-      // Prompt AI to generate terms
-      const res = await api.chat.send(`Extract 3 key flashcard terms (Term vs brief explanation) for the topic: "${flashcardTopic}". Format as Term: Explanation.`);
-      
-      const text = res.answer || res.message;
-      const lines = text.split('\n').filter(l => l.includes(':'));
-      
-      if (lines.length > 0) {
-        const generated = lines.map((line, idx) => {
-          const parts = line.split(':');
-          return {
-            id: Date.now() + idx,
-            front: parts[0].replace(/^\d+[\.\s]*/, '').trim(),
-            back: parts.slice(1).join(':').trim()
-          };
-        });
-        setFlashcards(generated);
+      const res = await api.tools.flashcards(flashcardTopic);
+      const cards = (res.cards || []).map((c, idx) => ({
+        id: Date.now() + idx,
+        front: c.term,
+        back: c.definition,
+        source: c.source
+      }));
+      setFlashcards(cards);
+      if (cards.length === 0) {
+        setFlashcardMessage(res.message || 'No flashcards could be generated for this topic.');
       }
     } catch (err) {
-      setError('Could not generate custom flashcards. Using reference cards.');
+      setError(err.message || 'Could not generate flashcards.');
     } finally {
       setIsLoading(false);
     }
@@ -350,7 +308,7 @@ export default function AITools() {
     setError('');
 
     try {
-      const res = await api.chat.send(`Acting as a professional professor, answer this question clearly: ${tutorPrompt}`);
+      const res = await api.tools.tutor(tutorPrompt);
       setTutorResult(res.answer || res.message);
     } catch (err) {
       setError(err.message || 'Tutor session failed.');
@@ -711,19 +669,6 @@ export default function AITools() {
                     {quizResult}
                   </pre>
                   
-                  {/* Option to load mock questions to play inside UI */}
-                  <div className="mt-4 p-4 rounded-2xl bg-violet-600/5 border border-violet-500/10 flex flex-col sm:flex-row justify-between items-center gap-3">
-                    <div className="text-left">
-                      <h4 className="text-xs font-bold text-violet-600 dark:text-violet-400">Interactive Mode Sandbox</h4>
-                      <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-1">Play the interactive quiz sandbox using high-fidelity pre-compiled databases.</p>
-                    </div>
-                    <button
-                      onClick={() => setQuizQuestions(sampleQuizQuestions)}
-                      className="px-4 py-2 bg-violet-600 hover:bg-violet-500 text-white rounded-xl text-xs font-bold transition-all shadow-sm shadow-violet-500/10"
-                    >
-                      Play Sandbox Test
-                    </button>
-                  </div>
                 </div>
               ) : (
                 // First entry helper
@@ -834,15 +779,23 @@ export default function AITools() {
                 </form>
               </div>
 
-              {summarizerResult && (
+              {summarizerResult !== null && (
                 <div className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm space-y-3">
                   <h4 className="text-xs font-bold text-slate-950 dark:text-white flex items-center gap-2">
                     <Sparkles size={14} className="text-violet-500" />
                     AI Summary Results
                   </h4>
-                  <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/20 text-xs text-slate-600 dark:text-slate-300 leading-relaxed border whitespace-pre-wrap select-all font-sans">
-                    {summarizerResult}
-                  </div>
+                  {summarizerResult.length > 0 ? (
+                    <ul className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/20 text-xs text-slate-600 dark:text-slate-300 leading-relaxed border space-y-2 list-disc pl-8 font-sans">
+                      {summarizerResult.map((bullet, idx) => (
+                        <li key={idx} className="select-all">{bullet}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/20 text-xs text-slate-500 dark:text-slate-400 border">
+                      Could not generate a summary for this text.
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -869,6 +822,12 @@ export default function AITools() {
                   </button>
                 </form>
               </div>
+
+              {flashcardMessage && (
+                <div className="p-6 text-center text-xs text-slate-400 dark:text-slate-500 bg-white/20 border border-slate-200 dark:border-slate-800 rounded-[28px]">
+                  {flashcardMessage}
+                </div>
+              )}
 
               {/* Flashcards Grid with Flip Effects */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 pt-4">

@@ -109,6 +109,35 @@ def generate_focused_answer(context, prompt_instruction, max_tokens=120):
         return ""
     return res
 
+def summarize_text_in_bullets(text: str, piece_words: int = 350) -> list:
+    """
+    Summarizes arbitrary pasted text (not retrieved document context) into
+    one bullet per ~350-word piece, using the local model. Every bullet is
+    grounded in that piece of the user's own text — nothing else is added.
+    """
+    words = text.split()
+    pieces = []
+    current_piece = []
+    for w in words:
+        current_piece.append(w)
+        if len(current_piece) >= piece_words:
+            pieces.append(" ".join(current_piece))
+            current_piece = []
+    if current_piece:
+        pieces.append(" ".join(current_piece))
+
+    bullets = []
+    for piece in pieces:
+        summary = clean_extracted_text(generate_focused_answer(
+            piece,
+            "Summarize this text in one clear, concise sentence.",
+            max_tokens=60
+        ))
+        if summary:
+            bullets.append(summary)
+
+    return bullets
+
 def generate_answer(context, question):
     """
     Generates a concise, document-grounded answer using the local Flan-T5 model.
