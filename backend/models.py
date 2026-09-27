@@ -1,8 +1,6 @@
 from sqlalchemy import Column, Integer, String, Text, ForeignKey
 from sqlalchemy.orm import relationship
 from database import Base
-from auth import hash_password, verify_password, create_access_token
-from fastapi import HTTPException
 
 class Book(Base):
     __tablename__ = "books"

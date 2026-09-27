@@ -1,12 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-import pdfplumber
 import json
 import numpy as np
 
 from embeddings import create_embedding
-from rag import generate_answer, generate_quiz, paraphrase_concept, check_context_relevance, synthesize_educational_response
+from rag import generate_answer, generate_quiz, check_context_relevance, synthesize_educational_response
 from document_parsers import parse_document, chunk_parsed_document
 
 from database import engine, SessionLocal
@@ -38,74 +37,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 Base.metadata.create_all(bind=engine)
-
-
-# -----------------------------
-# TEXT CHUNKING FUNCTION
-# -----------------------------
-import re
-
-def clean_pdf_text(text: str) -> str:
-    if not text:
-        return ""
-    
-    # Normalize line endings
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-    lines = text.split('\n')
-    cleaned_lines = []
-    
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        
-        # Filter page numbers (e.g. "page 12", "12", "12 of 120")
-        if re.match(r'^(page\s+)?\d+(\s+of\s+\d+)?$', stripped, re.IGNORECASE):
-            continue
-            
-        # Standardize spaces
-        cleaned_line = re.sub(r'[ \t]+', ' ', stripped)
-        cleaned_lines.append(cleaned_line)
-        
-    return "\n".join(cleaned_lines)
-
-def split_text(text: str, chunk_size=120, overlap=25) -> list:
-    cleaned = clean_pdf_text(text)
-    if not cleaned:
-        return []
-        
-    lines = cleaned.split('\n')
-    chunks = []
-    current_chunk_lines = []
-    current_word_count = 0
-    
-    for line in lines:
-        line_words = line.split()
-        if not line_words:
-            continue
-            
-        line_word_count = len(line_words)
-        
-        if current_word_count + line_word_count > chunk_size and current_chunk_lines:
-            chunk_text = "\n".join(current_chunk_lines)
-            chunks.append(chunk_text)
-            
-            # Preserve the last line for overlap
-            if len(current_chunk_lines) > 1:
-                current_chunk_lines = current_chunk_lines[-1:]
-                current_word_count = len(current_chunk_lines[0].split())
-            else:
-                current_chunk_lines = []
-                current_word_count = 0
-                
-        current_chunk_lines.append(line)
-        current_word_count += line_word_count
-        
-    if current_chunk_lines:
-        chunk_text = "\n".join(current_chunk_lines)
-        chunks.append(chunk_text)
-        
-    return chunks
 
 
 # -----------------------------
