@@ -1,14 +1,15 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 import json
-import numpy as np
 
 from embeddings import create_embedding
 from rag import generate_answer, generate_quiz, check_context_relevance, synthesize_educational_response
 from document_parsers import parse_document, chunk_parsed_document
+from retrieval import retrieve, invalidate_cache
 
-from database import engine, SessionLocal
+from database import engine, get_db
 from models import Base, Book, Page, User
 
 from auth import (
@@ -19,7 +20,6 @@ from auth import (
 )
 
 app = FastAPI()
-chat_memory = []
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -65,17 +65,13 @@ def health_check():
 # REGISTER
 # -----------------------------
 @app.post("/register")
-def register(username: str, password: str):
-
-    db = SessionLocal()
+def register(username: str, password: str, db: Session = Depends(get_db)):
 
     existing_user = db.query(User).filter(
         User.username == username
     ).first()
 
     if existing_user:
-
-        db.close()
 
         raise HTTPException(
             status_code=400,
@@ -92,8 +88,6 @@ def register(username: str, password: str):
     db.add(new_user)
     db.commit()
 
-    db.close()
-
     return {
         "message": "User registered successfully"
     }
@@ -104,18 +98,15 @@ def register(username: str, password: str):
 # -----------------------------
 @app.post("/login")
 def login(
-    form_data: OAuth2PasswordRequestForm = Depends()
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
 ):
-
-    db = SessionLocal()
 
     user = db.query(User).filter(
         User.username == form_data.username
     ).first()
 
     if not user:
-
-        db.close()
 
         raise HTTPException(
             status_code=401,
@@ -127,8 +118,6 @@ def login(
         user.password
     ):
 
-        db.close()
-
         raise HTTPException(
             status_code=401,
             detail="Invalid password"
@@ -137,8 +126,6 @@ def login(
     token = create_access_token(
         data={"sub": user.username}
     )
-
-    db.close()
 
     return {
         "access_token": token,
@@ -152,10 +139,9 @@ def login(
 @app.post("/upload-book")
 async def upload_book(
     file: UploadFile = File(...),
-    current_user: str = Depends(get_current_user)
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-
-    db = SessionLocal()
 
     try:
         # Save book
@@ -167,7 +153,7 @@ async def upload_book(
 
         # Parse document using our modular document parser
         pages_data = parse_document(file.file, file.filename)
-        
+
         # Chunk pages semantically
         chunks = chunk_parsed_document(pages_data)
 
@@ -193,6 +179,7 @@ async def upload_book(
                 continue
 
         db.commit()
+        invalidate_cache()
         return {
             "status": "Document uploaded and chunked successfully",
             "book_id": new_book.id
@@ -205,21 +192,17 @@ async def upload_book(
             detail=f"Failed to process document file: {str(e)}"
         )
 
-    finally:
-        db.close()
-
 
 # -----------------------------
 # GET ALL BOOKS
 # -----------------------------
 @app.get("/books")
-def get_books(current_user: str = Depends(get_current_user)):
-
-    db = SessionLocal()
+def get_books(
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
 
     books = db.query(Book).all()
-
-    db.close()
 
     return [
         {
@@ -236,18 +219,15 @@ def get_books(current_user: str = Depends(get_current_user)):
 @app.delete("/books/{book_id}")
 def delete_book(
     book_id: int,
-    current_user: str = Depends(get_current_user)
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-
-    db = SessionLocal()
 
     book = db.query(Book).filter(
         Book.id == book_id
     ).first()
 
     if not book:
-
-        db.close()
 
         raise HTTPException(
             status_code=404,
@@ -261,7 +241,7 @@ def delete_book(
 
     db.delete(book)
     db.commit()
-    db.close()
+    invalidate_cache()
 
     return {
         "status": "Book and associated chunks deleted successfully"
@@ -272,15 +252,11 @@ def delete_book(
 # NORMAL SEARCH
 # -----------------------------
 @app.get("/search")
-def search_content(query: str):
-
-    db = SessionLocal()
+def search_content(query: str, db: Session = Depends(get_db)):
 
     results = db.query(Page).filter(
         Page.content.ilike(f"%{query}%")
     ).all()
-
-    db.close()
 
     if not results:
 
@@ -306,55 +282,17 @@ def search_content(query: str):
 @app.get("/semantic-search")
 def semantic_search(
     query: str,
-    current_user: str = Depends(get_current_user)
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
 
-    db = SessionLocal()
-
-    pages = db.query(Page).all()
-
-    if not pages:
-
-        db.close()
+    if not db.query(Page.id).first():
 
         return {
             "message": "No documents available"
         }
 
-    query_vector = create_embedding(query)
-
-    similarities = []
-
-    for page in pages:
-
-        if not page.embedding:
-            continue
-
-        try:
-
-            page_vector = np.array(
-                json.loads(page.embedding)
-            )
-
-            score = np.dot(
-                query_vector,
-                page_vector
-            )
-
-            similarities.append((score, page))
-
-        except Exception:
-            continue
-
-    similarities.sort(
-        reverse=True,
-        key=lambda x: x[0]
-    )
-
-
-    top_pages = similarities[:3]
-
-    db.close()
+    top_pages = retrieve(db, query, top_k=3, apply_threshold=False)
 
     return [
         {
@@ -375,296 +313,115 @@ def semantic_search(
 @app.get("/chat")
 def chat_with_pdf(
     question: str,
-    current_user: str = Depends(get_current_user)
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
 
-    db = SessionLocal()
-
-    try:
-        pages = db.query(Page).all()
-
-        if not pages:
-            return {
-                "message": "No documents uploaded"
-            }
-
-        # Create embedding for question
-        query_vector = create_embedding(question)
-
-        similarities = []
-
-        # Compare embeddings
-        for page in pages:
-
-            if not page.embedding:
-                continue
-
-            try:
-
-                page_vector = np.array(
-                    json.loads(page.embedding)
-                )
-
-                score = np.dot(
-                    query_vector,
-                    page_vector
-                )
-
-                similarities.append((score, page))
-
-            except Exception:
-                continue
-
-        # Sort similarities
-        similarities.sort(
-            reverse=True,
-            key=lambda x: x[0]
-        )
-
-        # Filter weak matches and apply relative retrieval thresholding
-        filtered_results = []
-        if similarities:
-            top_score = similarities[0][0]
-            for score, page in similarities:
-                if score > 0.22:
-                    if top_score > 0.40:
-                        if score >= top_score - 0.18:
-                            filtered_results.append((score, page))
-                    else:
-                        filtered_results.append((score, page))
-
-        # Deduplicate retrieved chunks (Jaccard similarity > 0.5 is considered duplicate)
-        top_pages = []
-        seen_contents = []
-        for score, page in filtered_results:
-            is_duplicate = False
-            page_words = set(page.content.lower().split())
-            if not page_words:
-                continue
-                
-            for seen_text in seen_contents:
-                seen_words = set(seen_text.lower().split())
-                if seen_words:
-                    intersection = page_words.intersection(seen_words)
-                    union = page_words.union(seen_words)
-                    overlap = len(intersection) / len(union)
-                    if overlap > 0.5:
-                        is_duplicate = True
-                        break
-            if not is_duplicate:
-                top_pages.append((score, page))
-                seen_contents.append(page.content)
-                if len(top_pages) >= 3: # Retrieve max 3 distinct chunks
-                    break
-
-        # Relevance checking using both cosine similarity and lexical overlap
-        temp_context = " ".join([page.content for _, page in top_pages])
-        if not top_pages or not check_context_relevance(question, temp_context, top_pages[0][0]):
-            answer = "The uploaded documents do not contain enough information for this question."
-            chat_memory.append({
-                "role": "assistant",
-                "content": answer
-            })
-            return {
-                "question": question,
-                "answer": answer,
-                "sources": []
-            }
-
-        # Retrieve recent memory
-        recent_memory = "\n".join([
-            f"{msg['role']}: {msg['content']}"
-            for msg in chat_memory[-6:]
-        ])
-
-        # Build PDF context
-        pdf_context = "\n\n".join([
-            f"--- Document Source Block ---\n{page.content}"
-            for score, page in top_pages
-        ])
-
-        # Combine memory + PDF context
-        context = f"""
-Conversation History:
-{recent_memory}
-
-PDF Context:
-{pdf_context}
-"""
-
-        # Store user message in history
-        chat_memory.append({
-            "role": "user",
-            "content": question
-        })
-
-        # Generate AI answer (Flan-T5 generated definition/direct answer)
-        direct_answer = generate_answer(
-            pdf_context,
-            question
-        )
-
-        if not direct_answer or "do not contain enough information" in direct_answer.lower():
-            answer = "The uploaded documents do not contain enough information for this question."
-            chat_memory.append({
-                "role": "assistant",
-                "content": answer
-            })
-            return {
-                "question": question,
-                "answer": answer,
-                "sources": []
-            }
-
-        # Resolve topic from book name
-        first_book_id = top_pages[0][1].book_id
-        book_obj = db.query(Book).filter(Book.id == first_book_id).first()
-        topic = book_obj.name.split('.')[0] if book_obj else "Uploaded Material"
-
-        # Synthesize a beautiful, multi-paragraph ChatGPT-style response using hybrid techniques
-        answer = synthesize_educational_response(question, top_pages, direct_answer, topic)
-
-        # Store AI response
-        chat_memory.append({
-            "role": "assistant",
-            "content": answer
-        })
-
-        # Build sources
-        sources = []
-
-        for score, page in top_pages:
-
-            book = db.query(Book).filter(
-                Book.id == page.book_id
-            ).first()
-
-            if book:
-
-                sources.append({
-                    "book_name": book.name,
-                    "page_number": page.page_number,
-                    "chunk_number": page.chunk_number,
-                    "similarity_score": round(float(score), 4)
-                })
-
+    if not db.query(Page.id).first():
         return {
-            "question": question,
-            "answer": answer,
-            "sources": sources
+            "message": "No documents uploaded"
         }
 
-    finally:
-        db.close()
+    top_pages = retrieve(db, question, top_k=3, apply_threshold=True)
+
+    # Relevance checking using both cosine similarity and lexical overlap
+    temp_context = " ".join([page.content for _, page in top_pages])
+    if not top_pages or not check_context_relevance(question, temp_context, top_pages[0][0]):
+        return {
+            "question": question,
+            "answer": "The uploaded documents do not contain enough information for this question.",
+            "sources": []
+        }
+
+    # Build PDF context
+    pdf_context = "\n\n".join([
+        f"--- Document Source Block ---\n{page.content}"
+        for score, page in top_pages
+    ])
+
+    # Generate AI answer (Flan-T5 generated definition/direct answer)
+    direct_answer = generate_answer(
+        pdf_context,
+        question
+    )
+
+    if not direct_answer or "do not contain enough information" in direct_answer.lower():
+        return {
+            "question": question,
+            "answer": "The uploaded documents do not contain enough information for this question.",
+            "sources": []
+        }
+
+    # Resolve topic from book name
+    first_book_id = top_pages[0][1].book_id
+    book_obj = db.query(Book).filter(Book.id == first_book_id).first()
+    topic = book_obj.name.split('.')[0] if book_obj else "Uploaded Material"
+
+    # Synthesize a beautiful, multi-paragraph ChatGPT-style response using hybrid techniques
+    answer = synthesize_educational_response(question, top_pages, direct_answer, topic)
+
+    # Build sources
+    sources = []
+
+    for score, page in top_pages:
+
+        book = db.query(Book).filter(
+            Book.id == page.book_id
+        ).first()
+
+        if book:
+
+            sources.append({
+                "book_name": book.name,
+                "page_number": page.page_number,
+                "chunk_number": page.chunk_number,
+                "similarity_score": round(float(score), 4)
+            })
+
+    return {
+        "question": question,
+        "answer": answer,
+        "sources": sources
+    }
 
 
 @app.get("/generate-quiz")
 def generate_ai_quiz(
     topic: str,
-    current_user: str = Depends(get_current_user)
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
 
-    db = SessionLocal()
-
-    try:
-        pages = db.query(Page).all()
-
-        if not pages:
-            return {
-                "topic": topic,
-                "quiz": "Not enough information found in uploaded documents.",
-                "questions": []
-            }
-
-        query_vector = create_embedding(topic)
-
-        similarities = []
-
-        for page in pages:
-
-            if not page.embedding:
-                continue
-
-            try:
-
-                page_vector = np.array(
-                    json.loads(page.embedding)
-                )
-
-                score = np.dot(
-                    query_vector,
-                    page_vector
-                )
-
-                similarities.append((score, page))
-
-            except Exception:
-                continue
-
-        similarities.sort(
-            reverse=True,
-            key=lambda x: x[0]
-        )
-
-        # Filter weak matches and apply relative retrieval thresholding
-        filtered_results = []
-        if similarities:
-            top_score = similarities[0][0]
-            for score, page in similarities:
-                if score > 0.22:
-                    if top_score > 0.40:
-                        if score >= top_score - 0.18:
-                            filtered_results.append((score, page))
-                    else:
-                        filtered_results.append((score, page))
-
-        # Deduplicate retrieved chunks
-        top_pages = []
-        seen_contents = []
-        for score, page in filtered_results:
-            is_duplicate = False
-            page_words = set(page.content.lower().split())
-            if not page_words:
-                continue
-            for seen_text in seen_contents:
-                seen_words = set(seen_text.lower().split())
-                if seen_words:
-                    intersection = page_words.intersection(seen_words)
-                    union = page_words.union(seen_words)
-                    overlap = len(intersection) / len(union)
-                    if overlap > 0.5:
-                        is_duplicate = True
-                        break
-            if not is_duplicate:
-                top_pages.append((score, page))
-                seen_contents.append(page.content)
-                if len(top_pages) >= 3:
-                    break
-
-        # Relevance checking using both cosine similarity and lexical overlap
-        temp_context = " ".join([page.content for _, page in top_pages])
-        if not top_pages or not check_context_relevance(topic, temp_context, top_pages[0][0]):
-            return {
-                "topic": topic,
-                "quiz": "Not enough information found in uploaded documents.",
-                "questions": []
-            }
-
-        context = "\n\n".join([
-            page.content
-            for score, page in top_pages
-        ])
-
-        quiz_text, questions = generate_quiz(
-            context,
-            topic
-        )
-
+    if not db.query(Page.id).first():
         return {
             "topic": topic,
-            "quiz": quiz_text,
-            "questions": questions
+            "quiz": "Not enough information found in uploaded documents.",
+            "questions": []
         }
 
-    finally:
-        db.close()
+    top_pages = retrieve(db, topic, top_k=3, apply_threshold=True)
+
+    # Relevance checking using both cosine similarity and lexical overlap
+    temp_context = " ".join([page.content for _, page in top_pages])
+    if not top_pages or not check_context_relevance(topic, temp_context, top_pages[0][0]):
+        return {
+            "topic": topic,
+            "quiz": "Not enough information found in uploaded documents.",
+            "questions": []
+        }
+
+    context = "\n\n".join([
+        page.content
+        for score, page in top_pages
+    ])
+
+    quiz_text, questions = generate_quiz(
+        context,
+        topic
+    )
+
+    return {
+        "topic": topic,
+        "quiz": quiz_text,
+        "questions": questions
+    }
