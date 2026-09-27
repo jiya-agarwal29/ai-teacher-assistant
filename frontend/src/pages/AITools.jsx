@@ -18,6 +18,17 @@ import {
   BookMarked
 } from 'lucide-react';
 
+// Shared by calculateScore() and the inline ✅/❌ display so both agree on
+// what counts as a correct fill-in-the-blank answer. Ignores a leading
+// article and trailing punctuation so "a process" / "process." / "The
+// process" don't fail on formatting alone — still an exact match on the
+// actual word(s), not fuzzy grading.
+const normalizeFillBlankAnswer = (s) => (s || '')
+  .trim()
+  .toLowerCase()
+  .replace(/^(a|an|the)\s+/i, '')
+  .replace(/[.,!?;:'"]+$/, '');
+
 export default function AITools() {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = searchParams.get('tab') || 'quiz';
@@ -58,17 +69,7 @@ export default function AITools() {
           correctCount++;
         }
       } else if (q.type === 'fill_blank') {
-        // Ignore a leading article and trailing punctuation so "a process"
-        // vs "process." vs "The process" don't fail on formatting alone —
-        // still an exact match on the actual word(s), not fuzzy grading.
-        const normalize = (s) => (s || '')
-          .trim()
-          .toLowerCase()
-          .replace(/^(a|an|the)\s+/i, '')
-          .replace(/[.,!?;:'"]+$/, '');
-        const userAnswer = normalize(fillBlankAnswers[q.id]);
-        const correctAnswer = normalize(q.correctAnswer);
-        if (userAnswer === correctAnswer) {
+        if (normalizeFillBlankAnswer(fillBlankAnswers[q.id]) === normalizeFillBlankAnswer(q.correctAnswer)) {
           correctCount++;
         }
       } else if (['short_answer', 'long_answer', 'scenario', 'viva', 'interview'].includes(q.type)) {
@@ -478,7 +479,7 @@ export default function AITools() {
                       if (q.type === 'mcq' || q.type === 'true_false' || !q.type) {
                         isCorrect = selectedAnswers[q.id] === q.correctAnswer;
                       } else if (q.type === 'fill_blank') {
-                        isCorrect = (fillBlankAnswers[q.id] || '').trim().toLowerCase() === (q.correctAnswer || '').trim().toLowerCase();
+                        isCorrect = normalizeFillBlankAnswer(fillBlankAnswers[q.id]) === normalizeFillBlankAnswer(q.correctAnswer);
                       } else if (['short_answer', 'long_answer', 'scenario', 'viva', 'interview'].includes(q.type)) {
                         isCorrect = shortAnswerGrades[q.id] === 'correct';
                       }

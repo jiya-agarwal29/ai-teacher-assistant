@@ -290,28 +290,38 @@ def extract_definitions_and_statements(context: str):
     definitions = []
     statements = []
     seen_terms = set()
-    
+    seen_raw = set()
+
+    def normalize_raw(text):
+        # Strips bullet/numbering markers and collapses whitespace so the
+        # same underlying line can't be captured twice — once as a bulleted
+        # definition, once again as a "statement" via the sentence split
+        # below (they operate on the same text through different regexes).
+        stripped = re.sub(r'^[-*•+]\s*', '', text.strip())
+        stripped = re.sub(r'^\d+[\.\)]\s*', '', stripped)
+        return re.sub(r'\s+', ' ', stripped).strip().lower()
+
     # 1. Extract explicit list definitions
     for line in lines:
         line_strip = line.strip()
         if not line_strip:
             continue
-            
+
         bullet_match = re.match(r'^[-*•+]\s*(.+)$', line_strip)
         numbered_match = re.match(r'^\d+[\.\)]\s*(.+)$', line_strip)
-        
+
         content_line = line_strip
         if bullet_match:
             content_line = bullet_match.group(1).strip()
         elif numbered_match:
             content_line = numbered_match.group(1).strip()
-            
+
         parts = None
         if ':' in content_line:
             parts = content_line.split(':', 1)
         elif ' - ' in content_line:
             parts = content_line.split(' - ', 1)
-            
+
         if parts:
             term = parts[0].strip()
             explanation = parts[1].strip()
@@ -325,7 +335,8 @@ def extract_definitions_and_statements(context: str):
                         "raw": line_strip
                     })
                     seen_terms.add(term_key)
-                    
+                    seen_raw.add(normalize_raw(line_strip))
+
     # 2. Extract implicit definitions (is a, refers to, etc.)
     sentences = re.split(r'(?<=[.!?])\s+', context)
     for sent in sentences:
@@ -333,17 +344,20 @@ def extract_definitions_and_statements(context: str):
         sent = re.sub(r'\s+', ' ', sent)
         if len(sent) < 35 or len(sent) > 200:
             continue
-            
+
+        if normalize_raw(sent) in seen_raw:
+            continue
+
         verb_match = re.search(r'\b(is a|is an|is defined as|refers to|represents|is the process of|acts as)\b', sent, re.IGNORECASE)
         if verb_match:
             verb = verb_match.group(1)
             idx = sent.lower().find(verb.lower())
             term = sent[:idx].strip()
             explanation = sent[idx:].strip()
-            
+
             term_clean = re.sub(r'^(an?|the)\s+', '', term, flags=re.IGNORECASE).strip()
             term_clean = re.sub(r'^[“"\'\s]+|[”"\'\s\.\,]+$', '', term_clean)
-            
+
             if 2 <= len(term_clean) <= 45 and len(explanation) >= 15:
                 term_key = term_clean.lower()
                 if term_key not in seen_terms:
@@ -353,80 +367,99 @@ def extract_definitions_and_statements(context: str):
                         "raw": sent
                     })
                     seen_terms.add(term_key)
+                    seen_raw.add(normalize_raw(sent))
         else:
             if len(sent) >= 40 and len(sent) <= 150:
                 if not any(x in sent.lower() for x in ["question:", "context:", "instructions:", "---"]) and "#" not in sent:
                     statements.append(sent)
-                    
+                    seen_raw.add(normalize_raw(sent))
+
     return definitions, statements
 
 def get_distractors(correct_explanation, definitions, statements, topic, num_needed=3):
+    """
+    Picks distinct, real-text distractors — definitions before statements —
+    and only reaches for the generic filler sentences when there truly isn't
+    enough real content, using at most one of them so the options stay
+    similar in style.
+    """
+    seen = {correct_explanation.strip().lower()}
     distractors = []
-    
+
     for d in definitions:
-        exp = d["explanation"]
-        if exp.lower() != correct_explanation.lower() and exp not in distractors:
+        exp = d["explanation"].strip()
+        key = exp.lower()
+        if key not in seen:
             distractors.append(exp)
+            seen.add(key)
             if len(distractors) >= num_needed:
                 return distractors
-                
+
     for s in statements:
-        if s.lower() not in correct_explanation.lower() and s not in distractors:
+        s = s.strip()
+        key = s.lower()
+        if key not in seen:
             distractors.append(s)
+            seen.add(key)
             if len(distractors) >= num_needed:
                 return distractors
-                
-    fallbacks = [
-        f"A design standard defined by the {topic} specification.",
-        f"A legacy protocol used in older versions of the {topic} system.",
-        f"A security extension implemented to prevent external intrusions.",
-        f"An optimization technique designed to reduce execution overhead."
-    ]
-    for fb in fallbacks:
-        if fb not in distractors and fb.lower() not in correct_explanation.lower():
-            distractors.append(fb)
-            if len(distractors) >= num_needed:
-                return distractors
-                
+
+    if len(distractors) < num_needed:
+        fallbacks = [
+            f"A design standard defined by the {topic} specification.",
+            f"A legacy protocol used in older versions of the {topic} system.",
+            f"A security extension implemented to prevent external intrusions.",
+            f"An optimization technique designed to reduce execution overhead."
+        ]
+        random.shuffle(fallbacks)
+        for fb in fallbacks:
+            if fb.lower() not in seen:
+                distractors.append(fb)
+                break  # never more than one generic filler
+
     return distractors
 
 def mask_sentence(sentence, term=None):
+    """
+    Picks the word (or, for a real extracted concept, the exact term) to
+    blank out. Never returns an answer shorter than 3 letters or a stopword.
+    """
     sentence_clean = re.sub(r'^[-*•+]\s*', '', sentence)
     sentence_clean = re.sub(r'^\d+[\.\)]\s*', '', sentence_clean)
-    
-    if term and term.lower() in sentence_clean.lower():
-        pattern = re.compile(re.escape(term), re.IGNORECASE)
-        masked = pattern.sub("________", sentence_clean)
-        return masked, term
-        
-    words = sentence_clean.split()
+
     stopwords = {"is", "are", "the", "and", "that", "this", "with", "from", "into", "acts", "between", "under", "over", "system", "software", "hardware", "user", "users"}
+
+    if term:
+        term_clean = term.strip()
+        if len(term_clean) >= 3 and term_clean.lower() not in stopwords and term_clean.lower() in sentence_clean.lower():
+            pattern = re.compile(re.escape(term_clean), re.IGNORECASE)
+            masked = pattern.sub("________", sentence_clean)
+            return masked, term_clean
+
+    words = sentence_clean.split()
     candidates = []
     for w in words:
         w_clean = re.sub(r'^\W+|\W+$', '', w)
         if len(w_clean) >= 3 and w_clean.lower() not in stopwords:
             candidates.append(w_clean)
-            
+
     if candidates:
         chosen_word = candidates[len(candidates) // 2]
         pattern = re.compile(r'\b' + re.escape(chosen_word) + r'\b', re.IGNORECASE)
         masked = pattern.sub("________", sentence_clean)
         return masked, chosen_word
-        
-    return sentence_clean, "None"
+
+    return sentence_clean, None
 
 def generate_hybrid_quiz(context, topic):
     cleaned = clean_pdf_text_for_quiz(context)
     if not cleaned or len(cleaned.strip()) < 30:
         return "Not enough information found in uploaded documents.", []
-        
+
     definitions, statements = extract_definitions_and_statements(cleaned)
 
     # Shuffle so re-generating a quiz for the same topic (clicking "Build
-    # Test" again) picks a different set of concepts instead of the exact
-    # same questions every time — get_concept() below always reads by
-    # fixed index (0, 1, 2...), so the only way to vary the output across
-    # calls is to vary the order of these lists first.
+    # Test" again) picks a different set/order of concepts each time.
     random.shuffle(definitions)
     random.shuffle(statements)
 
@@ -436,149 +469,150 @@ def generate_hybrid_quiz(context, topic):
         d["explanation"] = clean_extracted_text(d["explanation"])
 
     total_concepts = len(definitions) + len(statements)
-    if total_concepts < 2:
+    if total_concepts < 3:
         sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', cleaned) if len(s.strip()) > 20]
         random.shuffle(sentences)
         statements = sentences[:12]
         total_concepts = len(statements)
-        
-    if total_concepts < 2:
+
+    if total_concepts < 3:
         return "Not enough information found in uploaded documents.", []
-        
-    num_defs = len(definitions)
-    num_states = len(statements)
-    
-    def get_concept(index):
-        # The boolean marks whether `term` is a real extracted concept
-        # (safe to mask verbatim) or just the leading words of a raw
-        # sentence (a grammatical fragment, not a concept — must NOT be
-        # used as a fill-in-the-blank answer).
-        if num_defs > 0:
-            item = definitions[index % num_defs]
-            return item["term"], item["explanation"], item["raw"], True
-        elif num_states > 0:
-            s = statements[index % num_states]
-            words = s.split()
-            term = " ".join(words[:2]) if len(words) > 2 else "Core Concept"
-            return term, s, s, False
-        else:
-            return "Concept", "No details available.", "No details available.", False
+
+    # One entry per distinct concept — definitions first (a real term, safe
+    # to mask verbatim in fill-in-the-blank), then statements (only the
+    # leading words as a placeholder term — a grammatical fragment, never
+    # usable as an answer). Every question below is assigned a different
+    # index into this list, so no two questions test the same concept.
+    concepts = []
+    for d in definitions:
+        concepts.append((d["term"], d["explanation"], d["raw"], True))
+    for s in statements:
+        words = s.split()
+        term = " ".join(words[:2]) if len(words) > 2 else "Core Concept"
+        concepts.append((term, s, s, False))
+
+    num_questions = min(8, len(concepts))
+    question_types = [
+        "mcq", "true_false", "fill_blank", "short_answer",
+        "long_answer", "scenario", "viva", "interview"
+    ][:num_questions]
 
     questions = []
-    q_id = 1
-    
-    # 1. MCQ
-    t1, e1, r1, _ = get_concept(0)
-    dist = get_distractors(e1, definitions, statements, topic, 3)
-    options = [e1] + dist
-    random.shuffle(options)
-    correct_letter = ['A', 'B', 'C', 'D'][options.index(e1)]
-    questions.append({
-        "id": q_id,
-        "type": "mcq",
-        "question": f"Based on the study materials, what is the primary function or definition of '{t1}'?",
-        "options": options,
-        "correctAnswer": correct_letter,
-        "explanation": f"According to the notes: '{clean_extracted_text(r1)}'"
-    })
-    q_id += 1
-    
-    # 2. True/False
-    t2, e2, r2, _ = get_concept(1)
-    if num_defs >= 2:
-        questions.append({
-            "id": q_id,
-            "type": "true_false",
-            "question": f"True or False: According to the documents, '{t2}' refers to {e1.rstrip('.')}.",
-            "options": ["True", "False"],
-            "correctAnswer": "B",
-            "explanation": f"False. The document defines '{t2}' as: {e2.rstrip('.')}. Meanwhile, {e1.rstrip('.').lower()} describes '{t1}'."
-        })
-    else:
-        questions.append({
-            "id": q_id,
-            "type": "true_false",
-            "question": f"True or False: According to the documents, '{t2}' is defined as: {e2.rstrip('.')}.",
-            "options": ["True", "False"],
-            "correctAnswer": "A",
-            "explanation": f"True. The material states: '{clean_extracted_text(r2)}'"
-        })
-    q_id += 1
-    
-    # 3. Fill in the Blank
-    blank_term, blank_exp, blank_raw, blank_is_concept = get_concept(2)
-    # Only mask the extracted term itself when it's a real concept (from a
-    # definition). Otherwise `blank_term` is just the leading words of a raw
-    # sentence — masking that would make the "correct answer" a grammatical
-    # fragment (e.g. "A program") instead of a real word. Passing term=None
-    # makes mask_sentence fall back to picking an actual content word from
-    # the middle of the sentence instead.
-    mask_term = blank_term if blank_is_concept else None
-    masked_q, masked_word = mask_sentence(blank_raw, mask_term)
-    questions.append({
-        "id": q_id,
-        "type": "fill_blank",
-        "question": f"Fill in the blank: {clean_extracted_text(masked_q)}",
-        "correctAnswer": clean_extracted_text(masked_word),
-        "explanation": f"The document outlines: '{clean_extracted_text(blank_raw)}'"
-    })
-    q_id += 1
-    
-    # 4. Short Answer
-    t4, e4, r4, _ = get_concept(3)
-    questions.append({
-        "id": q_id,
-        "type": "short_answer",
-        "question": f"Explain the role and definition of '{t4}' based on the study materials.",
-        "correctAnswer": e4,
-        "explanation": f"The notes clarify that '{t4}' is defined as: '{e4}'"
-    })
-    q_id += 1
-    
-    # 5. Long Answer
-    t5, e5, r5, _ = get_concept(4)
-    questions.append({
-        "id": q_id,
-        "type": "long_answer",
-        "question": f"Describe in detail the functionality, design, or operational flow of '{t5}' as described in the documents. Explain how it interacts with other system elements.",
-        "correctAnswer": e5,
-        "explanation": f"The notes highlight: '{clean_extracted_text(r5)}'"
-    })
-    q_id += 1
-    
-    # 6. Scenario-based
-    t6, e6, r6, _ = get_concept(5)
-    questions.append({
-        "id": q_id,
-        "type": "scenario",
-        "question": f"Scenario: A system administrator notices a challenge or needs to deploy a system related to '{t6}'. Explain how '{t6}' applies in this scenario based on the document text: '{e6}'",
-        "correctAnswer": e6,
-        "explanation": f"The document states: '{clean_extracted_text(r6)}'"
-    })
-    q_id += 1
-    
-    # 7. Viva Question
-    t7, e7, r7, _ = get_concept(6)
-    questions.append({
-        "id": q_id,
-        "type": "viva",
-        "question": f"Viva Question: If an examiner asks you to summarize the core characteristics of '{t7}', how would you present it clearly and academically?",
-        "correctAnswer": e7,
-        "explanation": f"The documents note: '{clean_extracted_text(r7)}'"
-    })
-    q_id += 1
-    
-    # 8. Interview Question
-    t8, e8, r8, _ = get_concept(7)
-    questions.append({
-        "id": q_id,
-        "type": "interview",
-        "question": f"Interview Question: During a technical job interview, how would you describe the difference, importance, or implementation details of '{t8}' as covered in the study documents?",
-        "correctAnswer": e8,
-        "explanation": f"The material details: '{clean_extracted_text(r8)}'"
-    })
-    q_id += 1
-    
+
+    for i, q_type in enumerate(question_types):
+        term, explanation, raw, is_concept = concepts[i]
+
+        if q_type == "mcq":
+            dist = get_distractors(explanation, definitions, statements, topic, 3)
+            options = [explanation] + dist
+            random.shuffle(options)
+            correct_letter = ['A', 'B', 'C', 'D'][options.index(explanation)]
+            questions.append({
+                "id": len(questions) + 1,
+                "type": "mcq",
+                "question": f"Based on the study materials, what is the primary function or definition of '{term}'?",
+                "options": options,
+                "correctAnswer": correct_letter,
+                "explanation": f"According to the notes: '{clean_extracted_text(raw)}'"
+            })
+
+        elif q_type == "true_false":
+            other_idx = random.choice([j for j in range(len(concepts)) if j != i])
+            other_term, other_exp, _, _ = concepts[other_idx]
+            if random.random() < 0.5:
+                # True statement: the concept paired with its own definition.
+                questions.append({
+                    "id": len(questions) + 1,
+                    "type": "true_false",
+                    "question": f"True or False: According to the documents, '{term}' refers to {explanation.rstrip('.')}.",
+                    "options": ["True", "False"],
+                    "correctAnswer": "A",
+                    "explanation": f"True. The material states: '{clean_extracted_text(raw)}'"
+                })
+            else:
+                # False statement: the concept paired with a different concept's definition.
+                questions.append({
+                    "id": len(questions) + 1,
+                    "type": "true_false",
+                    "question": f"True or False: According to the documents, '{term}' refers to {other_exp.rstrip('.')}.",
+                    "options": ["True", "False"],
+                    "correctAnswer": "B",
+                    "explanation": f"False. The document defines '{term}' as: {explanation.rstrip('.')}. That description instead belongs to '{other_term}'."
+                })
+
+        elif q_type == "fill_blank":
+            # Only mask the extracted term itself when it's a real concept
+            # (from a definition) — otherwise `term` is just the leading
+            # words of a raw sentence, a grammatical fragment rather than a
+            # real answer. mask_sentence() also refuses stopwords/answers
+            # under 3 letters; if it can't find anything usable, skip this
+            # question rather than present a broken blank.
+            # clean_extracted_text() strips underscores, so it must run
+            # BEFORE masking — otherwise it deletes the "________" blank
+            # itself, leaving a question with no visible blank at all.
+            cleaned_raw = clean_extracted_text(raw)
+            mask_term = term if is_concept else None
+            masked_q, masked_word = mask_sentence(cleaned_raw, mask_term)
+            if not masked_word:
+                continue
+            questions.append({
+                "id": len(questions) + 1,
+                "type": "fill_blank",
+                "question": f"Fill in the blank: {masked_q}",
+                "correctAnswer": clean_extracted_text(masked_word),
+                "explanation": f"The document outlines: '{cleaned_raw}'"
+            })
+
+        elif q_type == "short_answer":
+            questions.append({
+                "id": len(questions) + 1,
+                "type": "short_answer",
+                "question": f"Explain the role and definition of '{term}' based on the study materials.",
+                "correctAnswer": explanation,
+                "explanation": f"The notes clarify that '{term}' is defined as: '{explanation}'"
+            })
+
+        elif q_type == "long_answer":
+            questions.append({
+                "id": len(questions) + 1,
+                "type": "long_answer",
+                "question": f"Describe in detail the functionality, design, or operational flow of '{term}' as described in the documents. Explain how it interacts with other system elements.",
+                "correctAnswer": explanation,
+                "explanation": f"The notes highlight: '{clean_extracted_text(raw)}'"
+            })
+
+        elif q_type == "scenario":
+            # Names the concept and a realistic situation only — the answer
+            # itself must never appear inside the question text.
+            questions.append({
+                "id": len(questions) + 1,
+                "type": "scenario",
+                "question": f"Scenario: A system administrator is working on a task involving '{term}'. Explain how '{term}' applies in this situation.",
+                "correctAnswer": explanation,
+                "explanation": f"The document states: '{clean_extracted_text(raw)}'"
+            })
+
+        elif q_type == "viva":
+            questions.append({
+                "id": len(questions) + 1,
+                "type": "viva",
+                "question": f"Viva Question: If an examiner asks you to summarize the core characteristics of '{term}', how would you present it clearly and academically?",
+                "correctAnswer": explanation,
+                "explanation": f"The documents note: '{clean_extracted_text(raw)}'"
+            })
+
+        elif q_type == "interview":
+            questions.append({
+                "id": len(questions) + 1,
+                "type": "interview",
+                "question": f"Interview Question: During a technical job interview, how would you describe the difference, importance, or implementation details of '{term}' as covered in the study documents?",
+                "correctAnswer": explanation,
+                "explanation": f"The material details: '{clean_extracted_text(raw)}'"
+            })
+
+    if len(questions) < 3:
+        return "Not enough information found in uploaded documents.", []
+
     # Format a raw text version for legacy support
     raw_text_parts = []
     for q in questions:
@@ -590,7 +624,7 @@ def generate_hybrid_quiz(context, topic):
                 raw_text_parts.append(f"{letter}. {opt}")
         raw_text_parts.append(f"Correct Answer: {q['correctAnswer']}")
         raw_text_parts.append(f"Explanation: {q['explanation']}\n")
-        
+
     quiz_text = "\n".join(raw_text_parts)
     return quiz_text, questions
 
