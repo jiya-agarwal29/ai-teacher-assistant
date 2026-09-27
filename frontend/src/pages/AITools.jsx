@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api } from '../services/api';
+import { api, userScopedKey } from '../services/api';
 import { recordQuizAttempt } from '../hooks/useQuizHistory';
 import { 
   Brain, 
@@ -216,8 +216,9 @@ export default function AITools() {
       }
 
       // Increment local stats count
-      const currentQuizCount = parseInt(localStorage.getItem('quiz_count') || '0');
-      localStorage.setItem('quiz_count', (currentQuizCount + 1).toString());
+      const quizCountKey = userScopedKey('quiz_count');
+      const currentQuizCount = parseInt(localStorage.getItem(quizCountKey) || '0');
+      localStorage.setItem(quizCountKey, (currentQuizCount + 1).toString());
     } catch (err) {
       setError(err.message || 'Failed to generate quiz. Is the backend running?');
     } finally {

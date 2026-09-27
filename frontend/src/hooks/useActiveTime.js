@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { userScopedKey } from '../services/api';
 
 // Only count time toward "study session" if the user interacted within
 // this window — an idle tab with the screen just left on doesn't count.
@@ -14,18 +15,20 @@ function todayKey() {
 }
 
 function addActiveSeconds(seconds) {
-  const total = parseInt(localStorage.getItem(TOTAL_KEY) || '0', 10) + seconds;
-  localStorage.setItem(TOTAL_KEY, String(total));
+  const totalKey = userScopedKey(TOTAL_KEY);
+  const total = parseInt(localStorage.getItem(totalKey) || '0', 10) + seconds;
+  localStorage.setItem(totalKey, String(total));
 
+  const dailyKey = userScopedKey(DAILY_KEY);
   let byDay = {};
   try {
-    byDay = JSON.parse(localStorage.getItem(DAILY_KEY) || '{}');
+    byDay = JSON.parse(localStorage.getItem(dailyKey) || '{}');
   } catch {
     byDay = {};
   }
   const key = todayKey();
   byDay[key] = (byDay[key] || 0) + seconds;
-  localStorage.setItem(DAILY_KEY, JSON.stringify(byDay));
+  localStorage.setItem(dailyKey, JSON.stringify(byDay));
 }
 
 /**
@@ -59,13 +62,13 @@ export function useActiveTimeTracker() {
 }
 
 export function getTotalActiveSeconds() {
-  return parseInt(localStorage.getItem(TOTAL_KEY) || '0', 10);
+  return parseInt(localStorage.getItem(userScopedKey(TOTAL_KEY)) || '0', 10);
 }
 
 export function getActiveSecondsInLastNDays(days) {
   let byDay = {};
   try {
-    byDay = JSON.parse(localStorage.getItem(DAILY_KEY) || '{}');
+    byDay = JSON.parse(localStorage.getItem(userScopedKey(DAILY_KEY)) || '{}');
   } catch {
     byDay = {};
   }

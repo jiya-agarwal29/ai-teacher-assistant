@@ -33,6 +33,16 @@ export const setUsername = (username) => {
 };
 
 /**
+ * Prefixes a localStorage key with the logged-in username, so per-user data
+ * (analytics, quiz/query history, saved chats) doesn't leak between accounts
+ * sharing the same browser. Falls back to the bare key when logged out.
+ */
+export const userScopedKey = (key) => {
+  const username = getUsername();
+  return username ? `${username}::${key}` : key;
+};
+
+/**
  * Core request helper that wraps fetch and automatically handles:
  * - JWT Authorization header insertion
  * - Error propagation
@@ -139,8 +149,9 @@ export const api = {
     },
     
     logout: () => {
+      // Only the token is cleared — username stays so per-user localStorage
+      // keys (analytics, history, saved chats) remain intact for next login.
       setToken(null);
-      setUsername(null);
     }
   },
   

@@ -1,3 +1,5 @@
+import { userScopedKey } from '../services/api';
+
 const TOTAL_KEY = 'queries_count';
 const DAILY_KEY = 'queries_by_day'; // { "YYYY-MM-DD": count }
 
@@ -7,7 +9,7 @@ function todayKey(date = new Date()) {
 
 function readDaily() {
   try {
-    return JSON.parse(localStorage.getItem(DAILY_KEY) || '{}');
+    return JSON.parse(localStorage.getItem(userScopedKey(DAILY_KEY)) || '{}');
   } catch {
     return {};
   }
@@ -15,17 +17,18 @@ function readDaily() {
 
 /** Call once per real question sent to the AI (e.g. on a successful Chat reply). */
 export function recordQuery() {
-  const total = parseInt(localStorage.getItem(TOTAL_KEY) || '0', 10) + 1;
-  localStorage.setItem(TOTAL_KEY, String(total));
+  const totalKey = userScopedKey(TOTAL_KEY);
+  const total = parseInt(localStorage.getItem(totalKey) || '0', 10) + 1;
+  localStorage.setItem(totalKey, String(total));
 
   const byDay = readDaily();
   const key = todayKey();
   byDay[key] = (byDay[key] || 0) + 1;
-  localStorage.setItem(DAILY_KEY, JSON.stringify(byDay));
+  localStorage.setItem(userScopedKey(DAILY_KEY), JSON.stringify(byDay));
 }
 
 export function getTotalQueries() {
-  return parseInt(localStorage.getItem(TOTAL_KEY) || '0', 10);
+  return parseInt(localStorage.getItem(userScopedKey(TOTAL_KEY)) || '0', 10);
 }
 
 /** Real per-day counts for the last N days, oldest first, for charting. */

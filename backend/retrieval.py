@@ -4,54 +4,70 @@ import numpy as np
 from sqlalchemy.orm import Session
 
 from embeddings import create_embedding
-from models import Page
+from models import Book, Page
 
-_embedding_matrix = None
-_page_ids = None
-
-
-def invalidate_cache():
-    global _embedding_matrix, _page_ids
-    _embedding_matrix = None
-    _page_ids = None
+# Per-user cache: user_id -> (embedding_matrix, page_ids)
+_cache_by_user = {}
 
 
-def _ensure_cache(db: Session):
-    global _embedding_matrix, _page_ids
+def invalidate_cache(user_id: int = None):
+    global _cache_by_user
+    if user_id is None:
+        _cache_by_user = {}
+    else:
+        _cache_by_user.pop(user_id, None)
 
-    if _embedding_matrix is not None:
+
+def user_has_documents(db: Session, user_id: int) -> bool:
+    return db.query(Page.id).join(
+        Book, Page.book_id == Book.id
+    ).filter(Book.user_id == user_id).first() is not None
+
+
+def _ensure_cache(db: Session, user_id: int):
+    if user_id in _cache_by_user:
         return
 
     vectors = []
     ids = []
 
-    for page in db.query(Page).filter(Page.embedding.isnot(None)).all():
+    pages = db.query(Page).join(
+        Book, Page.book_id == Book.id
+    ).filter(
+        Book.user_id == user_id,
+        Page.embedding.isnot(None)
+    ).all()
+
+    for page in pages:
         try:
             vectors.append(json.loads(page.embedding))
             ids.append(page.id)
         except (TypeError, ValueError):
             continue
 
-    _embedding_matrix = np.array(vectors) if vectors else np.empty((0, 0))
-    _page_ids = ids
+    matrix = np.array(vectors) if vectors else np.empty((0, 0))
+    _cache_by_user[user_id] = (matrix, ids)
 
 
 def retrieve(
     db: Session,
+    user_id: int,
     query: str,
     top_k: int = 3,
     apply_threshold: bool = True
 ) -> list[tuple[float, Page]]:
-    _ensure_cache(db)
+    _ensure_cache(db, user_id)
 
-    if _embedding_matrix.shape[0] == 0:
+    embedding_matrix, page_ids = _cache_by_user[user_id]
+
+    if embedding_matrix.shape[0] == 0:
         return []
 
     query_vector = create_embedding(query)
-    scores = _embedding_matrix @ query_vector
+    scores = embedding_matrix @ query_vector
 
     order = np.argsort(scores)[::-1]
-    ranked = [(float(scores[i]), _page_ids[i]) for i in order]
+    ranked = [(float(scores[i]), page_ids[i]) for i in order]
 
     if not apply_threshold:
         selected = ranked[:top_k]

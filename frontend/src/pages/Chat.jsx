@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { api } from '../services/api';
+import { api, userScopedKey } from '../services/api';
 import { recordQuery } from '../hooks/useQueryHistory';
 import { 
   Send, 
@@ -16,7 +16,7 @@ import {
 
 export default function Chat() {
   const [conversations, setConversations] = useState(() => {
-    const saved = localStorage.getItem('chat_conversations');
+    const saved = localStorage.getItem(userScopedKey('chat_conversations'));
     return saved ? JSON.parse(saved) : [
       { id: '1', title: 'DBMS Fundamentals Chat', messages: [
         { role: 'user', content: 'What is database normalization?' },
@@ -40,7 +40,7 @@ export default function Chat() {
 
   // Save conversations to localStorage
   useEffect(() => {
-    localStorage.setItem('chat_conversations', JSON.stringify(conversations));
+    localStorage.setItem(userScopedKey('chat_conversations'), JSON.stringify(conversations));
   }, [conversations]);
 
   const activeConv = conversations.find(c => c.id === activeConvId);

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { api } from '../services/api';
+import { api, userScopedKey } from '../services/api';
 import { useAuth } from '../hooks/useAuth';
 import { 
   FileText, 
@@ -41,8 +41,8 @@ export default function Home() {
       setBooks(data || []);
       
       // Load query/quiz count from localStorage to make stats interactive and persist
-      const queriesCount = parseInt(localStorage.getItem('queries_count') || '0');
-      const quizCount = parseInt(localStorage.getItem('quiz_count') || '0');
+      const queriesCount = parseInt(localStorage.getItem(userScopedKey('queries_count')) || '0');
+      const quizCount = parseInt(localStorage.getItem(userScopedKey('quiz_count')) || '0');
       
       setStats({
         documents: data ? data.length : 0,

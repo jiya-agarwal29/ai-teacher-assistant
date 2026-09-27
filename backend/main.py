@@ -11,7 +11,7 @@ import json
 from embeddings import create_embedding
 from rag import generate_answer, generate_quiz, check_context_relevance, synthesize_educational_response
 from document_parsers import parse_document, chunk_parsed_document
-from retrieval import retrieve, invalidate_cache
+from retrieval import retrieve, invalidate_cache, user_has_documents
 
 from database import engine, get_db
 from models import Base, Book, Page, User
@@ -192,7 +192,7 @@ async def upload_book(
 
     try:
         # Save book
-        new_book = Book(name=file.filename)
+        new_book = Book(name=file.filename, user_id=current_user.id)
 
         db.add(new_book)
         db.commit()
@@ -226,7 +226,7 @@ async def upload_book(
                 continue
 
         db.commit()
-        invalidate_cache()
+        invalidate_cache(current_user.id)
         return {
             "status": "Document uploaded and chunked successfully",
             "book_id": new_book.id
@@ -249,7 +249,7 @@ def get_books(
     db: Session = Depends(get_db)
 ):
 
-    books = db.query(Book).all()
+    books = db.query(Book).filter(Book.user_id == current_user.id).all()
 
     return [
         {
@@ -271,7 +271,8 @@ def delete_book(
 ):
 
     book = db.query(Book).filter(
-        Book.id == book_id
+        Book.id == book_id,
+        Book.user_id == current_user.id
     ).first()
 
     if not book:
@@ -281,14 +282,10 @@ def delete_book(
             detail="Book not found"
         )
 
-    # Delete related pages
-    db.query(Page).filter(
-        Page.book_id == book_id
-    ).delete()
-
+    # Cascades to the book's pages via the Book.pages relationship
     db.delete(book)
     db.commit()
-    invalidate_cache()
+    invalidate_cache(current_user.id)
 
     return {
         "status": "Book and associated chunks deleted successfully"
@@ -305,7 +302,10 @@ def search_content(
     db: Session = Depends(get_db)
 ):
 
-    results = db.query(Page).filter(
+    results = db.query(Page).join(
+        Book, Page.book_id == Book.id
+    ).filter(
+        Book.user_id == current_user.id,
         Page.content.ilike(f"%{query}%")
     ).all()
 
@@ -337,13 +337,13 @@ def semantic_search(
     db: Session = Depends(get_db)
 ):
 
-    if not db.query(Page.id).first():
+    if not user_has_documents(db, current_user.id):
 
         return {
             "message": "No documents available"
         }
 
-    top_pages = retrieve(db, query, top_k=3, apply_threshold=False)
+    top_pages = retrieve(db, current_user.id, query, top_k=3, apply_threshold=False)
 
     return [
         {
@@ -368,12 +368,12 @@ def chat_with_pdf(
     db: Session = Depends(get_db)
 ):
 
-    if not db.query(Page.id).first():
+    if not user_has_documents(db, current_user.id):
         return {
             "message": "No documents uploaded"
         }
 
-    top_pages = retrieve(db, question, top_k=3, apply_threshold=True)
+    top_pages = retrieve(db, current_user.id, question, top_k=3, apply_threshold=True)
 
     # Relevance checking using both cosine similarity and lexical overlap
     temp_context = " ".join([page.content for _, page in top_pages])
@@ -443,14 +443,14 @@ def generate_ai_quiz(
     db: Session = Depends(get_db)
 ):
 
-    if not db.query(Page.id).first():
+    if not user_has_documents(db, current_user.id):
         return {
             "topic": topic,
             "quiz": "Not enough information found in uploaded documents.",
             "questions": []
         }
 
-    top_pages = retrieve(db, topic, top_k=3, apply_threshold=True)
+    top_pages = retrieve(db, current_user.id, topic, top_k=3, apply_threshold=True)
 
     # Relevance checking using both cosine similarity and lexical overlap
     temp_context = " ".join([page.content for _, page in top_pages])

@@ -78,7 +78,17 @@ npm run dev
 
 Serves on `http://localhost:5173`.
 
+## Migrating an existing database
+
+Books are scoped to the account that uploaded them (`Book.user_id`). A `teacher_ai.db` created before this existed has books with no owner — everyone's book list will look empty until you assign them:
+
+```
+cd backend
+python migrate.py <username>
+```
+
+This adds the `books.user_id` column if it's missing, then assigns every currently-unowned book to `<username>` (which must already be a registered account). Safe to run more than once — the column is only added once, and the assignment only ever touches books that still have no owner, so re-running it with the same or a different username won't reassign books that already belong to someone.
+
 ## Notes
 
 - The SQLite database (`backend/teacher_ai.db`) is created automatically on first run and is gitignored — it's local dev data, not meant to be shared.
-- Documents are **not** scoped per user — all uploaded books are visible to every account. Fine for solo/local use; would need a `user_id` column on `Book` before this is safe for multiple untrusted users.

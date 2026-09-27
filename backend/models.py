@@ -7,6 +7,9 @@ class Book(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
+
+    pages = relationship("Page", cascade="all, delete-orphan")
 
 
 class Page(Base):

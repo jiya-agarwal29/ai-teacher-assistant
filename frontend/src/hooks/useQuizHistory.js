@@ -1,9 +1,11 @@
+import { userScopedKey } from '../services/api';
+
 const HISTORY_KEY = 'quiz_history'; // array of { topic, correct, total, timestamp }
 const MAX_HISTORY = 200;
 
 function readHistory() {
   try {
-    return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+    return JSON.parse(localStorage.getItem(userScopedKey(HISTORY_KEY)) || '[]');
   } catch {
     return [];
   }
@@ -15,7 +17,7 @@ export function recordQuizAttempt({ topic, correct, total }) {
   const history = readHistory();
   history.push({ topic: (topic || 'General').trim(), correct, total, timestamp: Date.now() });
   const trimmed = history.length > MAX_HISTORY ? history.slice(history.length - MAX_HISTORY) : history;
-  localStorage.setItem(HISTORY_KEY, JSON.stringify(trimmed));
+  localStorage.setItem(userScopedKey(HISTORY_KEY), JSON.stringify(trimmed));
 }
 
 /**
