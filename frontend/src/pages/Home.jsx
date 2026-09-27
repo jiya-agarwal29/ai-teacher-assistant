@@ -65,10 +65,10 @@ export default function Home() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const allowedExtensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt'];
+    const allowedExtensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md'];
     const fileExtension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
     if (!allowedExtensions.includes(fileExtension)) {
-      setUploadError('Unsupported file format. Please upload PDF, Word (.docx, .doc), or PowerPoint (.pptx, .ppt) documents.');
+      setUploadError('Unsupported file format. Please upload PDF, Word (.docx, .doc), PowerPoint (.pptx, .ppt), or plain text (.txt, .md) documents.');
       return;
     }
 

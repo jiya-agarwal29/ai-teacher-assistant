@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 
@@ -8,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import json
 
-from embeddings import create_embedding
+from embeddings import create_embeddings
 from rag import generate_answer, generate_quiz, check_context_relevance, synthesize_educational_response
 from document_parsers import parse_document, chunk_parsed_document
 from retrieval import retrieve, invalidate_cache, user_has_documents
@@ -22,6 +23,8 @@ from auth import (
     hash_password,
     get_current_user
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -190,54 +193,69 @@ async def upload_book(
             detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_MB:g} MB"
         )
 
+    # Parse and chunk before touching the database — nothing is saved unless
+    # the whole pipeline succeeds, so a failed upload never leaves an empty book.
     try:
-        # Save book
-        new_book = Book(name=file.filename, user_id=current_user.id)
+        pages_data = parse_document(file.file, filename)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Failed to parse uploaded document '%s'", filename)
+        raise HTTPException(status_code=500, detail="Failed to process document file.")
 
+    chunks = chunk_parsed_document(pages_data)
+
+    if not chunks:
+        raise HTTPException(
+            status_code=422,
+            detail="No readable text found. This looks like a scanned document — OCR support is coming soon."
+        )
+
+    texts = [chunk_item["content"] for chunk_item in chunks]
+
+    try:
+        embeddings = create_embeddings(texts)
+    except Exception:
+        logger.exception("Failed to embed %d chunk(s) for '%s'", len(texts), filename)
+        raise HTTPException(status_code=500, detail="Failed to generate embeddings for this document.")
+
+    if len(embeddings) != len(texts):
+        logger.error(
+            "Embedding count mismatch for '%s': expected %d chunks, got %d embeddings",
+            filename, len(texts), len(embeddings)
+        )
+        raise HTTPException(status_code=500, detail="Failed to embed all chunks of this document.")
+
+    try:
+        new_book = Book(name=filename, user_id=current_user.id)
         db.add(new_book)
+        db.flush()
+
+        for chunk_index, (chunk_item, embedding) in enumerate(zip(chunks, embeddings)):
+            db.add(Page(
+                book_id=new_book.id,
+                page_number=chunk_item["page_number"],
+                chunk_number=chunk_index + 1,
+                content=chunk_item["content"],
+                embedding=json.dumps(embedding.tolist())
+            ))
+
         db.commit()
         db.refresh(new_book)
 
-        # Parse document using our modular document parser
-        pages_data = parse_document(file.file, file.filename)
-
-        # Chunk pages semantically
-        chunks = chunk_parsed_document(pages_data)
-
-        for chunk_index, chunk_item in enumerate(chunks):
-            chunk = chunk_item["content"]
-            page_num = chunk_item["page_number"]
-            try:
-                embedding = create_embedding(chunk)
-
-                new_page = Page(
-                    book_id=new_book.id,
-                    page_number=page_num,
-                    chunk_number=chunk_index + 1,
-                    content=chunk,
-                    embedding=json.dumps(
-                        embedding.tolist()
-                    )
-                )
-
-                db.add(new_page)
-
-            except Exception:
-                continue
-
-        db.commit()
-        invalidate_cache(current_user.id)
-        return {
-            "status": "Document uploaded and chunked successfully",
-            "book_id": new_book.id
-        }
-
-    except Exception as e:
+    except Exception:
         db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process document file: {str(e)}"
-        )
+        logger.exception("Failed to save uploaded document '%s' to the database", filename)
+        raise HTTPException(status_code=500, detail="Failed to save the uploaded document.")
+
+    invalidate_cache(current_user.id)
+
+    return {
+        "status": "Document uploaded and chunked successfully",
+        "book_id": new_book.id,
+        "chunks": len(chunks),
+        "pages": len(pages_data)
+    }
 
 
 # -----------------------------

@@ -1,140 +1,106 @@
+import io
 import re
 import collections
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
 import pdfplumber
 import docx
 from pptx import Presentation
 
-def extract_strings_from_binary(file_bytes):
+
+class LegacyFormatUnsupportedError(ValueError):
+    """Raised when a legacy .doc/.ppt file can't be converted because LibreOffice isn't installed."""
+
+
+def _convert_legacy_office_file(file_bytes: bytes, ext: str):
     """
-    Extracts printable ASCII and UTF-16-LE strings from a binary stream.
-    Used as a fallback for older .doc and .ppt formats without COM dependencies.
+    Converts a legacy .doc/.ppt file to its modern .docx/.pptx equivalent using
+    LibreOffice's headless CLI (`soffice`). Returns (converted_bytes, new_ext).
+    Raises LegacyFormatUnsupportedError if `soffice` isn't installed, or if the
+    conversion itself fails.
     """
-    # Extract ASCII strings
-    ascii_strings = []
-    current = []
-    for char in file_bytes:
-        if 32 <= char <= 126 or char in (10, 13, 9):
-            current.append(chr(char))
-        else:
-            if len(current) >= 8:
-                ascii_strings.append("".join(current))
-            current = []
-    if len(current) >= 8:
-        ascii_strings.append("".join(current))
-        
-    # Extract UTF-16-LE strings
-    utf16_strings = []
-    i = 0
-    n = len(file_bytes)
-    current_u = []
-    while i < n - 1:
-        b1 = file_bytes[i]
-        b2 = file_bytes[i+1]
-        if b2 == 0 and (32 <= b1 <= 126 or b1 in (10, 13, 9)):
-            current_u.append(chr(b1))
-            i += 2
-        else:
-            if len(current_u) >= 8:
-                utf16_strings.append("".join(current_u))
-            current_u = []
-            i += 1
-    if len(current_u) >= 8:
-        utf16_strings.append("".join(current_u))
-        
-    all_strings = ascii_strings + utf16_strings
-    cleaned_paragraphs = []
-    for s in all_strings:
-        s_clean = s.strip()
-        if not s_clean:
-            continue
-        # Remove obvious junk lines (too many non-alphanumeric chars)
-        alnum_count = sum(1 for c in s_clean if c.isalnum())
-        if len(s_clean) > 0 and (alnum_count / len(s_clean)) < 0.4:
-            continue
-        # Avoid common binary metadata or software keywords
-        if any(bad in s_clean.lower() for bad in ['microsoft', 'word document', 'powerpoint', 'msword', 'document summary', 'normal.dotm', 'root entry', 'current user']):
-            if len(s_clean) < 40:
-                continue
-        cleaned_paragraphs.append(s_clean)
-        
-    # Split paragraphs by newline and filter short lines
-    text = "\n".join(cleaned_paragraphs)
-    lines = text.split('\n')
-    good_lines = []
-    for line in lines:
-        l_strip = line.strip()
-        if len(l_strip) < 15:
-            continue
-        # Standardize spacing
-        l_clean = re.sub(r'[ \t]+', ' ', l_strip)
-        good_lines.append(l_clean)
-        
-    return "\n".join(good_lines)
+    if shutil.which("soffice") is None:
+        raise LegacyFormatUnsupportedError(
+            "Please save this file as .docx/.pptx and upload again."
+        )
+
+    target_format = "docx" if ext == ".doc" else "pptx"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        source_path = Path(tmp_dir) / f"input{ext}"
+        source_path.write_bytes(file_bytes)
+
+        result = subprocess.run(
+            [
+                "soffice", "--headless", "--norestore",
+                "--convert-to", target_format,
+                "--outdir", tmp_dir,
+                str(source_path)
+            ],
+            capture_output=True,
+            timeout=120
+        )
+
+        converted_path = source_path.with_suffix(f".{target_format}")
+        if result.returncode != 0 or not converted_path.exists():
+            raise LegacyFormatUnsupportedError(
+                "Please save this file as .docx/.pptx and upload again."
+            )
+
+        return converted_path.read_bytes(), f".{target_format}"
+
 
 def parse_pdf(file_file):
     """
     Extracts text page-by-page from PDF. Identifies and removes headers/footers,
-    normalizes spacing, and returns list of dicts.
+    normalizes spacing, and returns list of dicts. Opens the PDF once.
     """
-    pages_data = []
+    pages_lines = []  # list of (raw, non-empty) lines per page
     all_lines = []
-    
-    # Read PDF using pdfplumber
+
     with pdfplumber.open(file_file) as pdf:
+        num_pages = len(pdf.pages)
         for page in pdf.pages:
             text = page.extract_text()
+            lines = []
             if text:
                 for line in text.split('\n'):
                     line_strip = line.strip()
                     if line_strip:
+                        lines.append(line_strip)
                         all_lines.append(line_strip)
-                        
-    # Count frequencies of lines to identify repeated headers/footers
-    line_counts = collections.Counter(all_lines)
-    total_pages = len(all_lines) # Estimate density
-    # If a line appears on more than 30% of pages (when document has at least 3 pages), flag as header/footer
-    header_footers = set()
-    if total_pages > 3:
-        # Re-estimate based on actual page count
-        with pdfplumber.open(file_file) as pdf:
-            num_pages = len(pdf.pages)
-        if num_pages > 2:
-            header_footers = {line for line, count in line_counts.items() if count / num_pages > 0.3}
+            pages_lines.append(lines)
 
-    # Reset cursor and extract clean text
-    file_file.seek(0)
-    with pdfplumber.open(file_file) as pdf:
-        for page_idx, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if not text:
-                pages_data.append({
-                    "page_number": page_idx + 1,
-                    "content": ""
-                })
+    # Count frequencies of lines to identify repeated headers/footers.
+    # If a line appears on more than 30% of pages (when the document has more
+    # than 2 pages), flag it as a header/footer to strip out.
+    line_counts = collections.Counter(all_lines)
+    header_footers = set()
+    if num_pages > 2:
+        header_footers = {line for line, count in line_counts.items() if count / num_pages > 0.3}
+
+    pages_data = []
+    for page_idx, lines in enumerate(pages_lines):
+        cleaned_lines = []
+        for line_strip in lines:
+            # Skip headers/footers
+            if line_strip in header_footers:
                 continue
-                
-            lines = text.split('\n')
-            cleaned_lines = []
-            for line in lines:
-                line_strip = line.strip()
-                if not line_strip:
-                    continue
-                # Skip headers/footers
-                if line_strip in header_footers:
-                    continue
-                # Skip page numbers
-                if re.match(r'^(page\s+)?\d+(\s+of\s+\d+)?$', line_strip, re.IGNORECASE):
-                    continue
-                # Spacing normalization
-                line_clean = re.sub(r'[ \t]+', ' ', line_strip)
-                cleaned_lines.append(line_clean)
-                
-            page_text = "\n".join(cleaned_lines)
-            pages_data.append({
-                "page_number": page_idx + 1,
-                "content": page_text
-            })
-            
+            # Skip page numbers
+            if re.match(r'^(page\s+)?\d+(\s+of\s+\d+)?$', line_strip, re.IGNORECASE):
+                continue
+            # Spacing normalization
+            line_clean = re.sub(r'[ \t]+', ' ', line_strip)
+            cleaned_lines.append(line_clean)
+
+        pages_data.append({
+            "page_number": page_idx + 1,
+            "content": "\n".join(cleaned_lines)
+        })
+
     return pages_data
 
 def parse_docx(file_file):
@@ -144,41 +110,45 @@ def parse_docx(file_file):
     """
     doc = docx.Document(file_file)
     paragraphs = []
-    
+
+    # Build element->object lookups once instead of rescanning doc.paragraphs /
+    # doc.tables for every body element (was O(n*m) on large files).
+    paragraph_by_element = {p._element: p for p in doc.paragraphs}
+    table_by_element = {t._element: t for t in doc.tables}
+
     # Process elements: paragraphs and tables
     for element in doc.element.body:
         if element.tag.endswith('p'):
-            # Paragraph
-            # Find the paragraph object in python-docx
-            for p in doc.paragraphs:
-                if p._element == element:
-                    text = p.text.strip()
-                    if not text:
-                        continue
-                    
-                    style_name = p.style.name if p.style else ""
-                    if style_name.startswith('Heading'):
-                        match = re.match(r'Heading\s*(\d+)', style_name, re.IGNORECASE)
-                        level = int(match.group(1)) if match else 1
-                        prefix = "#" * level
-                        text = f"{prefix} {text}"
-                    elif style_name.startswith('List'):
-                        # Add a bullet
-                        text = f"- {text}"
-                    
-                    paragraphs.append(text)
-                    break
+            p = paragraph_by_element.get(element)
+            if p is None:
+                continue
+
+            text = p.text.strip()
+            if not text:
+                continue
+
+            style_name = p.style.name if p.style else ""
+            if style_name.startswith('Heading'):
+                match = re.match(r'Heading\s*(\d+)', style_name, re.IGNORECASE)
+                level = int(match.group(1)) if match else 1
+                prefix = "#" * level
+                text = f"{prefix} {text}"
+            elif style_name.startswith('List'):
+                # Add a bullet
+                text = f"- {text}"
+
+            paragraphs.append(text)
         elif element.tag.endswith('tbl'):
-            # Table
-            for t in doc.tables:
-                if t._element == element:
-                    table_rows = []
-                    for row in t.rows:
-                        row_cells = [cell.text.strip().replace('\n', ' ') for cell in row.cells]
-                        table_rows.append(" | ".join(row_cells))
-                    if table_rows:
-                        paragraphs.append("\n" + "\n".join(table_rows) + "\n")
-                    break
+            t = table_by_element.get(element)
+            if t is None:
+                continue
+
+            table_rows = []
+            for row in t.rows:
+                row_cells = [cell.text.strip().replace('\n', ' ') for cell in row.cells]
+                table_rows.append(" | ".join(row_cells))
+            if table_rows:
+                paragraphs.append("\n" + "\n".join(table_rows) + "\n")
 
     # Group into virtual pages/sections of ~300 words
     pages_data = []
@@ -274,9 +244,11 @@ def parse_document(file, filename: str) -> list:
     elif ext == '.pptx':
         return parse_pptx(file)
     elif ext in ('.doc', '.ppt'):
-        # Fallback raw binary text extraction
-        raw_text = extract_strings_from_binary(file_bytes)
-        return _chunk_raw_text_into_pages(raw_text)
+        converted_bytes, converted_ext = _convert_legacy_office_file(file_bytes, ext)
+        converted_file = io.BytesIO(converted_bytes)
+        if converted_ext == '.docx':
+            return parse_docx(converted_file)
+        return parse_pptx(converted_file)
     elif ext in ('.txt', '.md'):
         raw_text = file_bytes.decode('utf-8', errors='ignore')
         return _chunk_raw_text_into_pages(raw_text)
