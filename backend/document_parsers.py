@@ -276,28 +276,34 @@ def parse_document(file, filename: str) -> list:
     elif ext in ('.doc', '.ppt'):
         # Fallback raw binary text extraction
         raw_text = extract_strings_from_binary(file_bytes)
-        # Partition into chunks of ~300 words
-        words = raw_text.split()
-        pages_data = []
-        chunk_words = []
-        page_idx = 1
-        for w in words:
-            chunk_words.append(w)
-            if len(chunk_words) >= 300:
-                pages_data.append({
-                    "page_number": page_idx,
-                    "content": " ".join(chunk_words)
-                })
-                chunk_words = []
-                page_idx += 1
-        if chunk_words:
+        return _chunk_raw_text_into_pages(raw_text)
+    elif ext in ('.txt', '.md'):
+        raw_text = file_bytes.decode('utf-8', errors='ignore')
+        return _chunk_raw_text_into_pages(raw_text)
+    else:
+        raise ValueError(f"Unsupported file format: {ext}")
+
+def _chunk_raw_text_into_pages(raw_text: str) -> list:
+    # Partition into chunks of ~300 words
+    words = raw_text.split()
+    pages_data = []
+    chunk_words = []
+    page_idx = 1
+    for w in words:
+        chunk_words.append(w)
+        if len(chunk_words) >= 300:
             pages_data.append({
                 "page_number": page_idx,
                 "content": " ".join(chunk_words)
             })
-        return pages_data
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
+            chunk_words = []
+            page_idx += 1
+    if chunk_words:
+        pages_data.append({
+            "page_number": page_idx,
+            "content": " ".join(chunk_words)
+        })
+    return pages_data
 
 def chunk_parsed_document(pages_data: list, chunk_size=150, overlap=30) -> list:
     """

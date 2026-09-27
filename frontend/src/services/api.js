@@ -1,4 +1,4 @@
-const API_BASE_URL = 'http://127.0.0.1:8000';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
 /**
  * Helper to get the JWT token from localStorage
@@ -63,16 +63,12 @@ async function request(endpoint, options = {}) {
   
   // Handle HTTP status errors (401, 400, etc.)
   if (response.status === 401) {
-    // If it's a login attempt, present a standardized secure message
+    // The backend now always sends one generic message for a failed login
     if (endpoint === '/login') {
       let detail = 'Invalid username or password';
       try {
         const data = await response.json();
-        if (data.detail === 'Invalid password' || data.detail === 'Invalid username') {
-          detail = 'Invalid username or password';
-        } else {
-          detail = data.detail || detail;
-        }
+        detail = data.detail || detail;
       } catch (e) {}
       throw new Error(detail);
     }
@@ -131,12 +127,14 @@ export const api = {
     
     /**
      * POST /register
-     * Note: Backend register function expects username and password as query params
      */
     register: async (username, password) => {
-      const queryParams = new URLSearchParams({ username, password });
-      return await request(`/register?${queryParams.toString()}`, {
+      return await request('/register', {
         method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username, password }),
       });
     },
     

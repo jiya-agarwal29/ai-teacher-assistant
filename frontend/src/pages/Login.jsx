@@ -62,12 +62,12 @@ export default function Login() {
       return;
     }
 
-    if (password.length < 4) {
-      setValidationError('Password must be at least 4 characters long.');
-      return;
-    }
-
     if (!isLoginTab) {
+      if (password.length < 8) {
+        setValidationError('Password must be at least 8 characters long.');
+        return;
+      }
+
       if (password !== confirmPassword) {
         setValidationError('Passwords do not match.');
         return;

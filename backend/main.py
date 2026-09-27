@@ -1,6 +1,10 @@
+import os
+import re
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import json
 
@@ -20,23 +24,43 @@ from auth import (
 )
 
 app = FastAPI()
+
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000"
+]
+cors_origins_env = os.getenv("CORS_ORIGINS")
+allow_origins = (
+    [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+    if cors_origins_env
+    else DEFAULT_CORS_ORIGINS
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:5175",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000"
-    ],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 Base.metadata.create_all(bind=engine)
+
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
+ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".pptx", ".doc", ".ppt", ".txt", ".md"}
+MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "25"))
+MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
 
 
 # -----------------------------
@@ -65,10 +89,24 @@ def health_check():
 # REGISTER
 # -----------------------------
 @app.post("/register")
-def register(username: str, password: str, db: Session = Depends(get_db)):
+def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+
+    if not USERNAME_PATTERN.fullmatch(payload.username):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 3-32 characters and contain only letters, digits, underscores, dots, or hyphens."
+        )
+
+    if len(payload.password) < 8:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters long."
+        )
 
     existing_user = db.query(User).filter(
-        User.username == username
+        User.username == payload.username
     ).first()
 
     if existing_user:
@@ -78,10 +116,10 @@ def register(username: str, password: str, db: Session = Depends(get_db)):
             detail="Username already exists"
         )
 
-    hashed_password = hash_password(password)
+    hashed_password = hash_password(payload.password)
 
     new_user = User(
-        username=username,
+        username=payload.username,
         password=hashed_password
     )
 
@@ -106,21 +144,11 @@ def login(
         User.username == form_data.username
     ).first()
 
-    if not user:
+    if not user or not verify_password(form_data.password, user.password):
 
         raise HTTPException(
             status_code=401,
-            detail="Invalid username"
-        )
-
-    if not verify_password(
-        form_data.password,
-        user.password
-    ):
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid password"
+            detail="Invalid username or password"
         )
 
     token = create_access_token(
@@ -139,9 +167,28 @@ def login(
 @app.post("/upload-book")
 async def upload_book(
     file: UploadFile = File(...),
-    current_user: str = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file extension '{ext}'. Allowed: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}"
+        )
+
+    file.file.seek(0, os.SEEK_END)
+    file_size = file.file.tell()
+    file.file.seek(0)
+
+    if file_size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_MB:g} MB"
+        )
 
     try:
         # Save book
@@ -198,7 +245,7 @@ async def upload_book(
 # -----------------------------
 @app.get("/books")
 def get_books(
-    current_user: str = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
 
@@ -219,7 +266,7 @@ def get_books(
 @app.delete("/books/{book_id}")
 def delete_book(
     book_id: int,
-    current_user: str = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
 
@@ -252,7 +299,11 @@ def delete_book(
 # NORMAL SEARCH
 # -----------------------------
 @app.get("/search")
-def search_content(query: str, db: Session = Depends(get_db)):
+def search_content(
+    query: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
 
     results = db.query(Page).filter(
         Page.content.ilike(f"%{query}%")
@@ -282,7 +333,7 @@ def search_content(query: str, db: Session = Depends(get_db)):
 @app.get("/semantic-search")
 def semantic_search(
     query: str,
-    current_user: str = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
 
@@ -313,7 +364,7 @@ def semantic_search(
 @app.get("/chat")
 def chat_with_pdf(
     question: str,
-    current_user: str = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
 
@@ -388,7 +439,7 @@ def chat_with_pdf(
 @app.get("/generate-quiz")
 def generate_ai_quiz(
     topic: str,
-    current_user: str = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
 
