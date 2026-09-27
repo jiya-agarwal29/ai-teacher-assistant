@@ -444,7 +444,9 @@ def chat_with_pdf(
                 "book_name": book.name,
                 "page_number": page.page_number,
                 "chunk_number": page.chunk_number,
-                "similarity_score": round(float(score), 4)
+                "similarity_score": round(float(score), 4),
+                "page_id": page.id,
+                "content": page.content
             })
 
     return {

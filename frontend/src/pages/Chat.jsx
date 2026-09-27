@@ -33,8 +33,6 @@ export default function Chat() {
   
   // Citations side panel
   const [selectedCitation, setSelectedCitation] = useState(null);
-  const [citationContext, setCitationContext] = useState('');
-  const [isLoadingCitation, setIsLoadingCitation] = useState(false);
 
   const messagesEndRef = useRef(null);
 
@@ -168,34 +166,10 @@ export default function Chat() {
     }
   };
 
-  // Triggers semantic lookup to display the citation's exact text segment
-  const handleOpenCitation = async (source) => {
+  // The chat response now includes each source's chunk text directly, so
+  // opening a citation is just showing it — no extra lookup needed.
+  const handleOpenCitation = (source) => {
     setSelectedCitation(source);
-    setIsLoadingCitation(true);
-    setCitationContext('');
-    
-    try {
-      // We look up the semantic database for matching keywords of this chunk to fetch content
-      const searchResults = await api.search.semantic(source.book_name);
-      
-      // Try to find the exact chunk match
-      const matchingChunk = searchResults.find(
-        r => r.page_number === source.page_number && r.chunk_number === source.chunk_number
-      );
-
-      if (matchingChunk) {
-        setCitationContext(matchingChunk.content);
-      } else if (searchResults.length > 0) {
-        // Fallback to top matching text block
-        setCitationContext(searchResults[0].content);
-      } else {
-        setCitationContext("Exact context block could not be fetched from the database, but chunk reference is valid.");
-      }
-    } catch (err) {
-      setCitationContext(`Error pulling chunk text context: ${err.message}`);
-    } finally {
-      setIsLoadingCitation(false);
-    }
   };
 
   // Simple, high-fidelity markdown parser
@@ -572,16 +546,9 @@ export default function Chat() {
             <div className="space-y-2">
               <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider block">Cited Context Text Segment</span>
               
-              {isLoadingCitation ? (
-                <div className="space-y-2 py-10 flex flex-col items-center justify-center">
-                  <div className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin"></div>
-                  <span className="text-[10px] text-slate-400">Loading block...</span>
-                </div>
-              ) : (
-                <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/30 text-[11px] leading-relaxed text-slate-600 dark:text-slate-300 whitespace-pre-wrap select-all border border-slate-200/30 dark:border-slate-800/50">
-                  {citationContext}
-                </div>
-              )}
+              <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/30 text-[11px] leading-relaxed text-slate-600 dark:text-slate-300 whitespace-pre-wrap select-all border border-slate-200/30 dark:border-slate-800/50">
+                {selectedCitation?.content || "Exact context block could not be fetched, but the chunk reference is valid."}
+              </div>
             </div>
           </div>
         </div>

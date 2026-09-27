@@ -112,49 +112,29 @@ def generate_focused_answer(context, prompt_instruction, max_tokens=120):
 def generate_answer(context, question):
     """
     Generates a concise, document-grounded answer using the local Flan-T5 model.
-    Follows the strict system prompt instructions.
+    Keeps the question intact and truncates the context (via the tokenizer,
+    not a naive word count) so the whole prompt fits Flan-T5's 512-token
+    limit without risking the question itself being cut off.
     """
     if not context or not context.strip():
         return "The uploaded documents do not contain enough information for this question."
 
-    # Build prompt prepending the exact system prompt rules
-    system_prompt = """You are an intelligent AI Teacher Assistant.
+    instruction = "Answer the question using only the context."
+    prefix = f"{instruction} Question: {question} Context: "
+    suffix = " Answer:"
 
-Answer questions using the uploaded documents as the PRIMARY knowledge source.
+    prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
+    suffix_ids = tokenizer(suffix, add_special_tokens=False)["input_ids"]
+    # Leave a little headroom for the model's end-of-sequence token.
+    max_context_tokens = max(0, 512 - len(prefix_ids) - len(suffix_ids) - 1)
 
-IMPORTANT RULES:
-- Explain concepts in detail
-- Behave like ChatGPT
-- Teach concepts naturally
-- Elaborate important ideas clearly
-- Make answers easy for students to understand
-- Use educational and professional language
-- Add logical explanation flow
-- Use headings and bullet points
-- Explain “why” and “how” wherever possible
-- Avoid excessive summarization
-- Avoid raw chunk dumping
-- Avoid repetition
-- Avoid robotic responses
+    context_ids = tokenizer(context, add_special_tokens=False)["input_ids"][:max_context_tokens]
+    truncated_context = tokenizer.decode(context_ids, skip_special_tokens=True)
 
-You may improve readability and elaboration using your language intelligence, but the core concepts must come from the uploaded documents.
-
-Your goal is to TEACH concepts deeply and clearly like a professional tutor."""
-
-    # Compress context to first 250 words to avoid Flan-T5 truncation (512 token limit)
-    words = context.split()
-    if len(words) > 250:
-        context_compressed = " ".join(words[:250])
-    else:
-        context_compressed = context
-
-    prompt = f"""Context: {context_compressed}
-Instructions: {system_prompt}
-Question: {question}
-Answer:"""
+    prompt = f"{prefix}{truncated_context}{suffix}"
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
-    
+
     outputs = model.generate(
         **inputs,
         max_new_tokens=120,
@@ -162,13 +142,13 @@ Answer:"""
         repetition_penalty=1.3,
         no_repeat_ngram_size=3
     )
-    
+
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    
+
     # Clean answer
     if not answer or len(answer) < 5 or "do not contain enough information" in answer.lower():
         return "The uploaded documents do not contain enough information for this question."
-        
+
     return answer
 
 def paraphrase_concept(concept_text):
@@ -625,187 +605,131 @@ def synthesize_educational_response(question, top_pages, direct_answer, topic):
         d["term"] = clean_extracted_text(d["term"])
         d["explanation"] = clean_extracted_text(d["explanation"])
         
-    title = question.strip('?').strip()
-    title = title[0].upper() + title[1:] if title else "Study Assistant Explanation"
-    
     sections = []
     generated_texts = []
-    
-    # Section 1: Introduction
-    intro_p = generate_focused_answer(
-        full_text_clean,
-        f"Write a conversational, friendly tutor introduction greeting the student and saying what we are going to learn about '{question}'.",
-        max_tokens=80
-    )
-    intro_p = clean_extracted_text(intro_p)
-    if not intro_p or len(intro_p) < 20:
-        intro_p = f"Hello! Let's explore the concept of **{question}** together. Below is a detailed breakdown from your study documents to help you understand this topic."
-    
+
+    # Introduction — neutral template text, no model call, no invented facts.
     sections.append("### Introduction")
-    sections.append(f"{intro_p}\n")
-    generated_texts.append(intro_p)
-    
-    # Section 2: Formal Definition
-    def_p = generate_focused_answer(
+    sections.append(f"Here's what your study material says about **{question}**:\n")
+
+    # Formal Definition — 1 model call. Falls back to the already-computed,
+    # doc-grounded direct_answer or a raw extracted definition (never a
+    # hard-coded fact); omits the section entirely if none of those exist.
+    def_p = clean_extracted_text(generate_focused_answer(
         full_text_clean,
         f"Explain what '{question}' is by giving a formal, precise definition from the context in one or two clear sentences.",
         max_tokens=80
-    )
-    def_p = clean_extracted_text(def_p)
+    ))
     if is_duplicate_or_too_short(def_p, generated_texts, 20):
-        if definitions:
-            def_p = f"Based on the provided materials, **{definitions[0]['term']}** is defined as: {definitions[0]['explanation']}"
-        else:
+        if direct_answer and not is_duplicate_or_too_short(direct_answer, generated_texts, 20):
             def_p = direct_answer
-            
-    if is_duplicate_or_too_short(def_p, generated_texts, 20):
-        def_p = f"In the context of our study material, **{question}** refers to the core concept and details outlined below, which helps manage and coordinate related systems."
-        
-    sections.append("### Formal Definition")
-    sections.append(f"{def_p}\n")
-    generated_texts.append(def_p)
-    
-    # Section 3: Key Concepts & Terms
-    features = []
+        elif definitions:
+            def_p = f"**{definitions[0]['term']}**: {definitions[0]['explanation']}"
+        else:
+            def_p = ""
+
+    if def_p:
+        sections.append("### Formal Definition")
+        sections.append(f"{def_p}\n")
+        generated_texts.append(def_p)
+
+    # Key Concepts & Terms — at most 3 paraphrase_concept() calls total,
+    # regardless of how many succeed. Each call self-heals to the raw
+    # document text on failure (see paraphrase_concept), so this never
+    # invents a fact; the section is omitted if there's nothing to paraphrase.
+    candidates = []
     for d in definitions:
-        term = d["term"]
-        exp = d["explanation"]
-        if term.lower() in question.lower() and len(definitions) > 1:
+        if d["term"].lower() in question.lower() and len(definitions) > 1:
             continue
-        paraphrased_exp = paraphrase_concept(exp)
-        if paraphrased_exp and not is_duplicate_or_too_short(paraphrased_exp, generated_texts, 15):
-            features.append(f"- **{term}:** {paraphrased_exp}")
-            if len(features) >= 4:
-                break
-            
-    if len(features) < 3:
-        for s in statements:
-            if len(s) > 25:
-                para_s = paraphrase_concept(s)
-                if para_s and not is_duplicate_or_too_short(para_s, generated_texts, 15):
-                    features.append(f"- {para_s}")
-                    if len(features) >= 4:
-                        break
-                      
-    if not features:
-        features.append("- No specific sub-concepts were explicitly listed in the study materials, but the main concept is described in detail below.")
-        
-    sections.append("### Key Concepts & Terms")
-    for feat in features[:4]:
-        sections.append(feat)
-    sections.append("")
-    generated_texts.append(" ".join(features))
-    
-    # Section 4: Detailed Explanation (How & Why it Works)
-    detailed_p = generate_focused_answer(
+        candidates.append((d["term"], d["explanation"]))
+    for s in statements:
+        if len(s) > 25:
+            candidates.append((None, s))
+
+    features = []
+    for term, text in candidates[:3]:
+        paraphrased = paraphrase_concept(text)
+        if paraphrased and not is_duplicate_or_too_short(paraphrased, generated_texts, 15):
+            features.append(f"- **{term}:** {paraphrased}" if term else f"- {paraphrased}")
+            generated_texts.append(paraphrased)
+
+    if features:
+        sections.append("### Key Concepts & Terms")
+        sections.extend(features)
+        sections.append("")
+
+    # Detailed Explanation (How & Why it Works) — 1 model call. Falls back to
+    # raw (unparaphrased) document statements, or omits the section.
+    detailed_p = clean_extracted_text(generate_focused_answer(
         full_text_clean,
         f"Provide a detailed step-by-step explanation of how and why '{question}' works based on the context.",
         max_tokens=150
-    )
-    detailed_p = clean_extracted_text(detailed_p)
+    ))
     if is_duplicate_or_too_short(detailed_p, generated_texts, 30):
-        para_statements = []
+        remaining = [s for s in statements if not is_duplicate_or_too_short(s, generated_texts, 15)]
+        detailed_p = " ".join(remaining[:2]) if remaining else ""
+
+    if detailed_p:
+        sections.append("### Detailed Explanation (How & Why it Works)")
+        sections.append(f"{detailed_p}\n")
+        generated_texts.append(detailed_p)
+
+    # Importance & Applications — doc-sourced only, no model call, omitted
+    # if nothing in the material matches.
+    importance_items = []
+    for s in statements:
+        if is_duplicate_or_too_short(s, generated_texts, 15):
+            continue
+        if any(kw in s.lower() for kw in ["help", "allow", "provid", "ensur", "reduc", "improv", "make", "enabl", "key", "critic", "import"]):
+            importance_items.append(s)
+            if len(importance_items) >= 2:
+                break
+
+    if importance_items:
+        importance_p = " ".join(importance_items)
+        sections.append("### Importance & Applications")
+        sections.append(f"{importance_p}\n")
+        generated_texts.append(importance_p)
+
+    # Practical & Real-World Examples — doc-sourced only, no model call,
+    # omitted if nothing in the material matches.
+    example_items = []
+    for s in statements:
+        if is_duplicate_or_too_short(s, generated_texts, 15):
+            continue
+        if any(kw in s.lower() for kw in ["example", "e.g.", "such as", "instance", "for example"]):
+            example_items.append(s)
+            if len(example_items) >= 2:
+                break
+
+    if example_items:
+        examples_p = " ".join(example_items)
+        sections.append("### Practical & Real-World Examples")
+        sections.append(f"{examples_p}\n")
+        generated_texts.append(examples_p)
+
+    # In Simple Words — reuses an unused, real extracted definition or
+    # statement verbatim, no model call and no invented analogy. Omitted if
+    # everything's already been used elsewhere.
+    simple_source = None
+    for d in definitions:
+        if not is_duplicate_or_too_short(d["explanation"], generated_texts, 15):
+            simple_source = d["explanation"]
+            break
+    if not simple_source:
         for s in statements:
-            para_s = paraphrase_concept(s)
-            if para_s and not is_duplicate_or_too_short(para_s, generated_texts, 15):
-                para_statements.append(para_s)
-                if len(para_statements) >= 3:
-                    break
-        if para_statements:
-            detailed_p = " ".join(para_statements)
-        else:
-            detailed_p = f"The operation of {question} relies on the systematic flow defined in the document. It coordinates different elements to ensure consistency and reliability, acting as a crucial component of the overall process."
-            
-    sections.append("### Detailed Explanation (How & Why it Works)")
-    sections.append(f"{detailed_p}\n")
-    generated_texts.append(detailed_p)
-    
-    # Section 5: Importance & Applications
-    importance_p = generate_focused_answer(
-        full_text_clean,
-        f"Explain the educational importance, significance, or applications of '{question}' based on the context.",
-        max_tokens=120
-    )
-    importance_p = clean_extracted_text(importance_p)
-    if is_duplicate_or_too_short(importance_p, generated_texts, 25):
-        importance_items = []
-        for s in statements:
-            if any(keyword in s.lower() for keyword in ["help", "allow", "provid", "ensur", "reduc", "improv", "make", "enabl", "key", "critic", "import"]):
-                para_s = paraphrase_concept(s)
-                if para_s and not is_duplicate_or_too_short(para_s, generated_texts, 15):
-                    importance_items.append(para_s)
-                    if len(importance_items) >= 2:
-                        break
-        if importance_items:
-            importance_p = " ".join(importance_items)
-        else:
-            importance_p = f"Understanding this concept is highly important because it forms the baseline for configuring and optimizing standard operations as highlighted in the study guide."
-            
-    sections.append("### Importance & Applications")
-    sections.append(f"{importance_p}\n")
-    generated_texts.append(importance_p)
-    
-    # Section 6: Practical/Real-world Examples
-    examples_p = generate_focused_answer(
-        full_text_clean,
-        f"Provide concrete examples or case studies of '{question}' mentioned in the context.",
-        max_tokens=100
-    )
-    examples_p = clean_extracted_text(examples_p)
-    if is_duplicate_or_too_short(examples_p, generated_texts, 20):
-        ex_sentences = []
-        for s in statements:
-            if any(ex_kw in s.lower() for ex_kw in ["example", "e.g.", "such as", "instance", "for example"]):
-                para_ex = paraphrase_concept(s)
-                if para_ex and not is_duplicate_or_too_short(para_ex, generated_texts, 15):
-                    ex_sentences.append(para_ex)
-                    if len(ex_sentences) >= 2:
-                        break
-        if ex_sentences:
-            examples_p = " ".join(ex_sentences)
-        else:
-            examples_p = f"While the uploaded documents do not highlight specific real-world case studies for this concept, we can observe its practical use in standard operations within the field of {topic}."
-            
-    sections.append("### Practical & Real-World Examples")
-    sections.append(f"{examples_p}\n")
-    generated_texts.append(examples_p)
-    
-    # Section 7: Simple Explanation
-    simple_p = generate_focused_answer(
-        full_text_clean,
-        f"Explain the concept of '{question}' simply using an analogy or in layperson terms for a student. Start with the phrase 'In simple words'.",
-        max_tokens=100
-    )
-    simple_p = clean_extracted_text(simple_p)
-    if is_duplicate_or_too_short(simple_p, generated_texts, 20):
-        if definitions:
-            simple_p = f"In simple words, you can think of this concept like a structured queue where each item is processed one by one to keep things organized and avoid confusion."
-        else:
-            simple_p = f"In simple words, this concept works like a set of clear rules that everyone follows so that the whole system runs smoothly and without errors."
-    else:
-        simple_p_clean = simple_p.strip()
-        if not simple_p_clean.lower().startswith("in simple words"):
-            first_char = simple_p_clean[0]
-            if first_char.isupper() and not simple_p_clean[:3].isupper():
-                first_char = first_char.lower()
-            simple_p = f"In simple words, {first_char}{simple_p_clean[1:]}"
-            
-    sections.append("### In Simple Words")
-    sections.append(f"{simple_p}\n")
-    generated_texts.append(simple_p)
-    
-    # Section 8: Short Conclusion
-    conclusion_p = generate_focused_answer(
-        full_text_clean,
-        f"Write a short, encouraging tutor-like summary or takeaway about '{question}' for a student.",
-        max_tokens=80
-    )
-    conclusion_p = clean_extracted_text(conclusion_p)
-    if is_duplicate_or_too_short(conclusion_p, generated_texts, 20):
-        conclusion_p = f"In summary, mastering '{question}' is a key milestone in learning about {topic}. Keep up the great work, and feel free to ask more questions if any part needs further clarification!"
-        
-    sections.append("### Summary & Tutor's Conclusion")
-    sections.append(f"{conclusion_p}\n")
-    
+            if not is_duplicate_or_too_short(s, generated_texts, 15):
+                simple_source = s
+                break
+
+    if simple_source:
+        sections.append("### In Simple Words")
+        sections.append(f"In simple words: {simple_source}\n")
+        generated_texts.append(simple_source)
+
+    # Conclusion — neutral template text, no model call, no invented facts.
+    sections.append("### Summary")
+    sections.append(f"That's what your uploaded material covers on **{question}** — feel free to ask a follow-up question!\n")
+
     sections.append("---\n*Source: Uploaded study materials.*")
     return "\n".join(sections)
