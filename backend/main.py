@@ -1,15 +1,22 @@
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 import json
 
+import embeddings
 from embeddings import create_embeddings
+import rag
 from rag import (
     generate_answer,
     generate_quiz,
@@ -33,9 +40,49 @@ from auth import (
     get_current_user
 )
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+# Readiness flags exposed via /health — set once the FastAPI lifespan below
+# has warmed the AI models and prepared the database.
+app_state = {"models_ready": False, "database_ready": False}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting up: loading AI models and preparing database")
+
+    embeddings.load_model()
+    rag.load_model()
+    app_state["models_ready"] = True
+
+    Base.metadata.create_all(bind=engine)
+    app_state["database_ready"] = True
+
+    logger.info("Startup complete")
+    yield
+    logger.info("Shutting down")
+
+
+limiter = Limiter(key_func=get_remote_address)
+
+app = FastAPI(lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    # Catches anything not already handled as an HTTPException elsewhere.
+    # Never send exception text to the client — only the stack trace goes
+    # to the log.
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
 
 DEFAULT_CORS_ORIGINS = [
     "http://localhost:5173",
@@ -61,7 +108,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-Base.metadata.create_all(bind=engine)
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 
@@ -106,8 +152,12 @@ def read_root():
 @app.get("/health")
 def health_check():
 
+    ready = app_state["models_ready"] and app_state["database_ready"]
+
     return {
-        "status": "Server is healthy"
+        "status": "Server is healthy" if ready else "Server is starting up",
+        "models_ready": app_state["models_ready"],
+        "database_ready": app_state["database_ready"]
     }
 
 
@@ -115,7 +165,8 @@ def health_check():
 # REGISTER
 # -----------------------------
 @app.post("/register")
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+def register(request: Request, payload: RegisterRequest, db: Session = Depends(get_db)):
 
     if not USERNAME_PATTERN.fullmatch(payload.username):
 
@@ -161,7 +212,9 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 # LOGIN
 # -----------------------------
 @app.post("/login")
+@limiter.limit("10/minute")
 def login(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):

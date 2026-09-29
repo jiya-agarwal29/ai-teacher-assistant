@@ -10,12 +10,21 @@ touches books that still have no owner.
 Usage:
     python migrate.py <username>
 """
+import logging
+import os
 import sqlite3
 import sys
 
 from database import DATABASE_URL
 
 DB_PATH = DATABASE_URL.replace("sqlite:///", "", 1)
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(message)s",
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
 
 def column_exists(cursor, table, column):
@@ -25,7 +34,7 @@ def column_exists(cursor, table, column):
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python migrate.py <username>")
+        logger.info("Usage: python migrate.py <username>")
         sys.exit(1)
 
     username = sys.argv[1]
@@ -34,17 +43,17 @@ def main():
     cursor = conn.cursor()
 
     if column_exists(cursor, "books", "user_id"):
-        print("books.user_id column already exists, skipping ALTER TABLE.")
+        logger.info("books.user_id column already exists, skipping ALTER TABLE.")
     else:
         cursor.execute("ALTER TABLE books ADD COLUMN user_id INTEGER REFERENCES users(id)")
         conn.commit()
-        print("Added books.user_id column.")
+        logger.info("Added books.user_id column.")
 
     cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()
 
     if row is None:
-        print(f"No user named '{username}' found. Register that account first, then re-run this migration.")
+        logger.error("No user named '%s' found. Register that account first, then re-run this migration.", username)
         conn.close()
         sys.exit(1)
 
@@ -57,7 +66,7 @@ def main():
     conn.commit()
     conn.close()
 
-    print(f"Assigned {unowned_count} previously-unowned book(s) to '{username}' (user_id={user_id}).")
+    logger.info("Assigned %d previously-unowned book(s) to '%s' (user_id=%d).", unowned_count, username, user_id)
 
 
 if __name__ == "__main__":

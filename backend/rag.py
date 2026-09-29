@@ -3,13 +3,31 @@ import torch
 import re
 import random
 import collections
+import logging
+
+logger = logging.getLogger(__name__)
 
 model_name = "google/flan-t5-small"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer = None
+model = None
+device = None
 
-# Detect device
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+
+def load_model():
+    """
+    Loads the Flan-T5 tokenizer/model. Called once from the FastAPI lifespan
+    at startup so requests never pay the load cost; safe to call again
+    (no-op if already loaded). Also lets pure text-processing functions in
+    this module (quiz generation, definition extraction, etc.) be imported
+    and used — e.g. in tests — without paying the model-load cost at all.
+    """
+    global tokenizer, model, device
+    if model is not None:
+        return
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+    logger.info("Loaded Flan-T5 model '%s' on device=%s", model_name, device)
 
 def check_context_relevance(query: str, context: str, score: float) -> bool:
     """
@@ -87,6 +105,7 @@ def generate_focused_answer(context, prompt_instruction, max_tokens=120):
     """
     if not context or not context.strip():
         return ""
+    load_model()
     words = context.split()
     if len(words) > 250:
         context_compressed = " ".join(words[:250])
@@ -148,6 +167,8 @@ def generate_answer(context, question):
     if not context or not context.strip():
         return "The uploaded documents do not contain enough information for this question."
 
+    load_model()
+
     instruction = "Answer the question using only the context."
     prefix = f"{instruction} Question: {question} Context: "
     suffix = " Answer:"
@@ -187,7 +208,9 @@ def paraphrase_concept(concept_text):
     """
     if not concept_text or len(concept_text.strip()) < 10:
         return ""
-        
+
+    load_model()
+
     clean_text = re.sub(r'\s+', ' ', concept_text).strip()
     
     # Instruct Flan-T5 to explain/simplify
