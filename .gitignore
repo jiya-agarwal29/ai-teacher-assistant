@@ -24,4 +24,8 @@ __pycache__/
 
 # Local dev database (recreated automatically on first run)
 *.db
-*.sqlite3*.zip
+*.sqlite3
+
+# Zip files
+*.zip
+
