@@ -1,17 +1,13 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api, userScopedKey } from '../services/api';
 import { recordQuery } from '../hooks/useQueryHistory';
-import { 
-  Send, 
-  Plus, 
-  MessageSquare, 
-  BookOpen, 
-  Trash2, 
-  Sparkles, 
-  ChevronRight, 
-  Info,
-  ExternalLink,
-  ChevronDown
+import {
+  Send,
+  Plus,
+  MessageSquare,
+  BookOpen,
+  Trash2,
+  Sparkles
 } from 'lucide-react';
 
 export default function Chat() {
@@ -36,6 +32,20 @@ export default function Chat() {
 
   const messagesEndRef = useRef(null);
 
+  // Monotonic id source for new chats, seeded above any id already loaded
+  // from localStorage so a fresh chat never collides with a saved one.
+  const nextChatIdRef = useRef(
+    1 + conversations.reduce((max, c) => {
+      const n = Number(c.id);
+      return Number.isFinite(n) && n > max ? n : max;
+    }, 0)
+  );
+  const generateChatId = () => {
+    const id = String(nextChatIdRef.current);
+    nextChatIdRef.current += 1;
+    return id;
+  };
+
   // Save conversations to localStorage
   useEffect(() => {
     localStorage.setItem(userScopedKey('chat_conversations'), JSON.stringify(conversations));
@@ -53,7 +63,7 @@ export default function Chat() {
   }, [activeConv?.messages, isTyping]);
 
   const handleNewChat = () => {
-    const newId = Date.now().toString();
+    const newId = generateChatId();
     const newChat = {
       id: newId,
       title: `New Chat Session`,
@@ -76,7 +86,7 @@ export default function Chat() {
       if (updated.length > 0) {
         setActiveConvId(updated[0].id);
       } else {
-        const newId = Date.now().toString();
+        const newId = generateChatId();
         const newChat = {
           id: newId,
           title: `New Chat Session`,
@@ -295,7 +305,7 @@ export default function Chat() {
         }
 
         // Numbered Lists (1. or 2. etc.)
-        const numberedMatch = trimmed.match(/^\d+[\.\)]\s+(.*)$/);
+        const numberedMatch = trimmed.match(/^\d+[.)]\s+(.*)$/);
         if (numberedMatch) {
           if (!currentList || currentList.type !== 'ol') {
             flushList(`list-flush-${blockIdx}-${i}`);

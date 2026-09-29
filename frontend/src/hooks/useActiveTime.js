@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { userScopedKey } from '../services/api';
+import { localDateKey } from '../utils/dateKey';
 
 // Only count time toward "study session" if the user interacted within
 // this window — an idle tab with the screen just left on doesn't count.
@@ -10,23 +11,19 @@ const ACTIVITY_EVENTS = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchst
 const TOTAL_KEY = 'active_time_total_seconds';
 const DAILY_KEY = 'active_time_by_day';
 
-function todayKey() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD, local calendar day
-}
-
 function addActiveSeconds(seconds) {
   const totalKey = userScopedKey(TOTAL_KEY);
   const total = parseInt(localStorage.getItem(totalKey) || '0', 10) + seconds;
   localStorage.setItem(totalKey, String(total));
 
   const dailyKey = userScopedKey(DAILY_KEY);
-  let byDay = {};
+  let byDay;
   try {
     byDay = JSON.parse(localStorage.getItem(dailyKey) || '{}');
   } catch {
     byDay = {};
   }
-  const key = todayKey();
+  const key = localDateKey();
   byDay[key] = (byDay[key] || 0) + seconds;
   localStorage.setItem(dailyKey, JSON.stringify(byDay));
 }
@@ -38,9 +35,13 @@ function addActiveSeconds(seconds) {
  * backgrounded tab, does not add to the total.
  */
 export function useActiveTimeTracker() {
-  const lastActivityRef = useRef(Date.now());
+  const lastActivityRef = useRef(null);
 
   useEffect(() => {
+    // Set here rather than as useRef's initial value — calling Date.now()
+    // during render is impure; effects are the right place for it.
+    lastActivityRef.current = Date.now();
+
     const markActive = () => {
       lastActivityRef.current = Date.now();
     };
@@ -66,7 +67,7 @@ export function getTotalActiveSeconds() {
 }
 
 export function getActiveSecondsInLastNDays(days) {
-  let byDay = {};
+  let byDay;
   try {
     byDay = JSON.parse(localStorage.getItem(userScopedKey(DAILY_KEY)) || '{}');
   } catch {
@@ -77,7 +78,7 @@ export function getActiveSecondsInLastNDays(days) {
   for (let i = 0; i < days; i++) {
     const d = new Date(now);
     d.setDate(d.getDate() - i);
-    const key = d.toISOString().slice(0, 10);
+    const key = localDateKey(d);
     sum += byDay[key] || 0;
   }
   return sum;

@@ -43,6 +43,34 @@ export const userScopedKey = (key) => {
 };
 
 /**
+ * Decodes a JWT's payload with no library: split on '.', base64url-decode
+ * the middle segment, parse the JSON. Returns null for a missing/malformed
+ * token rather than throwing.
+ */
+function decodeJwtPayload(token) {
+  try {
+    const base64Url = token.split('.')[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the token is missing, malformed, or past its `exp` claim.
+ * Lets the app log out immediately on load instead of waiting for the
+ * backend to reject the first request with a 401.
+ */
+export const isTokenExpired = (token) => {
+  if (!token) return true;
+  const payload = decodeJwtPayload(token);
+  if (!payload || typeof payload.exp !== 'number') return false;
+  return Date.now() >= payload.exp * 1000;
+};
+
+/**
  * Core request helper that wraps fetch and automatically handles:
  * - JWT Authorization header insertion
  * - Error propagation
@@ -68,9 +96,9 @@ async function request(endpoint, options = {}) {
   } catch (netError) {
     // True network connection failure (e.g. server down)
     console.error(`Network connection failed on ${endpoint}:`, netError.message);
-    throw new Error('Failed to connect to backend server. Please ensure the backend is running.');
+    throw new Error('Failed to connect to backend server. Please ensure the backend is running.', { cause: netError });
   }
-  
+
   // Handle HTTP status errors (401, 400, etc.)
   if (response.status === 401) {
     // The backend now always sends one generic message for a failed login
@@ -79,7 +107,9 @@ async function request(endpoint, options = {}) {
       try {
         const data = await response.json();
         detail = data.detail || detail;
-      } catch (e) {}
+      } catch {
+        // Response body wasn't JSON — keep the default detail message above.
+      }
       throw new Error(detail);
     }
     // Clear auth on unauthorized and dispatch event or handle redirect
@@ -88,15 +118,15 @@ async function request(endpoint, options = {}) {
     window.dispatchEvent(new Event('auth-expired'));
     throw new Error('Session expired. Please log in again.');
   }
-  
+
   let data;
   try {
     data = await response.json();
   } catch (jsonErr) {
     if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}`);
+      throw new Error(`Request failed with status ${response.status}`, { cause: jsonErr });
     }
-    throw new Error('Failed to parse server response.');
+    throw new Error('Failed to parse server response.', { cause: jsonErr });
   }
   
   if (!response.ok) {
@@ -194,7 +224,7 @@ export const api = {
             try {
               const res = JSON.parse(xhr.responseText);
               resolve(res);
-            } catch (e) {
+            } catch {
               resolve({ status: 'Book uploaded and chunked successfully' });
             }
           } else {
@@ -202,7 +232,9 @@ export const api = {
             try {
               const res = JSON.parse(xhr.responseText);
               errorMsg = res.detail || errorMsg;
-            } catch (e) {}
+            } catch {
+              // Response body wasn't JSON — keep the default errorMsg above.
+            }
             reject(new Error(errorMsg));
           }
         };

@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { AuthProvider } from './hooks/useAuth';
+import { AuthProvider } from './hooks/AuthProvider';
 import ProtectedRoute from './components/ProtectedRoute';
 import PageLayout from './components/PageLayout';
+import ErrorBoundary from './components/ErrorBoundary';
 
 // Pages
 import Login from './pages/Login';
@@ -33,31 +34,33 @@ export default function App() {
   }, [darkMode]);
 
   return (
-    <AuthProvider>
-      <BrowserRouter>
-        <Routes>
-          {/* Public Auth Route */}
-          <Route path="/login" element={<Login />} />
+    <ErrorBoundary>
+      <AuthProvider>
+        <BrowserRouter>
+          <Routes>
+            {/* Public Auth Route */}
+            <Route path="/login" element={<Login />} />
 
-          {/* Protected Main SaaS Routes */}
-          <Route 
-            element={
-              <ProtectedRoute>
-                <PageLayout darkMode={darkMode} setDarkMode={setDarkMode} />
-              </ProtectedRoute>
-            }
-          >
-            <Route path="/" element={<Home />} />
-            <Route path="/chat" element={<Chat />} />
-            <Route path="/documents" element={<Documents />} />
-            <Route path="/tools" element={<AITools />} />
-            <Route path="/analytics" element={<Analytics />} />
-          </Route>
+            {/* Protected Main SaaS Routes */}
+            <Route
+              element={
+                <ProtectedRoute>
+                  <PageLayout darkMode={darkMode} setDarkMode={setDarkMode} />
+                </ProtectedRoute>
+              }
+            >
+              <Route path="/" element={<Home />} />
+              <Route path="/chat" element={<Chat />} />
+              <Route path="/documents" element={<Documents />} />
+              <Route path="/tools" element={<AITools />} />
+              <Route path="/analytics" element={<Analytics />} />
+            </Route>
 
-          {/* Fallback Catch-All Redirect */}
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </BrowserRouter>
-    </AuthProvider>
+            {/* Fallback Catch-All Redirect */}
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </BrowserRouter>
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }

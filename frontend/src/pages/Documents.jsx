@@ -1,13 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { api } from '../services/api';
-import { 
-  Upload, 
-  Search, 
-  Trash2, 
-  FileText, 
-  AlertCircle, 
+import {
+  Upload,
+  Search,
+  Trash2,
+  FileText,
+  AlertCircle,
   Sparkles,
-  Info,
   CheckCircle2,
   FolderOpen
 } from 'lucide-react';
@@ -15,8 +14,9 @@ import {
 export default function Documents() {
   const [books, setBooks] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
-  
+
   // Upload States
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -24,22 +24,34 @@ export default function Documents() {
   const [uploadError, setUploadError] = useState('');
   const [uploadSuccess, setUploadSuccess] = useState('');
 
-  // Load books
-  const loadBooks = async () => {
+  // Load books. Wrapped in useCallback with a stable (empty) dependency
+  // list so it can be safely listed as an effect dependency below.
+  const loadBooks = useCallback(async () => {
     setIsLoading(true);
     try {
       const data = await api.books.getAll();
       setBooks(data || []);
+      setLoadError('');
     } catch (error) {
       console.error('Failed to fetch books:', error);
+      setLoadError(error.message || 'Could not reach the backend. Please make sure the server is running.');
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadBooks();
-  }, []);
+    // Guard against setting state after this component has unmounted (e.g.
+    // navigating away before the request resolves).
+    let ignore = false;
+    (async () => {
+      if (ignore) return;
+      await loadBooks();
+    })();
+    return () => {
+      ignore = true;
+    };
+  }, [loadBooks]);
 
   // Upload book API call
   const handleUploadFile = async (file) => {
@@ -223,6 +235,12 @@ export default function Documents() {
           <div className="h-44 bg-slate-100 dark:bg-slate-800/60 rounded-[28px] animate-pulse"></div>
           <div className="h-44 bg-slate-100 dark:bg-slate-800/60 rounded-[28px] animate-pulse"></div>
           <div className="h-44 bg-slate-100 dark:bg-slate-800/60 rounded-[28px] animate-pulse"></div>
+        </div>
+      ) : loadError ? (
+        <div className="text-center py-20 border-2 border-dashed border-rose-200 dark:border-rose-900/40 rounded-[32px] bg-rose-50/30 dark:bg-rose-950/10">
+          <AlertCircle size={44} className="mx-auto text-rose-400 dark:text-rose-500 mb-4" />
+          <h3 className="text-sm font-bold text-rose-600 dark:text-rose-400">Could not load your documents</h3>
+          <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-2 max-w-xs mx-auto">{loadError}</p>
         </div>
       ) : filteredBooks.length === 0 ? (
         <div className="text-center py-20 border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-[32px] bg-white/20 dark:bg-slate-900/10 backdrop-blur-md">

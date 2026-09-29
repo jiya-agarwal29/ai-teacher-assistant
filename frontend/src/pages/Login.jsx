@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import {
@@ -36,13 +36,6 @@ export default function Login() {
       document.documentElement.classList.remove('dark');
     }
   }, [darkMode]);
-
-  // Clear errors when toggling tabs
-  useEffect(() => {
-    clearError();
-    setValidationError('');
-    setSuccessMessage('');
-  }, [isLoginTab]);
 
   // If already authenticated, redirect immediately
   useEffect(() => {
@@ -93,8 +86,18 @@ export default function Login() {
     }
   };
 
+  // Clearing feedback state belongs in the event handler that switches tabs,
+  // not in an effect watching isLoginTab — there's no external system to
+  // synchronize with here, just a response to a user action.
+  const handleTabSwitch = (loginTab) => {
+    setIsLoginTab(loginTab);
+    clearError();
+    setValidationError('');
+    setSuccessMessage('');
+  };
+
   const handleHeroCta = () => {
-    setIsLoginTab(false);
+    handleTabSwitch(false);
     formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     setTimeout(() => usernameRef.current?.focus(), 350);
   };
@@ -200,7 +203,7 @@ export default function Login() {
             <div className="flex bg-slate-100 dark:bg-slate-950 p-1 rounded-full mb-6 border border-slate-200/70 dark:border-slate-800">
               <button
                 type="button"
-                onClick={() => setIsLoginTab(true)}
+                onClick={() => handleTabSwitch(true)}
                 className={`flex-1 py-2 rounded-full text-xs font-semibold tracking-tight transition-all duration-200 ${
                   isLoginTab
                     ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm'
@@ -211,7 +214,7 @@ export default function Login() {
               </button>
               <button
                 type="button"
-                onClick={() => setIsLoginTab(false)}
+                onClick={() => handleTabSwitch(false)}
                 className={`flex-1 py-2 rounded-full text-xs font-semibold tracking-tight transition-all duration-200 ${
                   !isLoginTab
                     ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm'

@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { api, userScopedKey } from '../services/api';
 import { useAuth } from '../hooks/useAuth';
 import { 
@@ -18,10 +18,10 @@ import {
 
 export default function Home() {
   const { user } = useAuth();
-  const navigate = useNavigate();
-  
+
   const [books, setBooks] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [stats, setStats] = useState({
     documents: 0,
     queries: 0,
@@ -32,18 +32,22 @@ export default function Home() {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState('');
-  
-  // Load books
-  const loadBooks = async () => {
+
+  // Load books. Wrapped in useCallback with a stable (empty) dependency
+  // list — it only closes over stable setState functions and module-level
+  // imports — so it can be safely listed as an effect dependency below
+  // without causing re-runs on every render.
+  const loadBooks = useCallback(async () => {
     setIsLoading(true);
     try {
       const data = await api.books.getAll();
       setBooks(data || []);
-      
+      setLoadError('');
+
       // Load query/quiz count from localStorage to make stats interactive and persist
       const queriesCount = parseInt(localStorage.getItem(userScopedKey('queries_count')) || '0');
       const quizCount = parseInt(localStorage.getItem(userScopedKey('quiz_count')) || '0');
-      
+
       setStats({
         documents: data ? data.length : 0,
         queries: queriesCount,
@@ -51,14 +55,24 @@ export default function Home() {
       });
     } catch (error) {
       console.error('Failed to load books for dashboard:', error);
+      setLoadError(error.message || 'Could not reach the backend. Please make sure the server is running.');
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadBooks();
-  }, []);
+    // Guard against setting state after this component has unmounted (e.g.
+    // navigating away before the request resolves).
+    let ignore = false;
+    (async () => {
+      if (ignore) return;
+      await loadBooks();
+    })();
+    return () => {
+      ignore = true;
+    };
+  }, [loadBooks]);
 
   // Handle direct file upload from dashboard
   const handleFileUpload = async (e) => {
@@ -302,6 +316,10 @@ export default function Home() {
               <div className="space-y-3 py-4">
                 <div className="h-10 bg-slate-100 dark:bg-slate-800/60 rounded-xl animate-pulse"></div>
                 <div className="h-10 bg-slate-100 dark:bg-slate-800/60 rounded-xl animate-pulse"></div>
+              </div>
+            ) : loadError ? (
+              <div className="text-center py-10 border border-dashed border-rose-200 dark:border-rose-900/40 rounded-2xl bg-rose-50/50 dark:bg-rose-950/10">
+                <p className="text-xs text-rose-500 dark:text-rose-400 font-medium">{loadError}</p>
               </div>
             ) : books.length === 0 ? (
               <div className="text-center py-10 border border-dashed border-slate-100 dark:border-slate-800 rounded-2xl bg-slate-50/50 dark:bg-slate-950/10">

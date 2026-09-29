@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, userScopedKey } from '../services/api';
 import { recordQuizAttempt } from '../hooks/useQuizHistory';

@@ -1,11 +1,8 @@
 import { userScopedKey } from '../services/api';
+import { localDateKey } from '../utils/dateKey';
 
 const TOTAL_KEY = 'queries_count';
 const DAILY_KEY = 'queries_by_day'; // { "YYYY-MM-DD": count }
-
-function todayKey(date = new Date()) {
-  return date.toISOString().slice(0, 10);
-}
 
 function readDaily() {
   try {
@@ -22,7 +19,7 @@ export function recordQuery() {
   localStorage.setItem(totalKey, String(total));
 
   const byDay = readDaily();
-  const key = todayKey();
+  const key = localDateKey();
   byDay[key] = (byDay[key] || 0) + 1;
   localStorage.setItem(userScopedKey(DAILY_KEY), JSON.stringify(byDay));
 }
@@ -39,7 +36,7 @@ export function getQueriesByDay(days) {
   for (let i = days - 1; i >= 0; i--) {
     const d = new Date(now);
     d.setDate(d.getDate() - i);
-    const key = todayKey(d);
+    const key = localDateKey(d);
     result.push({
       day: d.toLocaleDateString(undefined, { weekday: 'short' }),
       date: key,

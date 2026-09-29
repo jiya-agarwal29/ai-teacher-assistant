@@ -1,16 +1,29 @@
-import { createContext, useContext, useState, useEffect } from 'react';
-import { api, getToken, getUsername } from '../services/api';
-
-const AuthContext = createContext(null);
+import { useState, useEffect } from 'react';
+import { api, getToken, getUsername, setToken as persistToken, isTokenExpired } from '../services/api';
+import { AuthContext } from './authContext';
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(getUsername());
-  const [token, setToken] = useState(getToken());
+  const [token, setToken] = useState(() => {
+    const stored = getToken();
+    return stored && isTokenExpired(stored) ? null : stored;
+  });
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
 
   // Synced state check
   const isAuthenticated = !!token;
+
+  useEffect(() => {
+    // `token` state above already initializes to null when the stored token
+    // is expired, so the app is correctly "logged out" from the first
+    // render — this just removes the stale value from storage instead of
+    // leaving it there until the backend would otherwise reject it with a 401.
+    const stored = getToken();
+    if (stored && isTokenExpired(stored)) {
+      persistToken(null);
+    }
+  }, []);
 
   useEffect(() => {
     // Listen for auth expiration events dispatched by api client
@@ -77,12 +90,4 @@ export function AuthProvider({ children }) {
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
-}
-
-export function useAuth() {
-  const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
-  return context;
 }
