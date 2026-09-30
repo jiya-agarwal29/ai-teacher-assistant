@@ -18,6 +18,7 @@ import embeddings
 import llm
 from rag import (
     generate_quiz,
+    format_quiz_text,
     check_context_relevance,
     summarize_text_in_bullets,
     extract_definitions_and_statements,
@@ -156,6 +157,48 @@ FLASHCARDS_SCHEMA = {
     },
     "required": ["cards"]
 }
+
+QUIZ_QUESTION_TYPES = [
+    "mcq", "true_false", "fill_blank", "short_answer",
+    "long_answer", "scenario", "viva", "interview"
+]
+
+QUIZ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "type": {"type": "string", "enum": QUIZ_QUESTION_TYPES},
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "correctAnswer": {"type": "string"},
+                    "explanation": {"type": "string"},
+                    "source_index": {"type": "integer"}
+                },
+                "required": ["id", "type", "question", "correctAnswer", "explanation", "source_index"]
+            }
+        }
+    },
+    "required": ["questions"]
+}
+
+QUIZ_PROMPT_RULES = (
+    "Use ONLY the provided numbered sources -- never invent facts. Generate exactly "
+    "one question of each type: mcq, true_false, fill_blank, short_answer, "
+    "long_answer, scenario, viva, interview. No question's text may reveal or hint "
+    "at its own correct answer. For type mcq, provide exactly 4 distinct, plausible "
+    "options and set correctAnswer to the letter (A, B, C, or D) of the correct one. "
+    "For type true_false, set options to [\"True\", \"False\"] and correctAnswer to "
+    "\"A\" or \"B\" -- mix true and false answers across the quiz rather than always "
+    "picking the same one. For every other type, correctAnswer is the actual answer "
+    "text (not a letter) and options is omitted. Every question must test a "
+    "different concept from the sources, and every question needs a source_index: "
+    "the number of the source chunk it's grounded in."
+)
 
 
 class RegisterRequest(BaseModel):
@@ -751,6 +794,126 @@ def ai_tutor(
     return _answer_question(payload.question, current_user, db)
 
 
+def _validate_quiz_questions(raw_questions, num_sources: int):
+    """
+    Validates and cleans Gemini's raw quiz question list: correct option
+    counts, a valid correctAnswer, no question leaking its own answer (for
+    types where correctAnswer is real answer text rather than a letter),
+    and no duplicate questions. Invalid questions are dropped rather than
+    failing the whole quiz. Returns cleaned question dicts -- id/type/
+    question/options?/correctAnswer/explanation, matching the existing
+    response shape (source_index is internal-only and stripped here).
+    """
+    if not isinstance(raw_questions, list):
+        return []
+
+    valid = []
+    seen_question_text = set()
+
+    for q in raw_questions:
+        if not isinstance(q, dict):
+            continue
+
+        q_type = q.get("type")
+        question_text = q.get("question")
+        correct_answer = q.get("correctAnswer")
+        explanation = q.get("explanation")
+        source_index = q.get("source_index")
+        options = q.get("options")
+
+        if q_type not in QUIZ_QUESTION_TYPES:
+            continue
+        if not isinstance(question_text, str) or not question_text.strip():
+            continue
+        if not isinstance(correct_answer, str) or not correct_answer.strip():
+            continue
+        if not isinstance(explanation, str) or not explanation.strip():
+            continue
+        if not isinstance(source_index, int) or not (1 <= source_index <= num_sources):
+            continue
+
+        cleaned_options = None
+
+        if q_type == "mcq":
+            if not isinstance(options, list) or len(options) != 4:
+                continue
+            # Gemini sometimes prefixes its own option text with a letter
+            # (e.g. "A) The atmospheric cycle") even though it also
+            # returns a separate lettered correctAnswer -- strip a leading
+            # "A) "/"A. "/"A: " style prefix so the option isn't rendered
+            # double-lettered (e.g. "A. A) ...").
+            option_texts = [
+                re.sub(r'^[A-Da-d][\.\):-]\s*', '', o.strip())
+                for o in options if isinstance(o, str) and o.strip()
+            ]
+            if len(option_texts) != 4:
+                continue
+            if len({o.lower() for o in option_texts}) != 4:
+                continue  # options must be distinct
+            if correct_answer not in ("A", "B", "C", "D"):
+                continue
+            cleaned_options = option_texts
+
+        elif q_type == "true_false":
+            if not isinstance(options, list) or [str(o).strip() for o in options] != ["True", "False"]:
+                continue
+            if correct_answer not in ("A", "B"):
+                continue
+            cleaned_options = ["True", "False"]
+
+        else:
+            # correctAnswer is real answer text here, not a letter -- the
+            # question text must not give it away.
+            if correct_answer.strip().lower() in question_text.lower():
+                continue
+
+        normalized = re.sub(r'\s+', ' ', question_text.strip().lower())
+        if normalized in seen_question_text:
+            continue  # duplicate question
+        seen_question_text.add(normalized)
+
+        cleaned = {
+            "id": len(valid) + 1,
+            "type": q_type,
+            "question": question_text.strip(),
+            "correctAnswer": correct_answer.strip(),
+            "explanation": explanation.strip()
+        }
+        if cleaned_options is not None:
+            cleaned["options"] = cleaned_options
+        valid.append(cleaned)
+
+    return valid
+
+
+def _generate_quiz_with_gemini(topic: str, top_pages):
+    """
+    Builds the numbered-source prompt, asks Gemini for a full quiz as
+    JSON, and validates/cleans the result. Returns (quiz_text, questions)
+    on success, or None if fewer than 3 valid questions remain even after
+    one retry -- the caller falls back to generate_quiz() (the local
+    hybrid generator) in that case. Raises NotImplementedError for
+    LLM_PROVIDER=local and llm.LLMUnavailableError on a persistently
+    unavailable provider, same as llm.generate_json() itself.
+    """
+    numbered_sources = "\n\n".join(
+        f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
+    )
+    prompt = (
+        f"Create a quiz about '{topic}' based on the numbered sources below.\n\n"
+        f"{QUIZ_PROMPT_RULES}\n\nSources:\n{numbered_sources}"
+    )
+
+    for _attempt in range(2):  # one retry if the first pass yields too few valid questions
+        result = llm.generate_json(prompt, schema=QUIZ_SCHEMA)
+        raw_questions = result.get("questions", []) if isinstance(result, dict) else []
+        questions = _validate_quiz_questions(raw_questions, len(top_pages))
+        if len(questions) >= 3:
+            return format_quiz_text(questions), questions
+
+    return None
+
+
 @app.get("/generate-quiz")
 def generate_ai_quiz(
     topic: str,
@@ -772,7 +935,7 @@ def generate_ai_quiz(
             "questions": []
         }
 
-    top_pages = _retrieve_or_503(db, current_user.id, topic, top_k=3, apply_threshold=True)
+    top_pages = _retrieve_or_503(db, current_user.id, topic, top_k=5, apply_threshold=True)
 
     # Relevance checking using both cosine similarity and lexical overlap
     temp_context = " ".join([page.content for _, page in top_pages])
@@ -783,15 +946,20 @@ def generate_ai_quiz(
             "questions": []
         }
 
-    context = "\n\n".join([
-        page.content
-        for score, page in top_pages
-    ])
+    try:
+        result = _generate_quiz_with_gemini(topic, top_pages)
+    except NotImplementedError:
+        # LLM_PROVIDER=local has no structured JSON output -- go straight
+        # to the local hybrid quiz generator below.
+        result = None
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
-    quiz_text, questions = generate_quiz(
-        context,
-        topic
-    )
+    if result is None:
+        context = "\n\n".join(page.content for _, page in top_pages)
+        quiz_text, questions = generate_quiz(context, topic)
+    else:
+        quiz_text, questions = result
 
     return {
         "topic": topic,

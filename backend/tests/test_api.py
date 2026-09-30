@@ -353,4 +353,92 @@ def test_semantic_search_returns_503_when_query_embedding_stays_rate_limited(cli
     assert res.status_code == 503
     assert res.json()["detail"] == "AI service is busy. Please try again in a minute."
 
+
+WATER_CYCLE_CONTENT = b"""The Water Cycle
+
+The water cycle describes the continuous movement of water on, above, and below the surface of the Earth. Water evaporates from oceans, lakes, and rivers due to heat from the sun, turning into water vapor.
+
+Condensation is the process by which water vapor cools and turns into tiny droplets, forming clouds. When enough droplets gather, precipitation falls back to Earth as rain, snow, sleet, or hail.
+
+Plants release water vapor into the air through a process called transpiration, where water absorbed by roots evaporates from leaves. Groundwater is water stored underground in aquifers after infiltrating the soil."""
+
+
+def _upload_water_cycle_doc(client, headers, filename="water_cycle.txt"):
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": (filename, WATER_CYCLE_CONTENT, "text/plain")}
+    )
+    assert res.status_code == 200, res.text
+    return res.json()["book_id"]
+
+
+def test_quiz_retries_once_before_falling_back(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_water_cycle_doc(client, headers, "quiz_retry.txt")
+
+    call_count = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return {"questions": []}  # first attempt: nothing usable
+        return {
+            "questions": [
+                {
+                    "id": 1, "type": "short_answer",
+                    "question": "What causes water to evaporate?",
+                    "correctAnswer": "Heat from the sun.",
+                    "explanation": "Explained in source 1.", "source_index": 1
+                },
+                {
+                    "id": 2, "type": "long_answer",
+                    "question": "Describe condensation.",
+                    "correctAnswer": "Water vapor cools into droplets.",
+                    "explanation": "Explained in source 1.", "source_index": 1
+                },
+                {
+                    "id": 3, "type": "scenario",
+                    "question": "A hiker sees clouds forming overhead. What process is at work?",
+                    "correctAnswer": "Condensation.",
+                    "explanation": "Explained in source 1.", "source_index": 1
+                },
+            ]
+        }
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3
+    assert call_count["n"] == 2  # exactly one retry happened
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_quiz_falls_back_to_hybrid_generator_when_gemini_yields_too_few(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_water_cycle_doc(client, headers, "quiz_fallback.txt")
+
+    # Gemini returns no usable questions on both the initial attempt and
+    # the retry -- the route must fall back to the local hybrid generator
+    # rather than returning an empty or broken quiz.
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {"questions": []}
+    )
+
+    res = client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) >= 3
+    assert data["quiz"]  # non-empty legacy text format too
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
     client.delete(f"/books/{book_id}", headers=headers)

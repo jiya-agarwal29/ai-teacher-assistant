@@ -503,7 +503,15 @@ def generate_hybrid_quiz(context, topic):
     if len(questions) < 3:
         return "Not enough information found in uploaded documents.", []
 
-    # Format a raw text version for legacy support
+    return format_quiz_text(questions), questions
+
+def format_quiz_text(questions):
+    """
+    Formats a list of question dicts (id, type, question, options?,
+    correctAnswer, explanation) into the raw legacy-format quiz text.
+    Shared by the local hybrid quiz generator and the Gemini quiz path in
+    main.py so both produce the same "quiz" string shape.
+    """
     raw_text_parts = []
     for q in questions:
         raw_text_parts.append(f"Q{q['id']}: {q['question']}")
@@ -515,8 +523,7 @@ def generate_hybrid_quiz(context, topic):
         raw_text_parts.append(f"Correct Answer: {q['correctAnswer']}")
         raw_text_parts.append(f"Explanation: {q['explanation']}\n")
 
-    quiz_text = "\n".join(raw_text_parts)
-    return quiz_text, questions
+    return "\n".join(raw_text_parts)
 
 def generate_quiz(context, topic):
     return generate_hybrid_quiz(context, topic)
