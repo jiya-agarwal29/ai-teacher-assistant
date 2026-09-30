@@ -72,9 +72,15 @@ class _FakeGeminiClient:
         self.models = _FakeGeminiModels(side_effects, dim=dim)
 
 
-def _gemini_api_error(code):
+class _FakeHttpResponse:
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+
+def _gemini_api_error(code, retry_after=None):
     from google.genai import errors as genai_errors
-    return genai_errors.APIError(code=code, response_json={"message": "boom"}, response=None)
+    response = _FakeHttpResponse({"retry-after": str(retry_after)}) if retry_after is not None else None
+    return genai_errors.APIError(code=code, response_json={"message": "boom"}, response=response)
 
 
 @pytest.fixture(autouse=True)
@@ -194,25 +200,55 @@ def test_gemini_embeddings_are_l2_normalised(fake_gemini):
     assert np.allclose(norms, 1.0)
 
 
-def test_gemini_embed_retries_after_rate_limit_then_succeeds(fake_gemini):
+def test_gemini_embed_waits_out_mid_upload_rate_limit_and_finishes(fake_gemini, monkeypatch, caplog):
+    monkeypatch.setenv("GEMINI_EMBED_BATCH_SIZE", "5")
     client = fake_gemini([
-        _gemini_api_error(429),
-        _FakeGeminiEmbedResponse([[1.0] * 8]),
+        _FakeGeminiEmbedResponse([[1.0] * 8] * 5),   # batch 1 succeeds
+        _gemini_api_error(429, retry_after=30),       # batch 2, first attempt: rate limited
+        _FakeGeminiEmbedResponse([[1.0] * 8] * 5),   # batch 2, retried: succeeds
     ])
-    vector = embeddings.embed_query("hello")
-    assert client.models.calls  # made it past the retry
-    assert len(client.models.calls) == 2
-    assert np.isclose(np.linalg.norm(vector), 1.0)
+    texts = [f"chunk {i}" for i in range(10)]
+
+    with caplog.at_level("INFO", logger="embeddings"):
+        matrix = embeddings.embed_documents(texts)
+
+    # All 10 chunks made it through -- the 429 paused and resumed the
+    # upload rather than failing it.
+    assert matrix.shape[0] == 10
+    assert len(client.models.calls) == 3
+    norms = np.linalg.norm(matrix, axis=1)
+    assert np.allclose(norms, 1.0)
+
+    assert any(
+        "embedded 5/10 chunks, waiting 30s for rate limit" in record.message
+        for record in caplog.records
+    )
 
 
-def test_gemini_embed_exhausted_rate_limit_raises_service_busy(fake_gemini):
+def test_gemini_embed_exceeds_total_wait_budget_raises_service_busy(fake_gemini, monkeypatch):
+    monkeypatch.setenv("EMBED_MAX_WAIT_SECONDS", "50")
     client = fake_gemini([
-        _gemini_api_error(429),
-        _gemini_api_error(429),
-        _gemini_api_error(429),
+        _gemini_api_error(429, retry_after=20),
+        _gemini_api_error(429, retry_after=20),
+        _gemini_api_error(429, retry_after=20),
     ])
     with pytest.raises(embeddings.EmbeddingServiceBusyError):
         embeddings.embed_documents(["a"])
+    # First two 429s are waited out (running total 20s, then 40s, both
+    # within the 50s budget); the third would push the total to 60s, over
+    # budget, so it raises instead of waiting (or calling) a 4th time.
+    assert len(client.models.calls) == 3
+
+
+def test_gemini_embed_non_rate_limit_error_still_uses_bounded_retry(fake_gemini):
+    client = fake_gemini([
+        _gemini_api_error(503),
+        _gemini_api_error(503),
+        _gemini_api_error(503),
+    ])
+    with pytest.raises(RuntimeError):
+        embeddings.embed_documents(["a"])
+    # Bounded attempts (_MAX_ATTEMPTS), not the unbounded rate-limit wait.
     assert len(client.models.calls) == embeddings._MAX_ATTEMPTS
 
 

@@ -39,6 +39,11 @@ _GEMINI_EMBED_DEFAULT_MODEL = "gemini-embedding-001"
 _GEMINI_EMBED_DEFAULT_DIM = 768
 _GEMINI_EMBED_DEFAULT_BATCH_SIZE = 50
 _GEMINI_BASE_BACKOFF_SECONDS = 1.0
+# Gemini's free tier embed_content quota resets roughly per-minute. When a
+# 429 doesn't carry a Retry-After header, this is how long we wait before
+# retrying the same batch.
+_GEMINI_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60.0
+_EMBED_MAX_WAIT_DEFAULT_SECONDS = 300.0
 
 _MAX_ATTEMPTS = 3
 
@@ -78,6 +83,13 @@ def _gemini_embed_batch_size() -> int:
         return int(os.getenv("GEMINI_EMBED_BATCH_SIZE", str(_GEMINI_EMBED_DEFAULT_BATCH_SIZE)))
     except ValueError:
         return _GEMINI_EMBED_DEFAULT_BATCH_SIZE
+
+
+def _embed_max_wait_seconds() -> float:
+    try:
+        return float(os.getenv("EMBED_MAX_WAIT_SECONDS", str(_EMBED_MAX_WAIT_DEFAULT_SECONDS)))
+    except ValueError:
+        return _EMBED_MAX_WAIT_DEFAULT_SECONDS
 
 
 def active_model_name() -> str:
@@ -194,22 +206,16 @@ def _gemini_retry_after_seconds(exc: Exception):
         return None
 
 
-def _call_with_retry(
-    call_fn,
-    description: str,
-    is_retryable,
-    is_rate_limited,
-    base_backoff_seconds: float,
-    get_retry_after=None,
-):
+def _call_with_retry(call_fn, description: str, is_retryable, is_rate_limited, base_backoff_seconds: float):
     """
     Calls call_fn() with up to _MAX_ATTEMPTS tries, retrying with
-    exponential backoff (or a provider-given Retry-After delay, if
-    get_retry_after is given and returns one) only on rate-limit/server
-    errors. Exhausting retries on a rate-limit error raises
-    EmbeddingServiceBusyError; any other failure raises RuntimeError
-    instead of leaking the raw provider exception. Never logs the texts
-    being embedded.
+    exponential backoff only on rate-limit/server errors. Exhausting
+    retries on a rate-limit error raises EmbeddingServiceBusyError; any
+    other failure raises RuntimeError instead of leaking the raw provider
+    exception. Never logs the texts being embedded.
+
+    Used by the Voyage path. The Gemini path has its own pacing logic (see
+    _embed_gemini) that waits out rate limits instead of giving up on them.
     """
     delay = base_backoff_seconds
     last_exc = None
@@ -226,16 +232,12 @@ def _call_with_retry(
                 )
                 break
 
-            wait_seconds = get_retry_after(exc) if get_retry_after else None
-            if not wait_seconds or wait_seconds <= 0:
-                wait_seconds = delay
-                delay *= 2
-
             logger.warning(
                 "%s failed on attempt %d/%d (%s); retrying in %.1fs",
-                description, attempt, _MAX_ATTEMPTS, type(exc).__name__, wait_seconds
+                description, attempt, _MAX_ATTEMPTS, type(exc).__name__, delay
             )
-            time.sleep(wait_seconds)
+            time.sleep(delay)
+            delay *= 2
 
     if is_rate_limited(last_exc):
         raise EmbeddingServiceBusyError(
@@ -277,6 +279,16 @@ def _embed_voyage(texts: list[str], input_type: str) -> np.ndarray:
 
 
 def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
+    """
+    Embeds `texts` in batches via Gemini. On a 429 (free-tier quota), waits
+    for the quota to reset (Retry-After if given, otherwise
+    _GEMINI_RATE_LIMIT_DEFAULT_WAIT_SECONDS) and retries the *same* batch,
+    rather than giving up -- large uploads finish on their own, just more
+    slowly, instead of failing outright. The total time spent waiting
+    across the whole call is capped at EMBED_MAX_WAIT_SECONDS; only once
+    that's exceeded do we raise EmbeddingServiceBusyError. Non-rate-limit
+    errors (5xx, etc.) still use the bounded attempt/backoff retry.
+    """
     import llm
     from google.genai import types
 
@@ -284,9 +296,14 @@ def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
     model = _gemini_embed_model()
     dim = _gemini_embed_dim()
     batch_size = _gemini_embed_batch_size()
-    all_vectors = []
+    max_wait = _embed_max_wait_seconds()
 
-    for start in range(0, len(texts), batch_size):
+    all_vectors = []
+    total_wait = 0.0
+    embedded_count = 0
+    total_count = len(texts)
+
+    for start in range(0, total_count, batch_size):
         batch = texts[start:start + batch_size]
 
         def call(batch=batch):
@@ -300,14 +317,60 @@ def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
             )
             return [embedding.values for embedding in response.embeddings]
 
-        vectors = _call_with_retry(
-            call, f"Gemini embed_content ({task_type})",
-            is_retryable=_is_retryable_gemini_embed_error,
-            is_rate_limited=_is_gemini_rate_limited,
-            base_backoff_seconds=_GEMINI_BASE_BACKOFF_SECONDS,
-            get_retry_after=_gemini_retry_after_seconds,
-        )
+        description = f"Gemini embed_content ({task_type})"
+        backoff = _GEMINI_BASE_BACKOFF_SECONDS
+        attempt = 0
+        vectors = None
+
+        while vectors is None:
+            attempt += 1
+            try:
+                vectors = call()
+            except Exception as exc:
+                if _is_gemini_rate_limited(exc):
+                    wait_seconds = _gemini_retry_after_seconds(exc) or _GEMINI_RATE_LIMIT_DEFAULT_WAIT_SECONDS
+                    if total_wait + wait_seconds > max_wait:
+                        logger.error(
+                            "%s still rate-limited after waiting %.0fs total "
+                            "(limit %.0fs); giving up",
+                            description, total_wait, max_wait
+                        )
+                        raise EmbeddingServiceBusyError(
+                            f"{description} is still rate-limited after waiting "
+                            f"{total_wait:.0f}s (limit {max_wait:.0f}s)"
+                        ) from exc
+
+                    total_wait += wait_seconds
+                    logger.info(
+                        "embedded %d/%d chunks, waiting %ds for rate limit",
+                        embedded_count, total_count, int(round(wait_seconds))
+                    )
+                    time.sleep(wait_seconds)
+                    # A rate-limit wait isn't a failed "attempt" at getting
+                    # this batch through -- don't count it against the
+                    # bounded retry budget below.
+                    attempt = 0
+                    continue
+
+                if _is_retryable_gemini_embed_error(exc) and attempt < _MAX_ATTEMPTS:
+                    logger.warning(
+                        "%s failed on attempt %d/%d (%s); retrying in %.1fs",
+                        description, attempt, _MAX_ATTEMPTS, type(exc).__name__, backoff
+                    )
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+
+                logger.error(
+                    "%s failed on attempt %d (%s); giving up",
+                    description, attempt, type(exc).__name__
+                )
+                raise RuntimeError(
+                    f"{description} failed after {attempt} attempt(s)"
+                ) from exc
+
         all_vectors.extend(vectors)
+        embedded_count += len(batch)
 
     matrix = np.asarray(all_vectors, dtype=np.float32)
     # gemini-embedding-001 does not L2-normalise its output when
