@@ -44,6 +44,11 @@ _GEMINI_BASE_BACKOFF_SECONDS = 1.0
 # retrying the same batch.
 _GEMINI_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60.0
 _EMBED_MAX_WAIT_DEFAULT_SECONDS = 300.0
+# Query embedding (chat/search/tutor/flashcards/quiz) is on the
+# interactive request path, so it gets a much shorter rate-limit wait
+# budget than a bulk document upload -- fail fast with a 503 instead of
+# making a user wait minutes for one question.
+_EMBED_QUERY_MAX_WAIT_DEFAULT_SECONDS = 15.0
 
 _MAX_ATTEMPTS = 3
 
@@ -90,6 +95,13 @@ def _embed_max_wait_seconds() -> float:
         return float(os.getenv("EMBED_MAX_WAIT_SECONDS", str(_EMBED_MAX_WAIT_DEFAULT_SECONDS)))
     except ValueError:
         return _EMBED_MAX_WAIT_DEFAULT_SECONDS
+
+
+def _embed_query_max_wait_seconds() -> float:
+    try:
+        return float(os.getenv("EMBED_QUERY_MAX_WAIT_SECONDS", str(_EMBED_QUERY_MAX_WAIT_DEFAULT_SECONDS)))
+    except ValueError:
+        return _EMBED_QUERY_MAX_WAIT_DEFAULT_SECONDS
 
 
 def active_model_name() -> str:
@@ -296,7 +308,13 @@ def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
     model = _gemini_embed_model()
     dim = _gemini_embed_dim()
     batch_size = _gemini_embed_batch_size()
-    max_wait = _embed_max_wait_seconds()
+    # Query embedding is on the interactive request path (chat/search/
+    # tutor/flashcards/quiz) and gets a much shorter wait budget than a
+    # bulk document upload.
+    max_wait = (
+        _embed_query_max_wait_seconds() if task_type == "RETRIEVAL_QUERY"
+        else _embed_max_wait_seconds()
+    )
 
     all_vectors = []
     total_wait = 0.0

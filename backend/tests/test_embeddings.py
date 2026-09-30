@@ -252,6 +252,28 @@ def test_gemini_embed_non_rate_limit_error_still_uses_bounded_retry(fake_gemini)
     assert len(client.models.calls) == embeddings._MAX_ATTEMPTS
 
 
+def test_embed_query_uses_its_own_shorter_wait_budget(fake_gemini, monkeypatch):
+    # embed_query() is on the interactive request path, so it gets a much
+    # shorter rate-limit wait budget than embed_documents() (document
+    # upload) -- a single 20s wait already exceeds the 10s query budget,
+    # so it should raise immediately without a second call.
+    monkeypatch.setenv("EMBED_QUERY_MAX_WAIT_SECONDS", "10")
+    query_client = fake_gemini([_gemini_api_error(429, retry_after=20)])
+    with pytest.raises(embeddings.EmbeddingServiceBusyError):
+        embeddings.embed_query("hello")
+    assert len(query_client.models.calls) == 1
+
+    # The same 20s wait is comfortably within the much larger (default)
+    # document-upload budget, so embed_documents() waits it out and
+    # succeeds instead.
+    doc_client = fake_gemini([
+        _gemini_api_error(429, retry_after=20),
+        _FakeGeminiEmbedResponse([[1.0] * 8]),
+    ])
+    embeddings.embed_documents(["a"])
+    assert len(doc_client.models.calls) == 2
+
+
 @pytest.fixture
 def db_session():
     engine = create_engine("sqlite:///:memory:")

@@ -72,6 +72,18 @@ def _auth_headers(client, username, password):
     return {"Authorization": f"Bearer {token}"}
 
 
+@pytest.fixture(scope="session")
+def llm_mock_headers(client):
+    """
+    One shared account, registered and logged in once, for every test below
+    that mocks llm.generate()/generate_json() -- /register and /login are
+    each rate-limited to 10/minute, so giving each of those tests its own
+    account would blow through that budget within one pytest run.
+    """
+    _register(client, "llm_mock_test_user", "llmmocktestpass1")
+    return _auth_headers(client, "llm_mock_test_user", "llmmocktestpass1")
+
+
 def test_register(client):
     res = _register(client, "apitestuser1", "apitestpass123")
     assert res.status_code == 200
@@ -191,3 +203,154 @@ def test_upload_returns_503_when_embedding_service_stays_rate_limited(client, mo
     # Nothing was saved
     books_res = client.get("/books", headers=headers)
     assert books_res.json() == []
+
+
+BEES_CONTENT = b"Bees pollinate flowering plants and are essential for many food crops around the world."
+
+
+def _upload_bees_doc(client, headers, filename="bees.txt"):
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": (filename, BEES_CONTENT, "text/plain")}
+    )
+    assert res.status_code == 200, res.text
+    return res.json()["book_id"]
+
+
+def test_chat_grounded_answer_includes_citations(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_bees.txt")
+
+    captured = {}
+
+    def fake_generate(prompt, system=None, temperature=0.3, max_tokens=1024):
+        captured["prompt"] = prompt
+        captured["system"] = system
+        return "Bees pollinate plants [1], supporting food crops worldwide."
+
+    monkeypatch.setattr(llm_module, "generate", fake_generate)
+
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200
+    data = res.json()
+    assert "[1]" in data["answer"]
+    assert len(data["sources"]) >= 1
+    assert data["sources"][0]["book_name"] == "chat_bees.txt"
+    # The prompt sent to the LLM includes a numbered, book+page-labelled source.
+    assert "[1]" in captured["prompt"]
+    assert "chat_bees.txt" in captured["prompt"]
+    assert captured["system"] == main.CHAT_SYSTEM_INSTRUCTION
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_llm_reports_not_enough_information(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_bees2.txt")
+
+    monkeypatch.setattr(
+        llm_module, "generate",
+        lambda *a, **kw: "The uploaded documents do not contain enough information for this question."
+    )
+
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["answer"] == "The uploaded documents do not contain enough information for this question."
+    assert data["sources"] == []
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_returns_503_on_llm_unavailable(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_bees3.txt")
+
+    def raise_unavailable(*a, **kw):
+        raise llm_module.LLMUnavailableError("boom")
+
+    monkeypatch.setattr(llm_module, "generate", raise_unavailable)
+
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 503
+    assert res.json()["detail"] == "AI service is busy. Please try again in a minute."
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_summarize_returns_bullets(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {"bullets": ["Point one.", "Point two.", "Point three."]}
+    )
+
+    res = client.post(
+        "/tools/summarize",
+        headers=headers,
+        json={"text": "Some pasted paragraph about photosynthesis and plant biology."}
+    )
+    assert res.status_code == 200
+    assert res.json()["bullets"] == ["Point one.", "Point two.", "Point three."]
+
+
+def test_flashcards_drops_cards_with_invalid_source_index(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "flash_bees.txt")
+
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {
+            "cards": [
+                {"term": "Pollination", "definition": "The process bees help with.", "source_index": 1},
+                {"term": "Bad card", "definition": "Should be dropped.", "source_index": 99},
+                {"term": "Also bad", "definition": "Should be dropped too.", "source_index": 0},
+            ]
+        }
+    )
+
+    res = client.post("/tools/flashcards", headers=headers, json={"topic": "bees"})
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["cards"]) == 1
+    assert data["cards"][0]["term"] == "Pollination"
+    assert "flash_bees.txt" in data["cards"][0]["source"]
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_semantic_search_returns_503_when_query_embedding_stays_rate_limited(client, llm_mock_headers, monkeypatch):
+    import embeddings
+    import llm as llm_module
+    from google.genai import errors as genai_errors
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "querybusy_bees.txt")
+
+    class _AlwaysRateLimitedModels:
+        def embed_content(self, **kwargs):
+            raise genai_errors.APIError(code=429, response_json={"message": "rate limited"}, response=None)
+
+    class _AlwaysRateLimitedClient:
+        models = _AlwaysRateLimitedModels()
+
+    monkeypatch.setattr(llm_module, "get_client", lambda: _AlwaysRateLimitedClient())
+    monkeypatch.setattr(embeddings.time, "sleep", lambda seconds: None)
+
+    res = client.get("/semantic-search", headers=headers, params={"query": "bees"})
+    assert res.status_code == 503
+    assert res.json()["detail"] == "AI service is busy. Please try again in a minute."
+
+    client.delete(f"/books/{book_id}", headers=headers)

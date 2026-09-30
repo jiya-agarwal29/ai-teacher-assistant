@@ -17,10 +17,8 @@ import json
 import embeddings
 import llm
 from rag import (
-    generate_answer,
     generate_quiz,
     check_context_relevance,
-    synthesize_educational_response,
     summarize_text_in_bullets,
     extract_definitions_and_statements,
     clean_pdf_text_for_quiz,
@@ -118,6 +116,46 @@ MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
 
 MAX_SUMMARIZE_CHARS = 20000
+
+AI_BUSY_DETAIL = "AI service is busy. Please try again in a minute."
+
+CHAT_SYSTEM_INSTRUCTION = (
+    "You are a helpful teaching assistant. Answer ONLY from the provided sources. "
+    "Cite sources inline like [1]. If the sources do not contain the answer, reply "
+    "exactly: 'The uploaded documents do not contain enough information for this "
+    "question.' Use short headings and bullet points where helpful. Explain simply "
+    "for students."
+)
+
+SUMMARIZE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "bullets": {
+            "type": "array",
+            "items": {"type": "string"}
+        }
+    },
+    "required": ["bullets"]
+}
+
+FLASHCARDS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "cards": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string"},
+                    "definition": {"type": "string"},
+                    "source_index": {"type": "integer"}
+                },
+                "required": ["term", "definition", "source_index"]
+            }
+        }
+    },
+    "required": ["cards"]
+}
 
 
 class RegisterRequest(BaseModel):
@@ -433,6 +471,18 @@ def search_content(
     ]
 
 
+def _retrieve_or_503(db: Session, user_id: int, query: str, top_k: int, apply_threshold: bool):
+    """
+    Wraps retrieve() so a Gemini embed_query() rate limit that's still busy
+    after EMBED_QUERY_MAX_WAIT_SECONDS surfaces as a 503 to the client,
+    instead of a generic 500 or an unhandled exception.
+    """
+    try:
+        return retrieve(db, user_id, query, top_k=top_k, apply_threshold=apply_threshold)
+    except embeddings.EmbeddingServiceBusyError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+
 # -----------------------------
 # SEMANTIC SEARCH
 # -----------------------------
@@ -455,7 +505,7 @@ def semantic_search(
             "message": "Your documents need re-indexing"
         }
 
-    top_pages = retrieve(db, current_user.id, query, top_k=3, apply_threshold=False)
+    top_pages = _retrieve_or_503(db, current_user.id, query, top_k=3, apply_threshold=False)
 
     return [
         {
@@ -489,7 +539,7 @@ def _answer_question(question: str, current_user: User, db: Session):
             "message": "Your documents need re-indexing"
         }
 
-    top_pages = retrieve(db, current_user.id, question, top_k=3, apply_threshold=True)
+    top_pages = _retrieve_or_503(db, current_user.id, question, top_k=5, apply_threshold=True)
 
     # Relevance checking using both cosine similarity and lexical overlap
     temp_context = " ".join([page.content for _, page in top_pages])
@@ -500,52 +550,44 @@ def _answer_question(question: str, current_user: User, db: Session):
             "sources": []
         }
 
-    # Build PDF context
-    pdf_context = "\n\n".join([
-        f"--- Document Source Block ---\n{page.content}"
-        for score, page in top_pages
-    ])
-
-    # Generate AI answer (Flan-T5 generated definition/direct answer)
-    direct_answer = generate_answer(
-        pdf_context,
-        question
-    )
-
-    if not direct_answer or "do not contain enough information" in direct_answer.lower():
-        return {
-            "question": question,
-            "answer": "The uploaded documents do not contain enough information for this question.",
-            "sources": []
-        }
-
-    # Resolve topic from book name
-    first_book_id = top_pages[0][1].book_id
-    book_obj = db.query(Book).filter(Book.id == first_book_id).first()
-    topic = book_obj.name.split('.')[0] if book_obj else "Uploaded Material"
-
-    # Synthesize a beautiful, multi-paragraph ChatGPT-style response using hybrid techniques
-    answer = synthesize_educational_response(question, top_pages, direct_answer, topic)
-
-    # Build sources
+    # Build the numbered source list ([1], [2], ...) the LLM cites inline,
+    # and the sources array the frontend renders -- same top_pages, so the
+    # citation numbers line up with their position in "sources".
     sources = []
+    numbered_sources = []
 
-    for score, page in top_pages:
+    for idx, (score, page) in enumerate(top_pages, start=1):
 
         book = db.query(Book).filter(
             Book.id == page.book_id
         ).first()
 
-        if book:
+        if not book:
+            continue
 
-            sources.append({
-                "book_name": book.name,
-                "page_number": page.page_number,
-                "chunk_number": page.chunk_number,
-                "similarity_score": round(float(score), 4),
-                "page_id": page.id,
-                "content": page.content
-            })
+        sources.append({
+            "book_name": book.name,
+            "page_number": page.page_number,
+            "chunk_number": page.chunk_number,
+            "similarity_score": round(float(score), 4),
+            "page_id": page.id,
+            "content": page.content
+        })
+        numbered_sources.append(f"[{idx}] ({book.name}, page {page.page_number}): {page.content}")
+
+    prompt = f"Question: {question}\n\nSources:\n" + "\n\n".join(numbered_sources)
+
+    try:
+        answer = llm.generate(prompt, system=CHAT_SYSTEM_INSTRUCTION)
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+    if not answer or "do not contain enough information" in answer.lower():
+        return {
+            "question": question,
+            "answer": "The uploaded documents do not contain enough information for this question.",
+            "sources": []
+        }
 
     return {
         "question": question,
@@ -582,7 +624,20 @@ def summarize_notes(
             detail=f"Text is too long ({len(text)} characters). Maximum is {MAX_SUMMARIZE_CHARS} characters."
         )
 
-    bullets = summarize_text_in_bullets(text)
+    try:
+        result = llm.generate_json(
+            "Summarize the following text in 5 to 10 clear, concise bullet points. "
+            "Use ONLY information from this text -- do not add anything that isn't "
+            f"there.\n\nText:\n{text}",
+            schema=SUMMARIZE_SCHEMA
+        )
+        bullets = result.get("bullets", []) if isinstance(result, dict) else []
+    except NotImplementedError:
+        # LLM_PROVIDER=local has no structured JSON output -- fall back to
+        # the local Flan-T5 bullet-by-bullet summarizer.
+        bullets = summarize_text_in_bullets(text)
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
     return {"bullets": bullets}
 
@@ -604,47 +659,82 @@ def generate_flashcards(
     if needs_reembedding(db, current_user.id):
         return {"cards": [], "message": "Your documents need re-indexing"}
 
-    top_pages = retrieve(db, current_user.id, topic, top_k=5, apply_threshold=True)
+    top_pages = _retrieve_or_503(db, current_user.id, topic, top_k=5, apply_threshold=True)
 
-    combined_text = "\n".join(page.content for _, page in top_pages)
-    if not combined_text.strip():
+    if not top_pages:
         return {"cards": [], "message": "No relevant content found in your documents for this topic."}
 
-    cleaned = clean_pdf_text_for_quiz(combined_text)
-    definitions, statements = extract_definitions_and_statements(cleaned)
+    try:
+        numbered_sources = "\n\n".join(
+            f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
+        )
+        result = llm.generate_json(
+            f"Based ONLY on the numbered source chunks below about '{topic}', create up "
+            "to 10 flashcards. Each flashcard needs a short 'term', a 'definition' "
+            "grounded only in the sources, and a 'source_index' -- the number of the "
+            f"chunk the definition came from.\n\nSources:\n{numbered_sources}",
+            schema=FLASHCARDS_SCHEMA
+        )
+        raw_cards = result.get("cards", []) if isinstance(result, dict) else []
 
-    cards = []
-    seen_terms = set()
+        cards = []
+        for card in raw_cards[:10]:
+            source_index = card.get("source_index")
+            if not isinstance(source_index, int) or not (1 <= source_index <= len(top_pages)):
+                continue  # drop cards with an invalid source_index
 
-    for d in definitions:
-        term = clean_extracted_text(d["term"])
-        key = term.lower()
-        if key in seen_terms:
-            continue
-        cards.append({
-            "term": term,
-            "definition": clean_extracted_text(d["explanation"]),
-            "source": clean_extracted_text(d["raw"])
-        })
-        seen_terms.add(key)
-        if len(cards) >= 10:
-            break
+            _, page = top_pages[source_index - 1]
+            book = db.query(Book).filter(Book.id == page.book_id).first()
+            source_label = f"{book.name}, page {page.page_number}" if book else f"page {page.page_number}"
 
-    if len(cards) < 10:
-        for s in statements:
-            if len(cards) >= 10:
-                break
-            words = s.split()
-            term = " ".join(words[:3]) if len(words) > 3 else s
+            cards.append({
+                "term": card.get("term", ""),
+                "definition": card.get("definition", ""),
+                "source": source_label
+            })
+
+    except NotImplementedError:
+        # LLM_PROVIDER=local has no structured JSON output -- fall back to
+        # the extraction-based flashcard generation.
+        combined_text = "\n".join(page.content for _, page in top_pages)
+        cleaned = clean_pdf_text_for_quiz(combined_text)
+        definitions, statements = extract_definitions_and_statements(cleaned)
+
+        cards = []
+        seen_terms = set()
+
+        for d in definitions:
+            term = clean_extracted_text(d["term"])
             key = term.lower()
             if key in seen_terms:
                 continue
             cards.append({
                 "term": term,
-                "definition": clean_extracted_text(s),
-                "source": clean_extracted_text(s)
+                "definition": clean_extracted_text(d["explanation"]),
+                "source": clean_extracted_text(d["raw"])
             })
             seen_terms.add(key)
+            if len(cards) >= 10:
+                break
+
+        if len(cards) < 10:
+            for s in statements:
+                if len(cards) >= 10:
+                    break
+                words = s.split()
+                term = " ".join(words[:3]) if len(words) > 3 else s
+                key = term.lower()
+                if key in seen_terms:
+                    continue
+                cards.append({
+                    "term": term,
+                    "definition": clean_extracted_text(s),
+                    "source": clean_extracted_text(s)
+                })
+                seen_terms.add(key)
+
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
     if not cards:
         return {"cards": [], "message": "No relevant content found in your documents for this topic."}
@@ -682,7 +772,7 @@ def generate_ai_quiz(
             "questions": []
         }
 
-    top_pages = retrieve(db, current_user.id, topic, top_k=3, apply_threshold=True)
+    top_pages = _retrieve_or_503(db, current_user.id, topic, top_k=3, apply_threshold=True)
 
     # Relevance checking using both cosine similarity and lexical overlap
     temp_context = " ".join([page.content for _, page in top_pages])
