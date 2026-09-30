@@ -294,6 +294,12 @@ async def upload_book(
 
     try:
         embedding_vectors = embeddings.embed_documents(texts)
+    except embeddings.EmbeddingServiceBusyError:
+        logger.warning("Embedding service busy while embedding %d chunk(s) for '%s'", len(texts), filename)
+        raise HTTPException(
+            status_code=503,
+            detail="Search service is busy. Please try uploading again in a minute."
+        )
     except Exception:
         logger.exception("Failed to embed %d chunk(s) for '%s'", len(texts), filename)
         raise HTTPException(status_code=500, detail="Failed to generate embeddings for this document.")

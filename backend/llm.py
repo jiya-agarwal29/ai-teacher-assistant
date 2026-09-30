@@ -9,6 +9,10 @@ LLM_PROVIDER selects the active backend:
 The rest of the app should only ever call generate() / generate_json() /
 provider_status() from this module — never import the Gemini SDK or rag's
 Flan-T5 internals directly for generation, so the provider stays swappable.
+
+get_client() exposes the shared, cached Gemini client so embeddings.py can
+reuse the same client/API key when EMBEDDING_PROVIDER=gemini, instead of
+building a second one.
 """
 import json
 import logging
@@ -50,9 +54,11 @@ def _get_gemini_client():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "LLM_PROVIDER=gemini but GEMINI_API_KEY is not set. Set "
-            "GEMINI_API_KEY in backend/.env, or set LLM_PROVIDER=local to "
-            "use the offline Flan-T5 model instead."
+            "GEMINI_API_KEY is not set, but it's required for Gemini-based "
+            "features (LLM_PROVIDER=gemini and/or EMBEDDING_PROVIDER=gemini). "
+            "Set GEMINI_API_KEY in backend/.env, or switch those to a "
+            "different provider (LLM_PROVIDER=local, "
+            "EMBEDDING_PROVIDER=voyage/local)."
         )
 
     from google import genai
@@ -70,6 +76,15 @@ def _get_gemini_client():
     )
     logger.info("Gemini client initialized (model=%s)", _gemini_model())
     return _gemini_client
+
+
+def get_client():
+    """
+    Returns the shared Gemini client, building it if needed. Public so
+    embeddings.py can reuse the same client/API key for Gemini embeddings
+    instead of constructing a second one.
+    """
+    return _get_gemini_client()
 
 
 def _is_retryable_gemini_error(exc: Exception) -> bool:

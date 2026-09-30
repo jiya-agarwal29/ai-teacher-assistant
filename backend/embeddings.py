@@ -2,14 +2,19 @@
 Swappable embedding layer.
 
 EMBEDDING_PROVIDER selects the active backend:
-  - "voyage" (default): Voyage AI's hosted embedding API. Requires
-    VOYAGE_API_KEY. 1024-dimensional vectors.
+  - "gemini" (default): Google's hosted Gemini embedding API, via the same
+    GEMINI_API_KEY and client used by llm.py. Free tier. 768-dimensional
+    vectors by default (GEMINI_EMBED_DIM).
+  - "voyage": Voyage AI's hosted embedding API. Requires VOYAGE_API_KEY.
+    1024-dimensional vectors. Without a payment method on the Voyage
+    account, this is capped at ~10K tokens/minute -- too slow for large
+    uploads; kept as an optional provider.
   - "local": the in-process all-MiniLM-L6-v2 model (sentence-transformers),
     loaded lazily and only when actually used, so the app keeps working
     fully offline / without an API key. 384-dimensional vectors.
 
-Voyage and local vectors have different dimensions and are not comparable.
-Every page stores the embedding_model that produced its vector (see
+Vectors from different providers/dimensions are not comparable. Every page
+stores the embedding_model that produced its vector (see
 models.Page.embedding_model); retrieval.py only ever loads and scores pages
 whose stored embedding_model matches active_model_name().
 """
@@ -22,34 +27,71 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _LOCAL_MODEL_NAME = "all-MiniLM-L6-v2"
+
 _VOYAGE_DEFAULT_MODEL = "voyage-4"
 _VOYAGE_BATCH_SIZE = 64
-_MAX_ATTEMPTS = 3
 # Voyage's rate limits reset per-minute (not per-second like a typical burst
 # limit), so a short backoff just wastes all its retries inside the same
 # rate-limit window. Starting at 20s gives a 429 a real chance to clear.
-_BASE_BACKOFF_SECONDS = 20.0
+_VOYAGE_BASE_BACKOFF_SECONDS = 20.0
+
+_GEMINI_EMBED_DEFAULT_MODEL = "gemini-embedding-001"
+_GEMINI_EMBED_DEFAULT_DIM = 768
+_GEMINI_EMBED_DEFAULT_BATCH_SIZE = 50
+_GEMINI_BASE_BACKOFF_SECONDS = 1.0
+
+_MAX_ATTEMPTS = 3
 
 _local_model = None
 _voyage_client = None
 
 
+class EmbeddingServiceBusyError(Exception):
+    """
+    Raised when the active embedding provider keeps rate-limiting us even
+    after retries. Routes map this to a 503 ("try again shortly") instead
+    of a generic 500, and must not save anything when it's raised.
+    """
+
+
 def _provider() -> str:
-    return os.getenv("EMBEDDING_PROVIDER", "voyage").strip().lower()
+    return os.getenv("EMBEDDING_PROVIDER", "gemini").strip().lower()
 
 
 def _voyage_model() -> str:
     return os.getenv("VOYAGE_MODEL", _VOYAGE_DEFAULT_MODEL).strip()
 
 
+def _gemini_embed_model() -> str:
+    return os.getenv("GEMINI_EMBED_MODEL", _GEMINI_EMBED_DEFAULT_MODEL).strip()
+
+
+def _gemini_embed_dim() -> int:
+    try:
+        return int(os.getenv("GEMINI_EMBED_DIM", str(_GEMINI_EMBED_DEFAULT_DIM)))
+    except ValueError:
+        return _GEMINI_EMBED_DEFAULT_DIM
+
+
+def _gemini_embed_batch_size() -> int:
+    try:
+        return int(os.getenv("GEMINI_EMBED_BATCH_SIZE", str(_GEMINI_EMBED_DEFAULT_BATCH_SIZE)))
+    except ValueError:
+        return _GEMINI_EMBED_DEFAULT_BATCH_SIZE
+
+
 def active_model_name() -> str:
     """
-    Identifies which provider+model produced (or will produce) a vector,
-    e.g. "voyage:voyage-4" or "local:all-MiniLM-L6-v2". Stored on every
-    Page so retrieval can tell incompatible vectors apart.
+    Identifies which provider+model(+dimension) produced (or will produce)
+    a vector, e.g. "gemini:gemini-embedding-001:768", "voyage:voyage-4", or
+    "local:all-MiniLM-L6-v2". Stored on every Page so retrieval can tell
+    incompatible vectors apart.
     """
-    if _provider() == "local":
+    provider = _provider()
+    if provider == "local":
         return f"local:{_LOCAL_MODEL_NAME}"
+    if provider == "gemini":
+        return f"gemini:{_gemini_embed_model()}:{_gemini_embed_dim()}"
     return f"voyage:{_voyage_model()}"
 
 
@@ -72,8 +114,8 @@ def _get_voyage_client():
     if not api_key:
         raise RuntimeError(
             "EMBEDDING_PROVIDER=voyage but VOYAGE_API_KEY is not set. Set "
-            "VOYAGE_API_KEY in backend/.env, or set EMBEDDING_PROVIDER=local "
-            "to use the offline MiniLM model instead."
+            "VOYAGE_API_KEY in backend/.env, or set EMBEDDING_PROVIDER=gemini "
+            "(the default) or EMBEDDING_PROVIDER=local instead."
         )
 
     import voyageai
@@ -88,20 +130,23 @@ def _get_voyage_client():
 def init():
     """
     Called once from the FastAPI lifespan at startup. Eagerly prepares the
-    active provider so a missing VOYAGE_API_KEY (or an unknown provider
-    name) fails loudly at boot instead of on the first request. Only loads
-    the local MiniLM model when EMBEDDING_PROVIDER=local -- with Voyage
-    active, MiniLM is never loaded at startup.
+    active provider so a missing API key (or an unknown provider name)
+    fails loudly at boot instead of on the first request. Only loads the
+    local MiniLM model when EMBEDDING_PROVIDER=local -- with Gemini or
+    Voyage active, MiniLM is never loaded at startup.
     """
     provider = _provider()
 
     if provider == "local":
         _load_local_model()
+    elif provider == "gemini":
+        import llm
+        llm.get_client()
     elif provider == "voyage":
         _get_voyage_client()
     else:
         raise RuntimeError(
-            f"Unknown EMBEDDING_PROVIDER '{provider}'. Use 'voyage' or 'local'."
+            f"Unknown EMBEDDING_PROVIDER '{provider}'. Use 'gemini', 'voyage', or 'local'."
         )
 
 
@@ -117,14 +162,56 @@ def _is_retryable_voyage_error(exc: Exception) -> bool:
     ))
 
 
-def _call_with_retry(call_fn, description: str):
+def _is_voyage_rate_limited(exc: Exception) -> bool:
+    import voyageai.error as verror
+    return isinstance(exc, verror.RateLimitError)
+
+
+def _is_retryable_gemini_embed_error(exc: Exception) -> bool:
+    from google.genai import errors as genai_errors
+    return isinstance(exc, genai_errors.APIError) and (
+        exc.code == 429 or (exc.code is not None and exc.code >= 500)
+    )
+
+
+def _is_gemini_rate_limited(exc: Exception) -> bool:
+    from google.genai import errors as genai_errors
+    return isinstance(exc, genai_errors.APIError) and exc.code == 429
+
+
+def _gemini_retry_after_seconds(exc: Exception):
+    """Reads a Retry-After header off the failed response, if present."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("retry-after") or headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_with_retry(
+    call_fn,
+    description: str,
+    is_retryable,
+    is_rate_limited,
+    base_backoff_seconds: float,
+    get_retry_after=None,
+):
     """
     Calls call_fn() with up to _MAX_ATTEMPTS tries, retrying with
-    exponential backoff only on rate-limit/server errors. Any other error,
-    or exhausting all attempts, raises RuntimeError instead of leaking the
-    raw provider exception. Never logs the texts being embedded.
+    exponential backoff (or a provider-given Retry-After delay, if
+    get_retry_after is given and returns one) only on rate-limit/server
+    errors. Exhausting retries on a rate-limit error raises
+    EmbeddingServiceBusyError; any other failure raises RuntimeError
+    instead of leaking the raw provider exception. Never logs the texts
+    being embedded.
     """
-    delay = _BASE_BACKOFF_SECONDS
+    delay = base_backoff_seconds
     last_exc = None
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -132,18 +219,28 @@ def _call_with_retry(call_fn, description: str):
             return call_fn()
         except Exception as exc:
             last_exc = exc
-            if not _is_retryable_voyage_error(exc) or attempt == _MAX_ATTEMPTS:
+            if not is_retryable(exc) or attempt == _MAX_ATTEMPTS:
                 logger.error(
                     "%s failed on attempt %d/%d (%s); giving up",
                     description, attempt, _MAX_ATTEMPTS, type(exc).__name__
                 )
                 break
+
+            wait_seconds = get_retry_after(exc) if get_retry_after else None
+            if not wait_seconds or wait_seconds <= 0:
+                wait_seconds = delay
+                delay *= 2
+
             logger.warning(
                 "%s failed on attempt %d/%d (%s); retrying in %.1fs",
-                description, attempt, _MAX_ATTEMPTS, type(exc).__name__, delay
+                description, attempt, _MAX_ATTEMPTS, type(exc).__name__, wait_seconds
             )
-            time.sleep(delay)
-            delay *= 2
+            time.sleep(wait_seconds)
+
+    if is_rate_limited(last_exc):
+        raise EmbeddingServiceBusyError(
+            f"{description} is still rate-limited after {_MAX_ATTEMPTS} attempt(s)"
+        ) from last_exc
 
     raise RuntimeError(
         f"{description} failed after {_MAX_ATTEMPTS} attempt(s)"
@@ -167,10 +264,55 @@ def _embed_voyage(texts: list[str], input_type: str) -> np.ndarray:
         def call(batch=batch):
             return client.embed(batch, model=model, input_type=input_type)
 
-        result = _call_with_retry(call, f"Voyage embed ({input_type})")
+        result = _call_with_retry(
+            call, f"Voyage embed ({input_type})",
+            is_retryable=_is_retryable_voyage_error,
+            is_rate_limited=_is_voyage_rate_limited,
+            base_backoff_seconds=_VOYAGE_BASE_BACKOFF_SECONDS,
+        )
         all_vectors.extend(result.embeddings)
 
     matrix = np.asarray(all_vectors, dtype=np.float32)
+    return _l2_normalize(matrix)
+
+
+def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
+    import llm
+    from google.genai import types
+
+    client = llm.get_client()
+    model = _gemini_embed_model()
+    dim = _gemini_embed_dim()
+    batch_size = _gemini_embed_batch_size()
+    all_vectors = []
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+
+        def call(batch=batch):
+            response = client.models.embed_content(
+                model=model,
+                contents=batch,
+                config=types.EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=dim,
+                ),
+            )
+            return [embedding.values for embedding in response.embeddings]
+
+        vectors = _call_with_retry(
+            call, f"Gemini embed_content ({task_type})",
+            is_retryable=_is_retryable_gemini_embed_error,
+            is_rate_limited=_is_gemini_rate_limited,
+            base_backoff_seconds=_GEMINI_BASE_BACKOFF_SECONDS,
+            get_retry_after=_gemini_retry_after_seconds,
+        )
+        all_vectors.extend(vectors)
+
+    matrix = np.asarray(all_vectors, dtype=np.float32)
+    # gemini-embedding-001 does not L2-normalise its output when
+    # output_dimensionality is reduced below the model's native size --
+    # always normalise ourselves so every provider's vectors are comparable.
     return _l2_normalize(matrix)
 
 
@@ -182,9 +324,14 @@ def embed_documents(texts: list[str]) -> np.ndarray:
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
 
-    if _provider() == "local":
+    provider = _provider()
+
+    if provider == "local":
         vectors = np.asarray(_load_local_model().encode(texts, batch_size=32), dtype=np.float32)
         return _l2_normalize(vectors)
+
+    if provider == "gemini":
+        return _embed_gemini(texts, task_type="RETRIEVAL_DOCUMENT")
 
     return _embed_voyage(texts, input_type="document")
 
@@ -194,8 +341,13 @@ def embed_query(text: str) -> np.ndarray:
     Embeds a single question/search query. Returns an L2-normalised
     (dim,) vector.
     """
-    if _provider() == "local":
+    provider = _provider()
+
+    if provider == "local":
         vector = np.asarray(_load_local_model().encode([text])[0], dtype=np.float32)
         return _l2_normalize(vector.reshape(1, -1))[0]
+
+    if provider == "gemini":
+        return _embed_gemini([text], task_type="RETRIEVAL_QUERY")[0]
 
     return _embed_voyage([text], input_type="query")[0]

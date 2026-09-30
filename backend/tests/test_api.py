@@ -160,3 +160,34 @@ def test_upload_list_isolation_and_delete(client):
 def test_endpoints_require_auth(client):
     res = client.get("/books")
     assert res.status_code == 401
+
+
+def test_upload_returns_503_when_embedding_service_stays_rate_limited(client, monkeypatch):
+    import embeddings
+    import llm as llm_module
+    from google.genai import errors as genai_errors
+
+    _register(client, "apibusyuser", "apibusypass1")
+    headers = _auth_headers(client, "apibusyuser", "apibusypass1")
+
+    class _AlwaysRateLimitedModels:
+        def embed_content(self, **kwargs):
+            raise genai_errors.APIError(code=429, response_json={"message": "rate limited"}, response=None)
+
+    class _AlwaysRateLimitedClient:
+        models = _AlwaysRateLimitedModels()
+
+    monkeypatch.setattr(llm_module, "get_client", lambda: _AlwaysRateLimitedClient())
+    monkeypatch.setattr(embeddings.time, "sleep", lambda seconds: None)
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("busy.txt", b"some content that needs to be embedded", "text/plain")}
+    )
+    assert res.status_code == 503
+    assert res.json()["detail"] == "Search service is busy. Please try uploading again in a minute."
+
+    # Nothing was saved
+    books_res = client.get("/books", headers=headers)
+    assert books_res.json() == []

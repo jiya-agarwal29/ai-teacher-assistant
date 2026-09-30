@@ -1,6 +1,7 @@
 """
 Tests for the swappable embedding layer (embeddings.py) and how retrieval.py
-uses it. The Voyage client is always mocked here -- no real network calls.
+uses it. The Voyage and Gemini clients are always mocked here -- no real
+network calls.
 """
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import embeddings
+import llm as llm_module
 import retrieval
 from models import Base, Book, Page, User
 
@@ -34,17 +36,79 @@ class _FakeVoyageClient:
         return _FakeEmbeddingsResult(vectors)
 
 
+class _FakeGeminiEmbedding:
+    def __init__(self, values):
+        self.values = values
+
+
+class _FakeGeminiEmbedResponse:
+    def __init__(self, vectors):
+        self.embeddings = [_FakeGeminiEmbedding(v) for v in vectors]
+
+
+class _FakeGeminiModels:
+    """Records every embed_content() call; side_effects is a queue of
+    either an exception to raise or a response to return."""
+
+    def __init__(self, side_effects, dim=8):
+        self.dim = dim
+        self._side_effects = list(side_effects)
+        self.calls = []  # list of (texts, model, task_type)
+
+    def embed_content(self, model=None, contents=None, config=None):
+        self.calls.append((list(contents), model, config.task_type))
+        effect = self._side_effects.pop(0)
+        if isinstance(effect, Exception):
+            raise effect
+        vectors = [
+            [float((i % 5) + 1)] + [1.0] * (self.dim - 1)
+            for i in range(len(contents))
+        ]
+        return _FakeGeminiEmbedResponse(vectors)
+
+
+class _FakeGeminiClient:
+    def __init__(self, side_effects, dim=8):
+        self.models = _FakeGeminiModels(side_effects, dim=dim)
+
+
+def _gemini_api_error(code):
+    from google.genai import errors as genai_errors
+    return genai_errors.APIError(code=code, response_json={"message": "boom"}, response=None)
+
+
 @pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    # Keeps every retry/backoff test fast -- none of them need a real delay.
+    monkeypatch.setattr(embeddings.time, "sleep", lambda seconds: None)
+
+
+@pytest.fixture
 def voyage_provider(monkeypatch):
     monkeypatch.setenv("EMBEDDING_PROVIDER", "voyage")
     monkeypatch.setenv("VOYAGE_API_KEY", "fake-key-for-tests")
 
 
 @pytest.fixture
-def fake_voyage(monkeypatch):
+def fake_voyage(voyage_provider, monkeypatch):
     client = _FakeVoyageClient()
     monkeypatch.setattr(embeddings, "_get_voyage_client", lambda: client)
     return client
+
+
+@pytest.fixture
+def gemini_provider(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-tests")
+
+
+@pytest.fixture
+def fake_gemini(gemini_provider, monkeypatch):
+    def _install(side_effects=(_FakeGeminiEmbedResponse([[1.0] * 8]),)):
+        client = _FakeGeminiClient(list(side_effects))
+        monkeypatch.setattr(llm_module, "get_client", lambda: client)
+        return client
+    return _install
 
 
 def test_embed_documents_uses_document_input_type(fake_voyage):
@@ -83,11 +147,73 @@ def test_embeddings_are_l2_normalised(fake_voyage):
 
 
 def test_active_model_name_reflects_provider(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+    monkeypatch.setenv("GEMINI_EMBED_DIM", "768")
+    assert embeddings.active_model_name() == "gemini:gemini-embedding-001:768"
+
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "voyage")
     monkeypatch.setenv("VOYAGE_MODEL", "voyage-4")
     assert embeddings.active_model_name() == "voyage:voyage-4"
 
     monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
     assert embeddings.active_model_name() == "local:all-MiniLM-L6-v2"
+
+
+def test_embed_documents_uses_gemini_retrieval_document_task_type(fake_gemini):
+    client = fake_gemini()
+    embeddings.embed_documents(["a", "b", "c"])
+    assert client.models.calls
+    assert all(task_type == "RETRIEVAL_DOCUMENT" for _, _, task_type in client.models.calls)
+
+
+def test_embed_query_uses_gemini_retrieval_query_task_type(fake_gemini):
+    client = fake_gemini()
+    embeddings.embed_query("what is x?")
+    assert client.models.calls
+    assert all(task_type == "RETRIEVAL_QUERY" for _, _, task_type in client.models.calls)
+
+
+def test_embed_documents_batches_gemini_at_configured_size(fake_gemini, monkeypatch):
+    monkeypatch.setenv("GEMINI_EMBED_BATCH_SIZE", "20")
+    client = fake_gemini([
+        _FakeGeminiEmbedResponse([[1.0] * 8] * 20),
+        _FakeGeminiEmbedResponse([[1.0] * 8] * 20),
+        _FakeGeminiEmbedResponse([[1.0] * 8] * 5),
+    ])
+    texts = [f"chunk {i}" for i in range(45)]
+    embeddings.embed_documents(texts)
+    batch_sizes = [len(texts_in_call) for texts_in_call, _, _ in client.models.calls]
+    assert batch_sizes == [20, 20, 5]
+
+
+def test_gemini_embeddings_are_l2_normalised(fake_gemini):
+    client = fake_gemini([_FakeGeminiEmbedResponse([[3.0, 4.0] + [0.0] * 6] * 2)])
+    matrix = embeddings.embed_documents(["a", "b"])
+    norms = np.linalg.norm(matrix, axis=1)
+    assert np.allclose(norms, 1.0)
+
+
+def test_gemini_embed_retries_after_rate_limit_then_succeeds(fake_gemini):
+    client = fake_gemini([
+        _gemini_api_error(429),
+        _FakeGeminiEmbedResponse([[1.0] * 8]),
+    ])
+    vector = embeddings.embed_query("hello")
+    assert client.models.calls  # made it past the retry
+    assert len(client.models.calls) == 2
+    assert np.isclose(np.linalg.norm(vector), 1.0)
+
+
+def test_gemini_embed_exhausted_rate_limit_raises_service_busy(fake_gemini):
+    client = fake_gemini([
+        _gemini_api_error(429),
+        _gemini_api_error(429),
+        _gemini_api_error(429),
+    ])
+    with pytest.raises(embeddings.EmbeddingServiceBusyError):
+        embeddings.embed_documents(["a"])
+    assert len(client.models.calls) == embeddings._MAX_ATTEMPTS
 
 
 @pytest.fixture

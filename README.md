@@ -2,7 +2,7 @@
 
 A RAG-based teaching assistant. Upload your own course material (PDF, Word, PowerPoint) and get grounded AI chat answers, semantic search, and auto-generated quizzes — all sourced from what you actually uploaded, not the open internet.
 
-Runs fully local: embeddings ([`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)) and answer generation ([`flan-t5-small`](https://huggingface.co/google/flan-t5-small)) both run on your own machine via `sentence-transformers` / `transformers` — no external LLM API key required.
+By default, answer generation and embeddings both use Google's hosted Gemini API (`GEMINI_API_KEY`, free tier). Both are swappable — Voyage AI is available as an alternative hosted embedding provider, and everything can run fully offline via local models (`flan-t5-small` for generation, `all-MiniLM-L6-v2` for embeddings) with no API key at all. See [AI providers](#ai-providers) below.
 
 ## Features
 
@@ -15,7 +15,7 @@ Runs fully local: embeddings ([`all-MiniLM-L6-v2`](https://huggingface.co/senten
 
 ## Tech stack
 
-**Backend** — FastAPI, SQLAlchemy + SQLite, `sentence-transformers`, `transformers` (Flan-T5), `pdfplumber` / `python-docx` / `python-pptx`, JWT auth (`python-jose` + `passlib`), rate limiting (`slowapi`)
+**Backend** — FastAPI, SQLAlchemy + SQLite, Gemini (`google-genai`) + Voyage (`voyageai`) + local (`sentence-transformers` / `transformers` Flan-T5) AI providers, `pdfplumber` / `python-docx` / `python-pptx`, JWT auth (`python-jose` + `passlib`), rate limiting (`slowapi`)
 
 **Frontend** — React 19, React Router, Vite, Tailwind CSS v4
 
@@ -28,8 +28,10 @@ backend/
   models.py               SQLAlchemy models (User, Book, Page)
   database.py            SQLite engine/session setup
   document_parsers.py    PDF/DOCX/PPTX parsing + chunking
-  embeddings.py           Sentence-transformer embedding model
-  rag.py                   Answer generation, quiz generation, relevance checking
+  embeddings.py           Swappable embeddings (Gemini / Voyage / local MiniLM)
+  llm.py                   Swappable answer generation (Gemini / local Flan-T5)
+  rag.py                   Local Flan-T5 generation, quiz generation, relevance checking
+  scripts/reembed.py      Re-embeds stored pages after switching EMBEDDING_PROVIDER
 frontend/
   src/pages/               Home, Chat, Documents, AITools, Analytics, Login
   src/components/          Sidebar, PageLayout, ProtectedRoute
@@ -55,7 +57,7 @@ For running the test suite too, install the dev extras instead (installs `requir
 pip install -r requirements-dev.txt
 ```
 
-Create `backend/.env` — see `backend/.env.example` for the full list with descriptions, copy it as a starting point (`cp .env.example .env`). Every variable is optional except `SECRET_KEY`; the rest fall back to sane local-dev defaults:
+Create `backend/.env` — see `backend/.env.example` for the full list with descriptions, copy it as a starting point (`cp .env.example .env`). Every variable is optional except `SECRET_KEY` and `GEMINI_API_KEY` (required for the default AI providers — see [AI providers](#ai-providers) below); the rest fall back to sane local-dev defaults:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -66,13 +68,15 @@ Create `backend/.env` — see `backend/.env.example` for the full list with desc
 | `MAX_UPLOAD_MB` | `25` | Maximum accepted document upload size. |
 | `LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`). |
 
+See [AI providers](#ai-providers) for `LLM_PROVIDER`, `EMBEDDING_PROVIDER`, and the Gemini/Voyage-specific variables.
+
 Run it:
 
 ```
 uvicorn main:app --reload
 ```
 
-Serves on `http://127.0.0.1:8000`. First run downloads the two AI models (~100MB total, one-time); they're loaded once at startup (FastAPI lifespan) rather than per-request. Check `GET /health` for `{"status", "models_ready", "database_ready"}`.
+Serves on `http://127.0.0.1:8000`. AI clients/models are prepared once at startup (FastAPI lifespan) rather than per-request — this fails fast with a clear error if a required API key is missing. Local models (used only when a provider is set to `local`) are downloaded on first use (~100MB total, one-time). Check `GET /health` for `{"status", "models_ready", "database_ready", "llm": {"provider", "model", "configured", "ready"}}`.
 
 > **Windows + antivirus HTTPS scanning (e.g. Avast):** if the model download fails with `SSL: CERTIFICATE_VERIFY_FAILED`, your antivirus is intercepting HTTPS and Python doesn't trust its certificate. Fix: `pip install pip-system-certs` inside the venv.
 
@@ -101,16 +105,45 @@ npm run preview    # optional: serve dist/ locally to sanity-check the build
 
 `dist/` is a static bundle — serve it with any static file host (nginx, Vercel, Netlify, `serve dist/`, etc.); it doesn't need Node running in production.
 
+## AI providers
+
+Two independent things are swappable via env vars — which AI generates chat/quiz answers, and which AI turns text into search vectors. Both default to Gemini's free tier, reusing the same `GEMINI_API_KEY`.
+
+**Answer generation** — `LLM_PROVIDER`:
+| Value | Notes |
+|---|---|
+| `gemini` (default) | Hosted, via `google-genai`. Model from `GEMINI_MODEL` (default `gemini-3.8-flash`). Requires `GEMINI_API_KEY` — the app fails to start without it while this is active. |
+| `local` | The in-process Flan-T5 model (`rag.py`), no API key, works fully offline. See [Known limitations](#known-limitations) for its quality tradeoffs. |
+
+**Embeddings** — `EMBEDDING_PROVIDER`:
+| Value | Notes |
+|---|---|
+| `gemini` (default) | Hosted, via `google-genai`, reusing `GEMINI_API_KEY`. Model `GEMINI_EMBED_MODEL` (default `gemini-embedding-001`), vector size `GEMINI_EMBED_DIM` (default `768`), batched at `GEMINI_EMBED_BATCH_SIZE` (default `50`). |
+| `voyage` | Hosted, via `voyageai`. Requires its own `VOYAGE_API_KEY`. Model `VOYAGE_MODEL` (default `voyage-4`), 1024-dimensional, batched at 64. **Without a payment method on the Voyage account, it's capped at ~10K tokens/minute** — noticeably slower for large uploads than the other providers. |
+| `local` | The in-process `all-MiniLM-L6-v2` model, no API key, works fully offline, 384-dimensional. |
+
+Vectors from different providers (or different dimensions of the same provider) aren't comparable, so every page records which `embedding_model` produced its vector (`Page.embedding_model`, e.g. `"gemini:gemini-embedding-001:768"`). Retrieval only scores pages matching the currently active model — if you switch `EMBEDDING_PROVIDER`, existing documents stop showing up in chat/search (with a clear "Your documents need re-indexing" message) until you re-embed them:
+
+```
+cd backend
+python scripts/reembed.py                    # every page, all users
+python scripts/reembed.py --username alice    # only one user's pages
+```
+
+This re-embeds in batches with progress output and invalidates the retrieval cache when done.
+
+Rate limits: a Gemini embedding call that keeps hitting the provider's rate limit even after retrying returns a `503` from `/upload-book` (`"Search service is busy. Please try uploading again in a minute."`) rather than a generic error, and nothing is saved — just retry the upload shortly after.
+
 ## Migrating an existing database
 
-Books are scoped to the account that uploaded them (`Book.user_id`). A `teacher_ai.db` created before this existed has books with no owner — everyone's book list will look empty until you assign them:
+Books are scoped to the account that uploaded them (`Book.user_id`), and pages record which embedding model produced their vector (`Page.embedding_model`). A `teacher_ai.db` created before either of these existed needs both backfilled:
 
 ```
 cd backend
 python migrate.py <username>
 ```
 
-This adds the `books.user_id` column if it's missing, then assigns every currently-unowned book to `<username>` (which must already be a registered account). Safe to run more than once — the column is only added once, and the assignment only ever touches books that still have no owner, so re-running it with the same or a different username won't reassign books that already belong to someone.
+This adds the `books.user_id` column if it's missing and assigns every currently-unowned book to `<username>` (which must already be a registered account), and adds `pages.embedding_model` if missing, backfilling it to `"local:all-MiniLM-L6-v2"` on existing rows (all pages embedded before this column existed used local MiniLM). Safe to run more than once — every column is only added once, and every backfill only ever touches rows that still need it.
 
 ## Running tests
 
@@ -134,6 +167,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 Before deploying, set:
 
 - **`SECRET_KEY`** — required; generate a long random string (e.g. `python -c "import secrets; print(secrets.token_hex(32))"`). Tokens signed with a different key than the one validating them will all be rejected as invalid.
+- **`GEMINI_API_KEY`** — required with the default `LLM_PROVIDER=gemini` / `EMBEDDING_PROVIDER=gemini`; the app fails to start without it. See [AI providers](#ai-providers) for switching to Voyage or fully-local models instead.
 - **`CORS_ORIGINS`** — set to your real frontend origin(s) (comma-separated for more than one), e.g. `CORS_ORIGINS=https://app.your-domain.com`. Left unset, the backend only allows the local Vite dev ports and will reject the deployed frontend's requests.
 - **`VITE_API_URL`** (frontend) — the backend's public URL, set before running `npm run build` (see [Frontend](#frontend) above — it's compiled into the bundle, not read at runtime).
 
@@ -146,9 +180,9 @@ Unexpected server errors (anything not raised deliberately as an `HTTPException`
 ## Known limitations
 
 - **No OCR.** A scanned PDF with no text layer (an image of a page, not extracted text) returns a `422` with a clear message rather than silently producing an empty or garbled document — OCR support (to actually read the scanned text) is not implemented yet.
-- **`flan-t5-small` answer quality.** The local answer-generation model is intentionally small (so it runs on a CPU with no external API key), which means answers can be shallow, occasionally repetitive, or misphrase a nuance from the source text — it's meant to stay grounded in your uploaded documents rather than to reason deeply. For sharper answers, uploading more specific/well-structured source material tends to help more than rephrasing the question.
+- **`flan-t5-small` answer quality (LLM_PROVIDER=local only).** The default `LLM_PROVIDER=gemini` doesn't have this limitation. The local answer-generation model is intentionally small (so it runs on a CPU with no external API key), which means answers can be shallow, occasionally repetitive, or misphrase a nuance from the source text. For sharper answers on `local`, uploading more specific/well-structured source material tends to help more than rephrasing the question.
 - **Single SQLite file, single worker.** Fine for individual or small-team use; not built for high-concurrency or multi-instance deployment (see the `--workers 1` note above).
-- **English-oriented.** Both the embedding model and Flan-T5 are primarily English-trained; other languages will work less reliably for retrieval and generation.
+- **English-oriented.** The embedding and generation models (Gemini, Voyage, and the local fallbacks) are primarily English-trained; other languages will work less reliably for retrieval and generation.
 
 ## Notes
 
