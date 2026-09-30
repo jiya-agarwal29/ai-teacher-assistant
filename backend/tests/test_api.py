@@ -441,4 +441,20 @@ def test_quiz_falls_back_to_hybrid_generator_when_gemini_yields_too_few(client, 
 
     client.delete(f"/books/{book_id}", headers=headers)
 
+
+def test_quiz_returns_503_on_llm_unavailable(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_water_cycle_doc(client, headers, "quiz_busy.txt")
+
+    def raise_unavailable(*a, **kw):
+        raise llm_module.LLMUnavailableError("boom")
+
+    monkeypatch.setattr(llm_module, "generate_json", raise_unavailable)
+
+    res = client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+    assert res.status_code == 503
+    assert res.json()["detail"] == "AI service is busy. Please try again in a minute."
+
     client.delete(f"/books/{book_id}", headers=headers)
