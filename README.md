@@ -2,7 +2,7 @@
 
 A RAG-based teaching assistant. Upload your own course material (PDF, Word, PowerPoint) and get grounded AI chat answers, semantic search, and auto-generated quizzes — all sourced from what you actually uploaded, not the open internet.
 
-By default, answer generation and embeddings both use Google's hosted Gemini API (`GEMINI_API_KEY`, free tier). Both are swappable — Voyage AI is available as an alternative hosted embedding provider, and everything can run fully offline via local models (`flan-t5-small` for generation, `all-MiniLM-L6-v2` for embeddings) with no API key at all. See [AI providers](#ai-providers) below.
+Gemini (`GEMINI_API_KEY`, free tier) is the main AI provider for both answer generation and embeddings. Voyage AI is available as an optional alternative embedding provider, and everything can also run fully offline via local models (`flan-t5-small` for generation, `all-MiniLM-L6-v2` for embeddings) with no API key at all. See [AI providers](#ai-providers) below.
 
 ## Features
 
@@ -107,22 +107,28 @@ npm run preview    # optional: serve dist/ locally to sanity-check the build
 
 ## AI providers
 
-Two independent things are swappable via env vars — which AI generates chat/quiz answers, and which AI turns text into search vectors. Both default to Gemini's free tier, reusing the same `GEMINI_API_KEY`.
+**Gemini is the main provider for both** of the things that are swappable via env vars — which AI generates chat/quiz answers, and which AI turns text into search vectors — and both default to Gemini's free tier, reusing the same `GEMINI_API_KEY`. Voyage is available as an optional alternative for embeddings only, and both can be switched to fully-local models with no API key and no internet access at all:
+
+```
+# .env — run everything offline, no API key needed
+LLM_PROVIDER=local
+EMBEDDING_PROVIDER=local
+```
 
 **Answer generation** — `LLM_PROVIDER`:
 | Value | Notes |
 |---|---|
-| `gemini` (default) | Hosted, via `google-genai`. Model from `GEMINI_MODEL` (default `gemini-3.8-flash`). Requires `GEMINI_API_KEY` — the app fails to start without it while this is active. |
-| `local` | The in-process Flan-T5 model (`rag.py`), no API key, works fully offline. See [Known limitations](#known-limitations) for its quality tradeoffs. |
+| `gemini` (default, main) | Hosted, via `google-genai`. Model from `GEMINI_MODEL` (default `gemini-3.8-flash`). Requires `GEMINI_API_KEY` — the app fails to start without it while this is active. |
+| `local` (optional) | The in-process Flan-T5 model (`rag.py`), no API key, works fully offline. See [Known limitations](#known-limitations) for its quality tradeoffs. |
 
 **Embeddings** — `EMBEDDING_PROVIDER`:
 | Value | Notes |
 |---|---|
-| `gemini` (default) | Hosted, via `google-genai`, reusing `GEMINI_API_KEY`. Model `GEMINI_EMBED_MODEL` (default `gemini-embedding-001`), vector size `GEMINI_EMBED_DIM` (default `768`), batched at `GEMINI_EMBED_BATCH_SIZE` (default `50`). |
-| `voyage` | Hosted, via `voyageai`. Requires its own `VOYAGE_API_KEY`. Model `VOYAGE_MODEL` (default `voyage-4`), 1024-dimensional, batched at 64. **Without a payment method on the Voyage account, it's capped at ~10K tokens/minute** — noticeably slower for large uploads than the other providers. |
-| `local` | The in-process `all-MiniLM-L6-v2` model, no API key, works fully offline, 384-dimensional. |
+| `gemini` (default, main) | Hosted, via `google-genai`, reusing `GEMINI_API_KEY`. Model `GEMINI_EMBED_MODEL` (default `gemini-embedding-001`), vector size `GEMINI_EMBED_DIM` (default `768`), batched at `GEMINI_EMBED_BATCH_SIZE` (default `50`). |
+| `voyage` (optional) | Hosted, via `voyageai`. Requires its own `VOYAGE_API_KEY`. Model `VOYAGE_MODEL` (default `voyage-4`), 1024-dimensional, batched at 64. **Without a payment method on the Voyage account, it's capped at ~10K tokens/minute** — noticeably slower for large uploads than the other providers. |
+| `local` (optional) | The in-process `all-MiniLM-L6-v2` model, no API key, works fully offline, 384-dimensional. |
 
-Vectors from different providers (or different dimensions of the same provider) aren't comparable, so every page records which `embedding_model` produced its vector (`Page.embedding_model`, e.g. `"gemini:gemini-embedding-001:768"`). Retrieval only scores pages matching the currently active model — if you switch `EMBEDDING_PROVIDER`, existing documents stop showing up in chat/search (with a clear "Your documents need re-indexing" message) until you re-embed them:
+Vectors from different providers (or different dimensions of the same provider) aren't comparable, so every page records which `embedding_model` produced its vector (`Page.embedding_model`, e.g. `"gemini:gemini-embedding-001:768"`). Retrieval only scores pages matching the currently active model — **whenever you change `EMBEDDING_PROVIDER` (or switch back), existing documents stop showing up in chat/search** (with a clear "Your documents need re-indexing" message) until you re-embed them with the newly active provider:
 
 ```
 cd backend
@@ -130,9 +136,9 @@ python scripts/reembed.py                    # every page, all users
 python scripts/reembed.py --username alice    # only one user's pages
 ```
 
-This re-embeds in batches with progress output and invalidates the retrieval cache when done.
+This re-embeds in batches with progress output and invalidates the retrieval cache when done; running it again when nothing needs re-embedding is a harmless no-op (each page keeps its existing vector if `embedding_model` already matches the active one — no need to re-run it after every restart, only after an actual provider/model change).
 
-Rate limits: a Gemini embedding call that keeps hitting the provider's rate limit even after retrying returns a `503` from `/upload-book` (`"Search service is busy. Please try uploading again in a minute."`) rather than a generic error, and nothing is saved — just retry the upload shortly after.
+Rate limits: both Gemini paths retry transient failures automatically, and a Gemini **embedding** call specifically paces itself around the free tier's per-minute quota (waiting out a `429` and continuing) rather than failing outright — see `EMBED_MAX_WAIT_SECONDS` / `EMBED_QUERY_MAX_WAIT_SECONDS` in `.env.example`. If the service is still unavailable after that, routes return a `503` instead of a generic error or a stack trace: `/upload-book` replies `"Search service is busy. Please try uploading again in a minute."` (nothing is saved), and `/chat`, `/tools/tutor`, `/tools/summarize`, `/tools/flashcards`, `/generate-quiz`, and `/semantic-search` all reply `"AI service is busy. Please try again in a minute."` — just retry shortly after.
 
 ## Migrating an existing database
 
@@ -179,8 +185,9 @@ Unexpected server errors (anything not raised deliberately as an `HTTPException`
 
 ## Known limitations
 
-- **No OCR.** A scanned PDF with no text layer (an image of a page, not extracted text) returns a `422` with a clear message rather than silently producing an empty or garbled document — OCR support (to actually read the scanned text) is not implemented yet.
+- **No OCR or handwriting recognition yet.** A scanned PDF with no text layer (an image of a page, not extracted text) or a handwritten document returns a `422` with a clear message rather than silently producing an empty or garbled document — reading scanned/handwritten content is planned for Phase 3, not implemented yet.
 - **`flan-t5-small` answer quality (LLM_PROVIDER=local only).** The default `LLM_PROVIDER=gemini` doesn't have this limitation. The local answer-generation model is intentionally small (so it runs on a CPU with no external API key), which means answers can be shallow, occasionally repetitive, or misphrase a nuance from the source text. For sharper answers on `local`, uploading more specific/well-structured source material tends to help more than rephrasing the question.
+- **Free-tier rate limits.** Gemini's free tier enforces per-minute quotas on both embeddings and generation; a large upload or a burst of chat/quiz/summarize/flashcard requests can hit them. Embedding requests pace themselves and wait out the quota automatically instead of failing (see [AI providers](#ai-providers)); generation requests retry briefly and then return a `503` ("AI service is busy...") if the service is still unavailable — just retry shortly after. Voyage's free tier (no payment method on the account) is similarly capped, at ~10K tokens/minute.
 - **Single SQLite file, single worker.** Fine for individual or small-team use; not built for high-concurrency or multi-instance deployment (see the `--workers 1` note above).
 - **English-oriented.** The embedding and generation models (Gemini, Voyage, and the local fallbacks) are primarily English-trained; other languages will work less reliably for retrieval and generation.
 
