@@ -15,7 +15,6 @@ from sqlalchemy.orm import Session
 import json
 
 import embeddings
-from embeddings import create_embeddings
 import llm
 from rag import (
     generate_answer,
@@ -28,7 +27,7 @@ from rag import (
     clean_extracted_text
 )
 from document_parsers import parse_document, chunk_parsed_document
-from retrieval import retrieve, invalidate_cache, user_has_documents
+from retrieval import retrieve, invalidate_cache, user_has_documents, needs_reembedding
 
 from database import engine, get_db
 from models import Base, Book, Page, User
@@ -56,10 +55,10 @@ app_state = {"models_ready": False, "database_ready": False}
 async def lifespan(app: FastAPI):
     logger.info("Starting up: loading AI models and preparing database")
 
-    embeddings.load_model()
-    # Loads the local Flan-T5 model only when LLM_PROVIDER=local; with
-    # Gemini active this instead eagerly builds the Gemini client, so a
-    # missing GEMINI_API_KEY fails startup here rather than on first request.
+    # Each init() loads the local model only when its provider env var is
+    # "local"; otherwise it eagerly builds the hosted client so a missing
+    # API key fails startup here rather than on first request.
+    embeddings.init()
     llm.init()
     app_state["models_ready"] = True
 
@@ -294,30 +293,33 @@ async def upload_book(
     texts = [chunk_item["content"] for chunk_item in chunks]
 
     try:
-        embeddings = create_embeddings(texts)
+        embedding_vectors = embeddings.embed_documents(texts)
     except Exception:
         logger.exception("Failed to embed %d chunk(s) for '%s'", len(texts), filename)
         raise HTTPException(status_code=500, detail="Failed to generate embeddings for this document.")
 
-    if len(embeddings) != len(texts):
+    if len(embedding_vectors) != len(texts):
         logger.error(
             "Embedding count mismatch for '%s': expected %d chunks, got %d embeddings",
-            filename, len(texts), len(embeddings)
+            filename, len(texts), len(embedding_vectors)
         )
         raise HTTPException(status_code=500, detail="Failed to embed all chunks of this document.")
+
+    embedding_model = embeddings.active_model_name()
 
     try:
         new_book = Book(name=filename, user_id=current_user.id)
         db.add(new_book)
         db.flush()
 
-        for chunk_index, (chunk_item, embedding) in enumerate(zip(chunks, embeddings)):
+        for chunk_index, (chunk_item, embedding) in enumerate(zip(chunks, embedding_vectors)):
             db.add(Page(
                 book_id=new_book.id,
                 page_number=chunk_item["page_number"],
                 chunk_number=chunk_index + 1,
                 content=chunk_item["content"],
-                embedding=json.dumps(embedding.tolist())
+                embedding=json.dumps(embedding.tolist()),
+                embedding_model=embedding_model
             ))
 
         db.commit()
@@ -441,6 +443,12 @@ def semantic_search(
             "message": "No documents available"
         }
 
+    if needs_reembedding(db, current_user.id):
+
+        return {
+            "message": "Your documents need re-indexing"
+        }
+
     top_pages = retrieve(db, current_user.id, query, top_k=3, apply_threshold=False)
 
     return [
@@ -468,6 +476,11 @@ def _answer_question(question: str, current_user: User, db: Session):
     if not user_has_documents(db, current_user.id):
         return {
             "message": "No documents uploaded"
+        }
+
+    if needs_reembedding(db, current_user.id):
+        return {
+            "message": "Your documents need re-indexing"
         }
 
     top_pages = retrieve(db, current_user.id, question, top_k=3, apply_threshold=True)
@@ -582,6 +595,9 @@ def generate_flashcards(
     if not user_has_documents(db, current_user.id):
         return {"cards": [], "message": "No documents uploaded yet."}
 
+    if needs_reembedding(db, current_user.id):
+        return {"cards": [], "message": "Your documents need re-indexing"}
+
     top_pages = retrieve(db, current_user.id, topic, top_k=5, apply_threshold=True)
 
     combined_text = "\n".join(page.content for _, page in top_pages)
@@ -650,6 +666,13 @@ def generate_ai_quiz(
         return {
             "topic": topic,
             "quiz": "Not enough information found in uploaded documents.",
+            "questions": []
+        }
+
+    if needs_reembedding(db, current_user.id):
+        return {
+            "topic": topic,
+            "quiz": "Your documents need re-indexing",
             "questions": []
         }
 

@@ -30,6 +30,12 @@ class Page(Base):
 
     embedding = Column(Text)
 
+    # Which provider+model produced `embedding` (e.g. "voyage:voyage-4" or
+    # "local:all-MiniLM-L6-v2") -- vectors from different models have
+    # different dimensions and can't be compared, so retrieval only scores
+    # pages whose embedding_model matches the currently active one.
+    embedding_model = Column(String, nullable=True)
+
 
 class User(Base):
     __tablename__ = "users"

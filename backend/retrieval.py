@@ -3,7 +3,7 @@ import json
 import numpy as np
 from sqlalchemy.orm import Session
 
-from embeddings import create_embedding
+import embeddings
 from models import Book, Page
 
 # Per-user cache: user_id -> (embedding_matrix, page_ids)
@@ -24,6 +24,27 @@ def user_has_documents(db: Session, user_id: int) -> bool:
     ).filter(Book.user_id == user_id).first() is not None
 
 
+def needs_reembedding(db: Session, user_id: int) -> bool:
+    """
+    True when the user has documents, but none of them are embedded with
+    the currently active embedding model (e.g. after switching
+    EMBEDDING_PROVIDER without re-running scripts/reembed.py yet) --
+    otherwise retrieve() would silently return no results, indistinguishable
+    from "no documents uploaded".
+    """
+    if not user_has_documents(db, user_id):
+        return False
+
+    has_current = db.query(Page.id).join(
+        Book, Page.book_id == Book.id
+    ).filter(
+        Book.user_id == user_id,
+        Page.embedding_model == embeddings.active_model_name()
+    ).first() is not None
+
+    return not has_current
+
+
 def _ensure_cache(db: Session, user_id: int):
     if user_id in _cache_by_user:
         return
@@ -35,7 +56,8 @@ def _ensure_cache(db: Session, user_id: int):
         Book, Page.book_id == Book.id
     ).filter(
         Book.user_id == user_id,
-        Page.embedding.isnot(None)
+        Page.embedding.isnot(None),
+        Page.embedding_model == embeddings.active_model_name()
     ).all()
 
     for page in pages:
@@ -63,7 +85,7 @@ def retrieve(
     if embedding_matrix.shape[0] == 0:
         return []
 
-    query_vector = create_embedding(query)
+    query_vector = embeddings.embed_query(query)
     scores = embedding_matrix @ query_vector
 
     order = np.argsort(scores)[::-1]
