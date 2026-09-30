@@ -16,7 +16,7 @@ import json
 
 import embeddings
 from embeddings import create_embeddings
-import rag
+import llm
 from rag import (
     generate_answer,
     generate_quiz,
@@ -57,7 +57,10 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up: loading AI models and preparing database")
 
     embeddings.load_model()
-    rag.load_model()
+    # Loads the local Flan-T5 model only when LLM_PROVIDER=local; with
+    # Gemini active this instead eagerly builds the Gemini client, so a
+    # missing GEMINI_API_KEY fails startup here rather than on first request.
+    llm.init()
     app_state["models_ready"] = True
 
     Base.metadata.create_all(bind=engine)
@@ -157,7 +160,8 @@ def health_check():
     return {
         "status": "Server is healthy" if ready else "Server is starting up",
         "models_ready": app_state["models_ready"],
-        "database_ready": app_state["database_ready"]
+        "database_ready": app_state["database_ready"],
+        "llm": llm.provider_status()
     }
 
 
