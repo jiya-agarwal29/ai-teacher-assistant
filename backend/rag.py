@@ -1,5 +1,3 @@
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-import torch
 import re
 import random
 import logging
@@ -15,14 +13,18 @@ device = None
 def load_model():
     """
     Loads the Flan-T5 tokenizer/model. Called once from the FastAPI lifespan
-    at startup so requests never pay the load cost; safe to call again
-    (no-op if already loaded). Also lets pure text-processing functions in
-    this module (quiz generation, definition extraction, etc.) be imported
-    and used — e.g. in tests — without paying the model-load cost at all.
+    at startup (only when LLM_PROVIDER=local) so requests never pay the
+    load cost; safe to call again (no-op if already loaded). torch and
+    transformers are imported here, not at module level, so importing
+    rag.py (e.g. for its quiz functions, used regardless of LLM_PROVIDER)
+    never requires those heavy packages to be installed -- only
+    LLM_PROVIDER=local does. See requirements-local.txt.
     """
     global tokenizer, model, device
     if model is not None:
         return
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)

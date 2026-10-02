@@ -19,7 +19,8 @@ class Page(Base):
 
     book_id = Column(
         Integer,
-        ForeignKey("books.id")
+        ForeignKey("books.id"),
+        index=True
     )
 
     page_number = Column(Integer)

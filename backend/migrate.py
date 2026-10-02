@@ -7,9 +7,11 @@ Adds the books.user_id column if it isn't already there, then assigns every
 currently-unowned book to the given username. Also adds the
 pages.embedding_model column if missing and backfills it to
 "local:all-MiniLM-L6-v2" on existing rows -- all pages embedded before this
-column existed were embedded with the local MiniLM model. Safe to run more
-than once: every ALTER TABLE is skipped once its column exists, and every
-UPDATE only ever touches rows that still need it.
+column existed were embedded with the local MiniLM model. Also creates an
+index on pages.book_id if missing (new databases get it automatically via
+models.py; this backfills it onto existing ones). Safe to run more than
+once: every ALTER TABLE / CREATE INDEX is skipped once it already exists,
+and every UPDATE only ever touches rows that still need it.
 
 Usage:
     python migrate.py <username>
@@ -38,6 +40,11 @@ logger = logging.getLogger(__name__)
 def column_exists(cursor, table, column):
     cursor.execute(f"PRAGMA table_info({table})")
     return any(row[1] == column for row in cursor.fetchall())
+
+
+def index_exists(cursor, table, index_name):
+    cursor.execute(f"PRAGMA index_list({table})")
+    return any(row[1] == index_name for row in cursor.fetchall())
 
 
 def main():
@@ -75,6 +82,13 @@ def main():
         "Set embedding_model='%s' on %d existing page(s).",
         LEGACY_EMBEDDING_MODEL, unset_embedding_model_count
     )
+
+    if index_exists(cursor, "pages", "ix_pages_book_id"):
+        logger.info("pages.book_id index already exists, skipping CREATE INDEX.")
+    else:
+        cursor.execute("CREATE INDEX ix_pages_book_id ON pages (book_id)")
+        conn.commit()
+        logger.info("Created index on pages.book_id.")
 
     cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()

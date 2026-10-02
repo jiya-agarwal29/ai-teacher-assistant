@@ -35,7 +35,8 @@ from auth import (
     create_access_token,
     verify_password,
     hash_password,
-    get_current_user
+    get_current_user,
+    verify_token
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -69,11 +70,39 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down")
 
 
+AI_RATE_LIMIT_DETAIL = "Too many requests. Please wait a minute."
+
+
+def _user_rate_limit_key(request: Request) -> str:
+    """
+    Rate-limits AI routes per logged-in user instead of per IP, so one
+    user can't exhaust another's budget (or a shared/NATed IP's budget)
+    and vice versa. Decodes the username straight out of the bearer token;
+    falls back to the client IP if there's no usable token -- the route's
+    own get_current_user dependency rejects those requests anyway.
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        username = verify_token(auth_header[7:])
+        if username:
+            return f"user:{username}"
+    return get_remote_address(request)
+
+
 limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    # /login and /register keep slowapi's own default {"error": "..."}
+    # response shape (already documented in the README); the per-user AI
+    # route limits below use a plainer, friendlier message instead.
+    if request.url.path in ("/login", "/register"):
+        return _rate_limit_exceeded_handler(request, exc)
+    return JSONResponse(status_code=429, content={"detail": AI_RATE_LIMIT_DETAIL})
 
 
 @app.exception_handler(Exception)
@@ -328,7 +357,7 @@ def login(
 # PDF UPLOAD + CHUNKING
 # -----------------------------
 @app.post("/upload-book")
-async def upload_book(
+def upload_book(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -482,6 +511,15 @@ def delete_book(
 # -----------------------------
 # NORMAL SEARCH
 # -----------------------------
+def _escape_like(value: str) -> str:
+    """
+    Escapes LIKE/ILIKE wildcard characters in user-supplied search text, so
+    a literal "%" or "_" in the query matches itself instead of acting as a
+    wildcard. Must be paired with escape="\\" on the ilike() call.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @app.get("/search")
 def search_content(
     query: str,
@@ -493,7 +531,7 @@ def search_content(
         Book, Page.book_id == Book.id
     ).filter(
         Book.user_id == current_user.id,
-        Page.content.ilike(f"%{query}%")
+        Page.content.ilike(f"%{_escape_like(query)}%", escape="\\")
     ).all()
 
     if not results:
@@ -640,7 +678,9 @@ def _answer_question(question: str, current_user: User, db: Session):
 
 
 @app.get("/chat")
+@limiter.limit("20/minute", key_func=_user_rate_limit_key)
 def chat_with_pdf(
+    request: Request,
     question: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -652,7 +692,9 @@ def chat_with_pdf(
 # AI TOOLS: SUMMARIZER, FLASHCARDS, TUTOR
 # -----------------------------
 @app.post("/tools/summarize")
+@limiter.limit("10/minute", key_func=_user_rate_limit_key)
 def summarize_notes(
+    request: Request,
     payload: SummarizeRequest,
     current_user: User = Depends(get_current_user)
 ):
@@ -686,7 +728,9 @@ def summarize_notes(
 
 
 @app.post("/tools/flashcards")
+@limiter.limit("10/minute", key_func=_user_rate_limit_key)
 def generate_flashcards(
+    request: Request,
     payload: FlashcardsRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -786,7 +830,9 @@ def generate_flashcards(
 
 
 @app.post("/tools/tutor")
+@limiter.limit("20/minute", key_func=_user_rate_limit_key)
 def ai_tutor(
+    request: Request,
     payload: TutorRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -915,7 +961,9 @@ def _generate_quiz_with_gemini(topic: str, top_pages):
 
 
 @app.get("/generate-quiz")
+@limiter.limit("5/minute", key_func=_user_rate_limit_key)
 def generate_ai_quiz(
+    request: Request,
     topic: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)

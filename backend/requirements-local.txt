@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Only needed for LLM_PROVIDER=local (Flan-T5, rag.py) and/or
+# EMBEDDING_PROVIDER=local (all-MiniLM-L6-v2, embeddings.py). The default
+# Gemini-based setup (requirements.txt alone) doesn't need these at all.
+sentence-transformers==5.2.3
+transformers==5.3.0
+torch==2.10.0

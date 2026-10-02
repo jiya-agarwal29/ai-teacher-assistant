@@ -6,10 +6,8 @@ isolation flow described in the deployment checklist.
 """
 import os
 
-# A throwaway SECRET_KEY so auth.py doesn't require a real .env file to be
-# present in whatever environment runs the tests. setdefault() means a real
-# configured value (e.g. from backend/.env) always wins.
-os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only")
+# Dummy SECRET_KEY / GEMINI_API_KEY are set in tests/conftest.py (loaded
+# before this module) so this file doesn't need to set them itself.
 
 import pytest
 from sqlalchemy import create_engine
@@ -174,6 +172,7 @@ def test_endpoints_require_auth(client):
     assert res.status_code == 401
 
 
+@pytest.mark.real_embeddings_path
 def test_upload_returns_503_when_embedding_service_stays_rate_limited(client, monkeypatch):
     import embeddings
     import llm as llm_module
@@ -331,12 +330,15 @@ def test_flashcards_drops_cards_with_invalid_source_index(client, llm_mock_heade
     client.delete(f"/books/{book_id}", headers=headers)
 
 
-def test_semantic_search_returns_503_when_query_embedding_stays_rate_limited(client, llm_mock_headers, monkeypatch):
+def test_semantic_search_returns_503_when_query_embedding_stays_rate_limited(client, llm_mock_headers, monkeypatch, real_embed_query):
     import embeddings
     import llm as llm_module
     from google.genai import errors as genai_errors
 
     headers = llm_mock_headers
+    # Uses the autouse fake embed_documents for a fast, network-free upload;
+    # embed_query is restored to the real implementation below, just for
+    # the search call, so the rate-limit/retry logic actually runs.
     book_id = _upload_bees_doc(client, headers, "querybusy_bees.txt")
 
     class _AlwaysRateLimitedModels:
@@ -347,6 +349,7 @@ def test_semantic_search_returns_503_when_query_embedding_stays_rate_limited(cli
         models = _AlwaysRateLimitedModels()
 
     monkeypatch.setattr(llm_module, "get_client", lambda: _AlwaysRateLimitedClient())
+    monkeypatch.setattr(embeddings, "embed_query", real_embed_query)
     monkeypatch.setattr(embeddings.time, "sleep", lambda seconds: None)
 
     res = client.get("/semantic-search", headers=headers, params={"query": "bees"})

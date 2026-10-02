@@ -57,6 +57,12 @@ For running the test suite too, install the dev extras instead (installs `requir
 pip install -r requirements-dev.txt
 ```
 
+`requirements.txt` alone is enough for the default Gemini-based setup. `torch`, `transformers`, and `sentence-transformers` live in a separate `requirements-local.txt` instead, since they're only needed for `LLM_PROVIDER=local` and/or `EMBEDDING_PROVIDER=local` (see [AI providers](#ai-providers)) — install it only if you're using one of those:
+
+```
+pip install -r requirements-local.txt
+```
+
 Create `backend/.env` — see `backend/.env.example` for the full list with descriptions, copy it as a starting point (`cp .env.example .env`). Every variable is optional except `SECRET_KEY` and `GEMINI_API_KEY` (required for the default AI providers — see [AI providers](#ai-providers) below); the rest fall back to sane local-dev defaults:
 
 | Variable | Default | Purpose |
@@ -67,6 +73,7 @@ Create `backend/.env` — see `backend/.env.example` for the full list with desc
 | `CORS_ORIGINS` | the local Vite dev ports | Comma-separated list of allowed frontend origins. **Must** be set in production to your real frontend URL(s) — see [Production deployment](#production-deployment). |
 | `MAX_UPLOAD_MB` | `25` | Maximum accepted document upload size. |
 | `LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`). |
+| `DATABASE_URL` | an absolute `sqlite:///.../backend/teacher_ai.db` path next to `database.py` | SQLAlchemy database URL. Only set this to point at a different file or a different database engine for production. |
 
 See [AI providers](#ai-providers) for `LLM_PROVIDER`, `EMBEDDING_PROVIDER`, and the Gemini/Voyage-specific variables.
 
@@ -115,6 +122,8 @@ LLM_PROVIDER=local
 EMBEDDING_PROVIDER=local
 ```
 
+Using either `local` value also needs `pip install -r requirements-local.txt` (see [Setup](#setup)) — `torch`/`transformers`/`sentence-transformers` aren't installed by `requirements.txt` alone.
+
 **Answer generation** — `LLM_PROVIDER`:
 | Value | Notes |
 |---|---|
@@ -159,7 +168,9 @@ pip install -r requirements-dev.txt   # installs requirements.txt + pytest
 python -m pytest tests/ -v
 ```
 
-`tests/test_quiz.py` exercises quiz fairness rules (no scenario-question answer leaks, True/False isn't always the same value, no repeated concepts) directly against `rag.py` — no server or database needed. `tests/test_api.py` drives the real FastAPI app through `TestClient` against an isolated on-disk SQLite database (`tests/test_api.db`, created and deleted automatically — it never touches `teacher_ai.db`): register, login, the generic bad-login message, uploading a small `.txt`, listing books, per-user isolation (a second account can neither see nor delete another account's book), and delete. The first run loads the real AI models via the app's startup lifespan, so it takes a similar amount of time to boot as the live server.
+The whole suite runs with **no internet connection and no real `backend/.env`** — `tests/conftest.py` sets a dummy `SECRET_KEY`/`GEMINI_API_KEY` (so the app's startup lifespan succeeds without a real key or a config file) and replaces `embeddings.embed_documents()`/`embed_query()` with deterministic fake vectors everywhere except `tests/test_embeddings.py` itself and the handful of tests that deliberately exercise the real embeddings pipeline against a mocked low-level client (marked `@pytest.mark.real_embeddings_path`) to test rate-limit handling; `tests/test_llm.py` and the LLM-dependent `tests/test_api.py` cases mock `llm.generate()`/`generate_json()` directly. No test makes a real API call.
+
+`tests/test_quiz.py` exercises quiz fairness rules (no scenario-question answer leaks, True/False isn't always the same value, no repeated concepts) directly against `rag.py` — no server or database needed. `tests/test_api.py` drives the real FastAPI app through `TestClient` against an isolated on-disk SQLite database (`tests/test_api.db`, created and deleted automatically — it never touches `teacher_ai.db`): register, login, the generic bad-login message, uploading a small `.txt`, listing books, per-user isolation (a second account can neither see nor delete another account's book), delete, plus the Gemini-backed chat/summarize/flashcards/quiz routes and their 503/429 edge cases, all against mocked LLM/embedding clients.
 
 ## Production deployment
 
@@ -179,7 +190,7 @@ Before deploying, set:
 
 Also worth setting for a real deployment: `ACCESS_TOKEN_EXPIRE_MINUTES`, `MAX_UPLOAD_MB`, and `LOG_LEVEL` (see the env var table in [Setup](#setup)).
 
-`POST /login` and `POST /register` are rate-limited to 10 requests/minute per IP (`slowapi`) to slow down credential-stuffing and account-creation abuse; a client over the limit gets `429` with `{"error": "Rate limit exceeded: ..."}`. The limiter's counters are in-memory and per-process, so they reset on restart and aren't shared across multiple worker processes or machines — fine for the single-worker setup above, but wouldn't rate-limit correctly if scaled to multiple workers without switching to a shared backing store (e.g. Redis).
+`POST /login` and `POST /register` are rate-limited to 10 requests/minute per IP (`slowapi`) to slow down credential-stuffing and account-creation abuse; a client over the limit gets `429` with `{"error": "Rate limit exceeded: ..."}`. The AI routes are separately rate-limited **per logged-in user** (not per IP, so one user can't exhaust another's budget): `/chat` and `/tools/tutor` at 20/minute, `/tools/summarize` and `/tools/flashcards` at 10/minute, `/generate-quiz` at 5/minute — a client over one of those limits gets `429` with `{"detail": "Too many requests. Please wait a minute."}`. The limiter's counters are in-memory and per-process, so they reset on restart and aren't shared across multiple worker processes or machines — fine for the single-worker setup above, but wouldn't rate-limit correctly if scaled to multiple workers without switching to a shared backing store (e.g. Redis).
 
 Unexpected server errors (anything not raised deliberately as an `HTTPException`) are caught by a global handler: the client always gets a plain `{"detail": "Internal server error"}` with a `500`, never the exception text or a stack trace; the real exception and stack trace go to the log instead.
 
