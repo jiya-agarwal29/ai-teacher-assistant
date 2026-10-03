@@ -6,13 +6,15 @@ Gemini (`GEMINI_API_KEY`, free tier) is the main AI provider for both answer gen
 
 ## Features
 
-- **Document upload** — PDF / DOCX / PPTX / TXT / MD, or one or more photos/scans (JPG / PNG / WEBP / HEIC), parsed and chunked into a semantic index; processing runs in the background with a live status (`processing` → `needs_review`/`ready`/`failed`, with a progress count and a one-click retry on failure) so an upload never blocks the request
+- **Document upload** — PDF / DOCX / PPTX / TXT / MD, or one or more photos/scans (JPG / PNG / WEBP / HEIC), parsed and chunked into a semantic index; processing runs entirely in the background with a live status (`processing` → `needs_review`/`ready`/`failed`, with a progress count and a one-click retry on failure) so an upload never blocks the request
 - **OCR for scanned PDFs and handwritten photos** — a PDF page with no usable text layer, or any uploaded photo, is transcribed with Gemini vision; optionally held for review before it's indexed (see [Document processing](#document-processing))
+- **OCR review page** — a page-by-page editor (image + zoom beside the editable transcription, `[illegible]` markers highlighted) to fix up OCR'd text, re-run OCR on a single page, and approve one page or a whole document before it's searchable (see [OCR review](#ocr-review))
 - **AI Chat** — ask questions, get answers grounded in your uploaded material with cited sources
 - **Semantic search** — find relevant passages by meaning, not just keyword match
 - **Quiz Builder** — generates MCQ / true-false / fill-in-the-blank / short & long answer / scenario / viva / interview questions from your material, with grading
 - **Notes Summarizer** and **AI Tutor** — bullet-point summaries and free-form Q&A
 - **Analytics** — real usage stats (active study time, quiz performance, question activity, document library breakdown), computed from what you've actually done, not placeholder numbers
+- **Session-expiry warning** — a "your session is about to expire" popup with a live countdown and a one-click "Stay logged in", so a lesson-prep session isn't cut off mid-work without warning (see [Session expiry](#session-expiry))
 
 ## Tech stack
 
@@ -104,7 +106,7 @@ npm install
 npm run dev
 ```
 
-Serves on `http://localhost:5173`. By default it talks to the backend at `http://127.0.0.1:8000`; to point it elsewhere, copy `frontend/.env.example` to `frontend/.env` and set `VITE_API_URL`.
+Serves on `http://localhost:5173`. By default it talks to the backend at `http://127.0.0.1:8000`; to point it elsewhere, copy `frontend/.env.example` to `frontend/.env` and set `VITE_API_URL`. The same file also has `VITE_SESSION_WARNING_MINUTES` (default `5`) — see [Session expiry](#session-expiry).
 
 **`VITE_API_URL` is baked in at build time, not read at runtime.** Vite statically replaces `import.meta.env.VITE_API_URL` when it builds the bundle, so the variable must be set in the environment (or in `frontend/.env.production`) *before* running `npm run build` — setting it later, or on the server that hosts `dist/`, has no effect. To confirm which URL a given build was compiled with, search the built bundle: `grep -o "http[^\"]*" frontend/dist/assets/*.js | head`.
 
@@ -186,9 +188,20 @@ A `needs_review` book's amber badge (and a "Review" button in Documents.jsx) lin
 - `GET /books/{id}/pages/{n}/image` — the saved page image (the frontend fetches this with the JWT as a `fetch`-to-blob, since a plain `<img src>` can't carry an `Authorization` header); only ever serves a file actually inside that book's own `UPLOAD_DIR` folder.
 - `PUT /books/{id}/pages/{n}` `{extracted_text}` — saves edited text (max 20,000 characters) without otherwise touching `review_status`, **unless** the page was already `approved`/`auto_approved`, in which case editing reopens it to `needs_review` (and reopens the book to `needs_review` too, if it was `ready`).
 - `POST /books/{id}/pages/{n}/approve` and `POST /books/{id}/approve-all` — approve one page or every remaining `needs_review` page. Once none are left, this kicks off the background chunk+embed job (`status` → `processing` → `ready`), replacing any previous `Page` rows rather than appending to them — so re-approving after a post-`ready` edit correctly rebuilds the index from the edited text.
-- `POST /books/{id}/pages/{n}/reread` — re-runs OCR against that page's already-saved image (no re-render/re-upload) in the background, setting `review_status="needs_review"` (and reopening the book the same way an edit does) immediately so the frontend can show that it's in flight.
+- `POST /books/{id}/pages/{n}/reread` — re-runs OCR against that page's already-saved image (no re-render/re-upload) in the background, setting `review_status="needs_review"` (and reopening the book the same way an edit does) immediately so the frontend can show that it's in flight. The frontend asks for confirmation first ("Re-reading will replace your edits...") if the page's text was hand-edited, since the fresh transcription overwrites it.
 
 All five endpoints are owner-only (`404` otherwise) and only ever operate on files inside the book's own upload folder.
+
+## Session expiry
+
+`POST /refresh-token` (requires a still-valid token; an expired or invalid one gets the usual `401`) exchanges it for a new one with a fresh `ACCESS_TOKEN_EXPIRE_MINUTES` expiry, same response shape as `/login`. Rate-limited to 10/minute per user, same as the other authenticated routes.
+
+The frontend (`hooks/AuthProvider.jsx`) decodes the token's own `exp` claim to schedule two client-side timers — no polling — rescheduled every time the token changes (login, a page load picking up a stored token, or a refresh):
+
+- A warning popup (`components/SessionExpiryModal.jsx`, `VITE_SESSION_WARNING_MINUTES` before expiry, default `5`) with a live countdown, offering **"Stay logged in"** (calls `/refresh-token`) or **"Log out"**. Focus-trapped and accessible (Esc acts as "Stay logged in").
+- A hard logout exactly at expiry if the warning is ignored.
+
+Either path redirects to `/login` with "Your session has expired. Please log in again." and, after re-authenticating, returns the user to the page they were on (`ProtectedRoute`'s saved `location.state.from`). An unsent Chat question or an unsaved edit on the OCR review page is saved to a per-user `localStorage` slot right before any logout (manual or automatic) and restored once on the next visit (`hooks/useDraftPersistence.js`).
 
 ## Migrating an existing database
 
@@ -237,17 +250,18 @@ Also worth setting for a real deployment: `ACCESS_TOKEN_EXPIRE_MINUTES`, `MAX_UP
 
 `POST /login` and `POST /register` are rate-limited to 10 requests/minute per IP (`slowapi`) to slow down credential-stuffing and account-creation abuse; a client over the limit gets `429` with `{"error": "Rate limit exceeded: ..."}`. The AI routes are separately rate-limited **per logged-in user** (not per IP, so one user can't exhaust another's budget): `/chat` and `/tools/tutor` at 20/minute, `/tools/summarize` and `/tools/flashcards` at 10/minute, `/generate-quiz` at 5/minute, `/refresh-token` at 10/minute — a client over one of those limits gets `429` with `{"detail": "Too many requests. Please wait a minute."}`. The limiter's counters are in-memory and per-process, so they reset on restart and aren't shared across multiple worker processes or machines — fine for the single-worker setup above, but wouldn't rate-limit correctly if scaled to multiple workers without switching to a shared backing store (e.g. Redis).
 
-**Session expiry** — `POST /refresh-token` (requires a still-valid token; an expired or invalid one gets the usual `401`) exchanges it for a new one with a fresh `ACCESS_TOKEN_EXPIRE_MINUTES` expiry, same response shape as `/login`. The frontend (`hooks/AuthProvider.jsx`) decodes the token's own `exp` claim to schedule two client-side timers — no polling — rescheduled every time the token changes (login, a page load picking up a stored token, or a refresh): a warning popup (`components/SessionExpiryModal.jsx`, `VITE_SESSION_WARNING_MINUTES` before expiry, default 5) offering "Stay logged in" (calls `/refresh-token`) or "Log out", and a hard logout exactly at expiry. Either path redirects to `/login` with the message "Your session has expired. Please log in again." and, after re-authenticating, returns the user to the page they were on (`ProtectedRoute`'s saved `location.state.from`). An unsent Chat question or an unsaved edit on the OCR review page is saved to a per-user `localStorage` slot right before any logout and restored once on the next visit (`hooks/useDraftPersistence.js`).
+See [Session expiry](#session-expiry) for `/refresh-token`'s own rate limit and the client-side warning/logout timers.
 
 Unexpected server errors (anything not raised deliberately as an `HTTPException`) are caught by a global handler: the client always gets a plain `{"detail": "Internal server error"}` with a `500`, never the exception text or a stack trace; the real exception and stack trace go to the log instead.
 
 ## Known limitations
 
+- **Background jobs don't resume after a server restart.** A book still `processing` (initial upload/retry, or re-indexing after approval) when the server stops is marked `failed` on the next startup ("Processing was interrupted. Please re-upload.") rather than picked back up — there's no persistent job queue behind `jobs.py`'s in-memory `ThreadPoolExecutor`.
+- **OCR quality depends on photo quality.** Gemini vision transcribes handwriting well overall, but a blurry photo, heavy glare, extreme skew, or very small/cramped handwriting produces more `[illegible]` markers or outright wrong text — review the transcription (see [OCR review](#ocr-review)) rather than trusting it blindly for a photo taken in poor conditions.
+- **Free-tier rate limits make large scans slow.** Each OCR'd page is its own Gemini vision call, and every chunk still needs its own embedding call afterward — a large multi-page scan on the free tier can take several minutes if it runs into the per-minute quota partway through (it paces itself and keeps going rather than failing, see [AI providers](#ai-providers) and `EMBED_JOB_MAX_WAIT_SECONDS`), and a burst of chat/quiz/summarize/flashcard requests can separately hit the interactive-path limits and return a `503` — just retry shortly after. Voyage's free tier (no payment method on the account) is similarly capped, at ~10K tokens/minute.
 - **OCR needs the Gemini provider.** `LLM_PROVIDER=local` has no vision model, so a scanned PDF page or any photo upload fails the whole document with a clear error instead of silently producing an empty or garbled page.
-- **Retry doesn't skip completed OCR.** Only `/books/{id}/retry` (for a `failed` book) re-extracts everything from scratch; the review endpoints (edit/approve/re-read) never discard an already-successful OCR pass.
-- **Retry re-extracts (and re-OCRs) everything.** `/books/{id}/retry` doesn't resume partway through or reuse a previous attempt's already-transcribed pages, so retrying a document that failed late (e.g. during embedding, after OCR already succeeded) re-runs OCR on every low-text/image page again.
+- **Retry re-extracts (and re-OCRs) everything.** `/books/{id}/retry` (for a `failed` book) doesn't resume partway through or reuse a previous attempt's already-transcribed pages, so retrying a document that failed late (e.g. during embedding, after OCR already succeeded) re-runs OCR on every low-text/image page again. The review endpoints (edit/approve/re-read) are unaffected — they never discard an already-successful OCR pass.
 - **`flan-t5-small` answer quality (LLM_PROVIDER=local only).** The default `LLM_PROVIDER=gemini` doesn't have this limitation. The local answer-generation model is intentionally small (so it runs on a CPU with no external API key), which means answers can be shallow, occasionally repetitive, or misphrase a nuance from the source text. For sharper answers on `local`, uploading more specific/well-structured source material tends to help more than rephrasing the question.
-- **Free-tier rate limits.** Gemini's free tier enforces per-minute quotas on both embeddings and generation; a large upload or a burst of chat/quiz/summarize/flashcard requests can hit them. Embedding requests pace themselves and wait out the quota automatically instead of failing (see [AI providers](#ai-providers)); generation requests retry briefly and then return a `503` ("AI service is busy...") if the service is still unavailable — just retry shortly after. Voyage's free tier (no payment method on the account) is similarly capped, at ~10K tokens/minute.
 - **Single SQLite file, single worker.** Fine for individual or small-team use; not built for high-concurrency or multi-instance deployment (see the `--workers 1` note above).
 - **English-oriented.** The embedding and generation models (Gemini, Voyage, and the local fallbacks) are primarily English-trained; other languages will work less reliably for retrieval and generation.
 
