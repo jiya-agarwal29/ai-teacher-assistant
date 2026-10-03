@@ -212,35 +212,40 @@ export const api = {
 
     /**
      * POST /upload-book (with XHR for upload progress estimation).
-     * Returns immediately once the file is saved (202 {book_id, status:
-     * "processing"}) -- the caller should refresh the book list and poll
-     * status() until it reaches "ready"/"failed".
+     * `fileOrFiles` is a single File (a traditional document -- sent as
+     * "file") or an array of Files (one or more page photos/scans -- sent
+     * as "files", in array order, OCR'd as one document). `reviewOcr`
+     * (default true) is the "Let me check the text before it's used"
+     * choice -- only matters for pages that get OCR'd.
+     * Returns immediately once the file(s) are saved (202 {book_id,
+     * status}) -- the caller should refresh the book list and poll
+     * status() until it reaches "ready"/"needs_review"/"failed".
      */
-    upload: (file, onProgress) => {
+    upload: (fileOrFiles, onProgress, { reviewOcr = true } = {}) => {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', `${API_BASE_URL}/upload-book`);
-        
+
         // Attach JWT token
         const token = getToken();
         if (token) {
           xhr.setRequestHeader('Authorization', `Bearer ${token}`);
         }
-        
+
         xhr.upload.onprogress = (event) => {
           if (event.lengthComputable && onProgress) {
             const percentComplete = Math.round((event.loaded / event.total) * 100);
             onProgress(percentComplete);
           }
         };
-        
+
         xhr.onload = () => {
           if (xhr.status >= 200 && xhr.status < 300) {
             try {
               const res = JSON.parse(xhr.responseText);
               resolve(res);
             } catch {
-              resolve({ status: 'Book uploaded and chunked successfully' });
+              resolve({ status: 'processing' });
             }
           } else {
             let errorMsg = 'Failed to upload document';
@@ -253,13 +258,18 @@ export const api = {
             reject(new Error(errorMsg));
           }
         };
-        
+
         xhr.onerror = () => {
           reject(new Error('Network error during file upload.'));
         };
-        
+
         const formData = new FormData();
-        formData.append('file', file);
+        if (Array.isArray(fileOrFiles)) {
+          fileOrFiles.forEach((f) => formData.append('files', f));
+        } else {
+          formData.append('file', fileOrFiles);
+        }
+        formData.append('review_ocr', reviewOcr ? 'true' : 'false');
         xhr.send(formData);
       });
     }

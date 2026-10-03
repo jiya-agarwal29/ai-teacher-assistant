@@ -94,6 +94,32 @@ def _is_retryable_gemini_error(exc: Exception) -> bool:
     )
 
 
+def _is_gemini_rate_limited(exc: Exception) -> bool:
+    from google.genai import errors as genai_errors
+    return isinstance(exc, genai_errors.APIError) and exc.code == 429
+
+
+def _gemini_retry_after_seconds(exc: Exception):
+    """
+    Reads a Retry-After header off the failed response, if present. Small,
+    deliberate duplicate of embeddings.py's identical helper -- llm.py must
+    not import embeddings.py (which itself lazily imports llm.py to reuse
+    the Gemini client, see _embed_gemini), so this stays self-contained
+    rather than risk a circular import.
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("retry-after") or headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _call_with_retry(call_fn, description: str):
     """
     Calls call_fn() with up to MAX_ATTEMPTS tries, retrying with exponential
@@ -179,6 +205,108 @@ def _generate_local(prompt: str, system: str | None, max_tokens: int) -> str:
     import rag
     instruction = system or "Respond to the instructions above."
     return rag.generate_focused_answer(prompt, instruction, max_tokens=max_tokens)
+
+
+OCR_INSTRUCTION = (
+    "Transcribe ALL text on this page exactly as written, including handwriting. "
+    "Keep the original order, headings, bullet points and line breaks. Write "
+    "equations in plain text. Do not summarise, explain or add anything. If a "
+    "word is unreadable write [illegible]. If the page has no text, return an "
+    "empty string."
+)
+
+_OCR_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60.0
+_OCR_MAX_WAIT_DEFAULT_SECONDS = 300.0
+
+
+def _read_image_gemini(image_bytes: bytes, mime_type: str, max_wait_seconds: float) -> str:
+    """
+    Paces through Gemini rate limits the same way embeddings.py's
+    _embed_gemini does (wait out a 429 up to max_wait_seconds total,
+    rather than giving up on the first one) since jobs.py's OCR step is a
+    background job with no user request blocked on it, just like a bulk
+    embedding call. Non-rate-limit errors (5xx, etc.) use the same bounded
+    attempt/backoff retry as generate().
+    """
+    from google.genai import types
+
+    client = _get_gemini_client()
+    config = types.GenerateContentConfig(temperature=0.0)
+
+    def call():
+        response = client.models.generate_content(
+            model=_gemini_model(),
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                OCR_INSTRUCTION,
+            ],
+            config=config,
+        )
+        return response.text or ""
+
+    description = "Gemini read_image"
+    total_wait = 0.0
+    backoff = _BASE_BACKOFF_SECONDS
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            return call()
+        except Exception as exc:
+            if _is_gemini_rate_limited(exc):
+                wait_seconds = _gemini_retry_after_seconds(exc) or _OCR_RATE_LIMIT_DEFAULT_WAIT_SECONDS
+                if total_wait + wait_seconds > max_wait_seconds:
+                    logger.error(
+                        "%s still rate-limited after waiting %.0fs total (limit %.0fs); giving up",
+                        description, total_wait, max_wait_seconds
+                    )
+                    raise LLMUnavailableError(
+                        f"{description} is still rate-limited after waiting "
+                        f"{total_wait:.0f}s (limit {max_wait_seconds:.0f}s)"
+                    ) from exc
+
+                total_wait += wait_seconds
+                logger.info("%s rate-limited, waiting %ds", description, int(round(wait_seconds)))
+                time.sleep(wait_seconds)
+                attempt = 0  # a rate-limit wait doesn't count against the bounded retry budget below
+                continue
+
+            if _is_retryable_gemini_error(exc) and attempt < MAX_ATTEMPTS:
+                logger.warning(
+                    "%s failed on attempt %d/%d (%s); retrying in %.1fs",
+                    description, attempt, MAX_ATTEMPTS, type(exc).__name__, backoff
+                )
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+
+            logger.error(
+                "%s failed on attempt %d (%s); giving up",
+                description, attempt, type(exc).__name__
+            )
+            raise LLMUnavailableError(
+                f"{description} failed after {attempt} attempt(s)"
+            ) from exc
+
+
+def read_image(image_bytes: bytes, mime_type: str, max_wait_seconds: float = _OCR_MAX_WAIT_DEFAULT_SECONDS) -> str:
+    """
+    OCRs a single page image (a rendered scanned PDF page, or an uploaded
+    photo of handwritten/printed notes) via Gemini vision, transcribing all
+    text verbatim -- see OCR_INSTRUCTION. Used only by jobs.py's background
+    document-processing pipeline, which passes its own (much longer)
+    rate-limit wait budget (EMBED_JOB_MAX_WAIT_SECONDS).
+
+    Raises NotImplementedError for LLM_PROVIDER=local (no vision model
+    available offline) and LLMUnavailableError if the provider stays
+    unavailable/rate-limited past max_wait_seconds.
+    """
+    if _provider() == "local":
+        raise NotImplementedError(
+            "Reading scanned or handwritten pages needs the Gemini provider."
+        )
+    return _read_image_gemini(image_bytes, mime_type, max_wait_seconds)
 
 
 def generate(

@@ -13,4 +13,11 @@ pdfplumber==0.11.9
 python-docx==1.2.0
 python-pptx==1.0.2
 
+# OCR (jobs.py / ocr.py): rendering scanned PDF pages and photos/handwritten
+# notes to images before sending them to Gemini vision for transcription.
+# pypdfium2, not PyMuPDF, specifically to avoid PyMuPDF's AGPL license.
+pypdfium2==5.13.0
+Pillow==12.3.0
+pillow-heif==1.8.0
+
 numpy==2.4.3

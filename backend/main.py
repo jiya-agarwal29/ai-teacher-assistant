@@ -6,7 +6,7 @@ import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -172,8 +172,15 @@ app.add_middleware(
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".pptx", ".doc", ".ppt", ".txt", ".md"}
-MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "25"))
+MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "60"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
+
+# Scanned/photographed pages (jobs.py OCRs these with Gemini vision -- see
+# ocr.py). Sent via the separate "files" field, one or more at a time, never
+# mixed with the single-document "file" field above.
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
+MAX_IMAGE_MB = 15.0
+MAX_IMAGE_BYTES = int(MAX_IMAGE_MB * 1024 * 1024)
 
 # Absolute path next to this file by default, not a "./"-relative one, for
 # the same reason as database.py's DEFAULT_DB_PATH -- it must not depend on
@@ -185,10 +192,27 @@ def _book_upload_dir(user_id: int, book_id: int) -> Path:
     return UPLOAD_DIR / str(user_id) / str(book_id)
 
 
-def _find_original_file(user_id: int, book_id: int) -> str | None:
-    """Locates the saved original<ext> file for a book, regardless of extension."""
-    matches = glob.glob(str(_book_upload_dir(user_id, book_id) / "original.*"))
-    return matches[0] if matches else None
+def _find_original_sources(user_id: int, book_id: int):
+    """
+    Locates whatever was saved for /books/{id}/retry to re-process: either
+    a single "original.<ext>" document, or one or more images under
+    "original_images/" (in upload order). Returns (kind, file_paths) or
+    None if nothing is saved (e.g. the upload folder was lost).
+    """
+    book_dir = _book_upload_dir(user_id, book_id)
+
+    doc_matches = sorted(glob.glob(str(book_dir / "original.*")))
+    if doc_matches:
+        return "document", doc_matches
+
+    image_matches = sorted(glob.glob(str(book_dir / "original_images" / "*")))
+    if image_matches:
+        return "images", image_matches
+
+    return None
+
+
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "50"))
 
 MAX_SUMMARIZE_CHARS = 20000
 
@@ -399,17 +423,11 @@ def login(
 
 
 # -----------------------------
-# PDF UPLOAD + CHUNKING
+# DOCUMENT UPLOAD (+ OCR)
 # -----------------------------
-@app.post("/upload-book", status_code=202)
-def upload_book(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-
-    filename = file.filename or ""
-    ext = os.path.splitext(filename)[1].lower()
+def _validate_document_upload(file: UploadFile) -> str:
+    """Returns the validated extension, or raises an HTTPException."""
+    ext = os.path.splitext(file.filename or "")[1].lower()
 
     if ext not in ALLOWED_UPLOAD_EXTENSIONS:
         raise HTTPException(
@@ -427,27 +445,100 @@ def upload_book(
             detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_MB:g} MB"
         )
 
-    new_book = Book(name=filename, user_id=current_user.id, status="processing")
+    return ext
+
+
+def _validate_image_uploads(image_files: list) -> None:
+    if len(image_files) > MAX_OCR_PAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many images ({len(image_files)}); the limit is {MAX_OCR_PAGES} per document."
+        )
+
+    for f in image_files:
+        ext = os.path.splitext(f.filename or "")[1].lower()
+        if ext not in ALLOWED_IMAGE_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported image extension '{ext}'. Allowed: {', '.join(sorted(ALLOWED_IMAGE_EXTENSIONS))}"
+            )
+
+        f.file.seek(0, os.SEEK_END)
+        size = f.file.tell()
+        f.file.seek(0)
+        if size > MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image '{f.filename}' exceeds the maximum allowed size of {MAX_IMAGE_MB:g} MB"
+            )
+
+
+@app.post("/upload-book", status_code=202)
+def upload_book(
+    file: UploadFile = File(None),
+    files: list[UploadFile] = File(None),
+    review_ocr: bool = Form(True),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # A single traditional document goes in "file"; one or more page images
+    # (a scan, phone photos of handwritten notes, etc. -- OCR'd as one
+    # document, in the order sent) go in "files". Exactly one of the two.
+    image_files = [f for f in (files or []) if f and f.filename]
+    has_document = bool(file and file.filename)
+
+    if has_document and image_files:
+        raise HTTPException(status_code=400, detail="Send either 'file' or 'files', not both.")
+
+    if image_files:
+        kind = "images"
+        _validate_image_uploads(image_files)
+        book_name = image_files[0].filename
+    elif has_document:
+        kind = "document"
+        book_name = file.filename
+        ext = _validate_document_upload(file)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="No file provided. Send a document as 'file' or one or more images as 'files'."
+        )
+
+    new_book = Book(name=book_name, user_id=current_user.id, status="processing", review_ocr=review_ocr)
     db.add(new_book)
     db.flush()  # assigns new_book.id, needed for the upload folder name below
 
     book_dir = _book_upload_dir(current_user.id, new_book.id)
-    saved_path = book_dir / f"original{ext}"
 
     try:
         book_dir.mkdir(parents=True, exist_ok=True)
-        file.file.seek(0)
-        with open(saved_path, "wb") as out:
-            shutil.copyfileobj(file.file, out)
+
+        if kind == "images":
+            images_dir = book_dir / "original_images"
+            images_dir.mkdir(parents=True, exist_ok=True)
+            saved_paths = []
+            for index, f in enumerate(image_files, start=1):
+                image_ext = os.path.splitext(f.filename or "")[1].lower()
+                dest = images_dir / f"{index:04d}{image_ext}"
+                f.file.seek(0)
+                with open(dest, "wb") as out:
+                    shutil.copyfileobj(f.file, out)
+                saved_paths.append(str(dest))
+        else:
+            dest = book_dir / f"original{ext}"
+            file.file.seek(0)
+            with open(dest, "wb") as out:
+                shutil.copyfileobj(file.file, out)
+            saved_paths = [str(dest)]
     except Exception:
         db.rollback()
-        logger.exception("Failed to save uploaded file '%s' to disk", filename)
+        logger.exception("Failed to save uploaded file(s) for '%s' to disk", book_name)
         raise HTTPException(status_code=500, detail="Failed to save the uploaded document.")
 
     db.commit()
     db.refresh(new_book)
 
-    jobs.submit_processing_job(new_book.id, str(saved_path), filename)
+    jobs.submit_processing_job(new_book.id, kind, saved_paths, book_name, review_ocr)
 
     # In production this job runs on a worker thread and is still
     # "processing" by the time we get here. In tests (jobs.JOBS_SYNC=True)
@@ -533,20 +624,25 @@ def retry_book(
     if book.status != "failed":
         raise HTTPException(status_code=400, detail="Only a failed document can be retried.")
 
-    saved_path = _find_original_file(current_user.id, book_id)
-    if not saved_path:
+    sources = _find_original_sources(current_user.id, book_id)
+    if not sources:
         raise HTTPException(
             status_code=400,
             detail="The original uploaded file is no longer available. Please upload it again."
         )
+    kind, file_paths = sources
 
     book.status = "processing"
     book.error = None
     book.pages_total = 0
     book.pages_done = 0
+    # Reset so the frontend's "reading pages" vs "processing chunks" phase
+    # detection (source_type is still null while OCR/extraction runs) isn't
+    # confused by a stale value left over from the failed attempt.
+    book.source_type = None
     db.commit()
 
-    jobs.submit_processing_job(book.id, saved_path, book.name)
+    jobs.submit_processing_job(book.id, kind, file_paths, book.name, book.review_ocr)
     db.refresh(book)
 
     return {"book_id": book.id, "status": book.status}

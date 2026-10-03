@@ -14,6 +14,9 @@ import {
 } from 'lucide-react';
 
 const STATUS_POLL_INTERVAL_MS = 2000;
+const DOCUMENT_EXTENSIONS = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md'];
+const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.heic'];
+const getExtension = (name) => name.slice(name.lastIndexOf('.')).toLowerCase();
 
 export default function Documents() {
   const [books, setBooks] = useState([]);
@@ -27,6 +30,7 @@ export default function Documents() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState('');
   const [uploadSuccess, setUploadSuccess] = useState('');
+  const [reviewOcr, setReviewOcr] = useState(true);
 
   // Load books. Wrapped in useCallback with a stable (empty) dependency
   // list so it can be safely listed as an effect dependency below.
@@ -84,16 +88,28 @@ export default function Documents() {
     return () => clearInterval(interval);
   }, []);
 
-  // Upload book API call
-  const handleUploadFile = async (file) => {
-    if (!file) return;
+  // Upload book API call. Accepts either a single document or one or more
+  // page photos/scans (uploaded together as one document, OCR'd in order).
+  const handleUploadFiles = async (fileList) => {
+    const selectedFiles = Array.from(fileList || []);
+    if (selectedFiles.length === 0) return;
 
-    const allowedExtensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md'];
-    const fileExtension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-    if (!allowedExtensions.includes(fileExtension)) {
-      setUploadError('Unsupported file format. Please upload PDF, Word (.docx, .doc), PowerPoint (.pptx, .ppt), or plain text (.txt, .md) documents.');
+    const allImages = selectedFiles.every((f) => IMAGE_EXTENSIONS.includes(getExtension(f.name)));
+    const allDocuments = selectedFiles.every((f) => DOCUMENT_EXTENSIONS.includes(getExtension(f.name)));
+
+    if (!allImages && !allDocuments) {
+      setUploadError('Unsupported file format. Please upload PDF, Word (.docx, .doc), PowerPoint (.pptx, .ppt), or plain text (.txt, .md) documents, or one or more photos/scans (.jpg, .png, .webp, .heic).');
       return;
     }
+    if (allDocuments && selectedFiles.length > 1) {
+      setUploadError('Please upload one document at a time. To combine multiple photos/scans into one document, select image files instead.');
+      return;
+    }
+
+    const uploadPayload = allImages ? selectedFiles : selectedFiles[0];
+    const label = allImages
+      ? `${selectedFiles.length} image${selectedFiles.length === 1 ? '' : 's'}`
+      : `"${selectedFiles[0].name}"`;
 
     setIsUploading(true);
     setUploadProgress(0);
@@ -101,12 +117,12 @@ export default function Documents() {
     setUploadSuccess('');
 
     try {
-      await api.books.upload(file, (progress) => {
+      await api.books.upload(uploadPayload, (progress) => {
         setUploadProgress(progress);
-      });
-      setUploadSuccess(`"${file.name}" is uploaded and now processing — track its progress below.`);
+      }, { reviewOcr });
+      setUploadSuccess(`${label} uploaded and now processing — track progress below.`);
       // Refresh list so the new "processing" book shows up immediately;
-      // the poller above then follows it to ready/failed.
+      // the poller above then follows it to ready/needs_review/failed.
       await loadBooks();
     } catch (err) {
       setUploadError(err.message || 'Failed to upload document. Check your backend status.');
@@ -126,8 +142,8 @@ export default function Documents() {
   };
 
   const handleFileChange = (e) => {
-    const file = e.target.files?.[0];
-    handleUploadFile(file);
+    handleUploadFiles(e.target.files);
+    e.target.value = ''; // allow re-selecting the same file(s) later
   };
 
   // Drag and drop handlers
@@ -143,8 +159,7 @@ export default function Documents() {
   const handleDrop = (e) => {
     e.preventDefault();
     setIsDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    handleUploadFile(file);
+    handleUploadFiles(e.dataTransfer.files);
   };
 
   const handleDelete = async (id, name) => {
@@ -200,19 +215,31 @@ export default function Documents() {
               Drag & Drop Study Documents
             </h3>
             <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-2 leading-relaxed">
-              Drag any textbook, chapter syllabus, Word document, or PowerPoint presentation slides here. The assistant will partition the text and build semantic embeddings.
+              Drag any textbook, chapter syllabus, Word document, or PowerPoint presentation slides here, or one or more photos/scans of handwritten or printed pages. The assistant will partition the text and build semantic embeddings.
             </p>
           </div>
-          
+
           <label className="px-5 py-2.5 bg-gradient-to-tr from-violet-600 to-indigo-500 hover:from-violet-500 hover:to-indigo-400 text-white font-semibold text-xs tracking-tight rounded-xl shadow-md cursor-pointer hover:scale-[1.02] active:scale-[0.98] transition-all">
             Browse files
-            <input 
-              type="file" 
-              accept=".pdf,.pptx,.ppt,.docx,.doc"
+            <input
+              type="file"
+              accept=".pdf,.pptx,.ppt,.docx,.doc,.txt,.md,.jpg,.jpeg,.png,.webp,.heic"
+              multiple
               disabled={isUploading}
               onChange={handleFileChange}
-              className="hidden" 
+              className="hidden"
             />
+          </label>
+
+          <label className="flex items-center gap-2 text-[10px] font-semibold text-slate-500 dark:text-slate-400 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={reviewOcr}
+              onChange={(e) => setReviewOcr(e.target.checked)}
+              disabled={isUploading}
+              className="rounded border-slate-300 dark:border-slate-700 text-violet-600 focus:ring-violet-500 focus:ring-offset-0"
+            />
+            Let me check the text before it's used
           </label>
         </div>
 
@@ -308,7 +335,7 @@ export default function Documents() {
                     </span>
                   </div>
                 </div>
-                <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} />
+                <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} />
               </div>
 
               {book.status === 'failed' && book.error && (

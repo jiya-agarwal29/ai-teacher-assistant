@@ -29,17 +29,22 @@ const STATUS_CONFIG = {
 
 /**
  * Small pill showing a document's background-processing status. While
- * "processing", shows a live "Processing N/M" count once the backend has
- * reported how many chunks there are to embed (pagesTotal > 0) and falls
- * back to a plain "Processing" label before that.
+ * "processing", shows a live progress count once the backend has reported
+ * one (pagesTotal > 0): "Reading page N of M" during OCR -- the backend
+ * leaves sourceType null until every page's text is extracted -- then
+ * "Processing N/M" once chunking/embedding takes over. Falls back to a
+ * plain "Processing" label before either count exists yet.
  */
-export default function DocumentStatusBadge({ status, pagesTotal = 0, pagesDone = 0 }) {
+export default function DocumentStatusBadge({ status, pagesTotal = 0, pagesDone = 0, sourceType = null }) {
   const config = STATUS_CONFIG[status] || STATUS_CONFIG.processing;
   const Icon = config.icon;
 
-  const label = status === 'processing' && pagesTotal > 0
-    ? `Processing ${pagesDone}/${pagesTotal}`
-    : config.label;
+  let label = config.label;
+  if (status === 'processing' && pagesTotal > 0) {
+    label = sourceType
+      ? `Processing ${pagesDone}/${pagesTotal}`
+      : `Reading page ${pagesDone} of ${pagesTotal}`;
+  }
 
   return (
     <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] font-bold whitespace-nowrap ${config.className}`}>

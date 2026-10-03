@@ -105,15 +105,19 @@ export default function Home() {
     return () => clearInterval(interval);
   }, []);
 
-  // Handle direct file upload from dashboard
+  // Handle direct file upload from dashboard. Single file only here (no
+  // multi-image/review-OCR controls -- that lives in the full Documents
+  // page); a lone photo/scan still works fine as a one-page OCR upload.
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const allowedExtensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md'];
+    const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.heic'];
+    const documentExtensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md'];
     const fileExtension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-    if (!allowedExtensions.includes(fileExtension)) {
-      setUploadError('Unsupported file format. Please upload PDF, Word (.docx, .doc), PowerPoint (.pptx, .ppt), or plain text (.txt, .md) documents.');
+    const isImage = imageExtensions.includes(fileExtension);
+    if (!isImage && !documentExtensions.includes(fileExtension)) {
+      setUploadError('Unsupported file format. Please upload PDF, Word (.docx, .doc), PowerPoint (.pptx, .ppt), plain text (.txt, .md), or a photo/scan (.jpg, .png, .webp, .heic).');
       return;
     }
 
@@ -122,7 +126,9 @@ export default function Home() {
     setUploadError('');
 
     try {
-      await api.books.upload(file, (progress) => {
+      // A photo/scan must go through the "files" (plural) field -- even a
+      // single one -- since that's the only field the backend OCRs.
+      await api.books.upload(isImage ? [file] : file, (progress) => {
         setUploadProgress(progress);
       });
       // Refresh books list
@@ -305,7 +311,7 @@ export default function Home() {
                 Select Document
                 <input 
                   type="file" 
-                  accept=".pdf,.pptx,.ppt,.docx,.doc"
+                  accept=".pdf,.pptx,.ppt,.docx,.doc,.txt,.md,.jpg,.jpeg,.png,.webp,.heic"
                   onChange={handleFileUpload} 
                   disabled={isUploading}
                   className="hidden" 
@@ -386,7 +392,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
-                      <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} />
+                      <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} />
                       {book.status === 'failed' && (
                         <button
                           onClick={() => handleRetryBook(book.id)}

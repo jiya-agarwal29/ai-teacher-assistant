@@ -1,23 +1,31 @@
 """
 Background document-processing worker.
 
-/upload-book only validates the file, saves it to disk, and creates a Book
-row with status="processing" before returning 202 -- the slow part (parse,
-chunk, embed, save pages) runs here, off the request thread, in a small
-pool of worker threads. Each job opens its own DB session (SQLAlchemy
-sessions aren't safe to share across threads) and is responsible for
-leaving the book in a terminal status ("ready" or "failed") no matter how
-it exits.
+/upload-book only validates the file(s), saves them to disk, and creates a
+Book row with status="processing" before returning 202 -- everything slow
+(parsing/OCR, chunking, embedding, saving pages) runs here, off the request
+thread, in a small pool of worker threads. Each job opens its own DB session
+(SQLAlchemy sessions aren't safe to share across threads) and is responsible
+for leaving the book in a terminal status ("ready"/"failed") or "needs_review"
+no matter how it exits.
+
+Per-page extraction always produces DocumentPage rows first (method="text"
+or "ocr", review_status "auto_approved"/"needs_review") -- Page rows (the
+searchable chunked index) are only ever built from DocumentPage.extracted_text,
+and only once every page for that book is approved.
 """
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 
 import database
+import document_parsers
 import embeddings
 import json
-from document_parsers import parse_document, chunk_parsed_document
-from models import Book, Page
+import llm
+import ocr
+from document_parsers import chunk_parsed_document
+from models import Book, DocumentPage, Page
 from retrieval import invalidate_cache
 
 logger = logging.getLogger(__name__)
@@ -28,41 +36,39 @@ JOB_WORKERS = int(os.getenv("JOB_WORKERS", "2"))
 # used to have -- a large upload just takes longer instead of failing.
 EMBED_JOB_MAX_WAIT_SECONDS = float(os.getenv("EMBED_JOB_MAX_WAIT_SECONDS", "1800"))
 
+# A pdfplumber page with fewer than this many real (post-cleanup) characters
+# is treated as having no usable text layer and gets OCR'd instead.
+OCR_MIN_CHARS = int(os.getenv("OCR_MIN_CHARS", "40"))
+# Caps both how many low-text PDF pages one document may send to OCR, and
+# how many images a multi-image upload may contain -- OCR is a per-page
+# Gemini vision call, so this bounds cost/time on one document.
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "50"))
+
 NO_READABLE_TEXT_ERROR = (
     "No readable text found. This looks like a scanned document — OCR support is coming soon."
 )
 EMBEDDING_BUSY_ERROR = "Search service is busy, please retry."
+OCR_BUSY_ERROR = "Search service is busy, please retry."
 GENERIC_PROCESSING_ERROR = "Something went wrong while processing this document. Please try again."
 
 _executor = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix="doc-job")
 
-# Tests monkeypatch this to True so uploads finish (ready/failed) before the
-# request assertion runs, instead of racing a real background thread.
+# Tests monkeypatch this to True so uploads finish (ready/failed/needs_review)
+# before the request assertion runs, instead of racing a real background thread.
 JOBS_SYNC = os.getenv("JOBS_SYNC", "false").strip().lower() == "true"
 
 
-def submit_processing_job(book_id: int, file_path: str, filename: str):
-    """Queues background processing for an already-saved upload. Returns immediately."""
+def submit_processing_job(book_id: int, kind: str, file_paths: list, filename: str, review_ocr: bool = True):
+    """
+    Queues background processing for an already-saved upload. Returns
+    immediately. `kind` is "document" (file_paths has exactly one path: a
+    pdf/docx/pptx/doc/ppt/txt/md file) or "images" (one or more page image
+    paths, in reading order).
+    """
     if JOBS_SYNC:
-        _process_book(book_id, file_path, filename)
+        _process_book(book_id, kind, file_paths, filename, review_ocr)
     else:
-        _executor.submit(_process_book, book_id, file_path, filename)
-
-
-def _detect_source_type(pages_data: list) -> str:
-    """
-    No OCR yet, so this is purely descriptive: "text" when every page
-    yielded extractable text, "scanned" when none did (that book then also
-    fails below, since there's nothing to index), "mixed" otherwise.
-    """
-    if not pages_data:
-        return "text"
-    non_empty = sum(1 for p in pages_data if p["content"].strip())
-    if non_empty == len(pages_data):
-        return "text"
-    if non_empty == 0:
-        return "scanned"
-    return "mixed"
+        _executor.submit(_process_book, book_id, kind, file_paths, filename, review_ocr)
 
 
 def _mark_failed(db, book_id: int, error: str):
@@ -74,13 +80,147 @@ def _mark_failed(db, book_id: int, error: str):
     db.commit()
 
 
-def _process_book(book_id: int, file_path: str, filename: str):
+def _save_page_image(book_dir, page_number: int, image_bytes: bytes) -> str:
+    pages_dir = os.path.join(book_dir, "pages")
+    os.makedirs(pages_dir, exist_ok=True)
+    path = os.path.join(pages_dir, f"{page_number:04d}.jpg")
+    with open(path, "wb") as f:
+        f.write(image_bytes)
+    return path
+
+
+def _extract_pdf_as_pages(db, book, file_path: str, book_dir: str, review_ocr: bool) -> list:
+    """
+    Per-page decision for a PDF: pdfplumber text if the page has at least
+    OCR_MIN_CHARS real (post-cleanup) characters, otherwise render that page
+    with pypdfium2 and OCR it with Gemini vision. Returns a list of page
+    records (page_number/extracted_text/method/review_status/image_path).
+    """
+    with open(file_path, "rb") as f:
+        pages_data = document_parsers.parse_pdf(f)
+
+    ocr_page_numbers = [
+        p["page_number"] for p in pages_data if len(p["content"].strip()) < OCR_MIN_CHARS
+    ]
+    if len(ocr_page_numbers) > MAX_OCR_PAGES:
+        raise ValueError(
+            f"This document has {len(ocr_page_numbers)} scanned or low-text pages, "
+            f"over the {MAX_OCR_PAGES}-page OCR limit."
+        )
+
+    # Drives the "Reading page N of M" progress shown while book.source_type
+    # is still unset (see jobs._run_pipeline / the frontend status poll).
+    book.pages_total = len(ocr_page_numbers)
+    book.pages_done = 0
+    db.commit()
+
+    records = []
+    ocr_done = 0
+
+    for page in pages_data:
+        content = page["content"]
+        page_number = page["page_number"]
+
+        if len(content.strip()) >= OCR_MIN_CHARS:
+            records.append({
+                "page_number": page_number,
+                "extracted_text": content,
+                "method": "text",
+                "review_status": "auto_approved",
+                "image_path": None,
+            })
+            continue
+
+        rendered = ocr.render_pdf_page_to_png(file_path, page_index=page_number - 1)
+        prepared = ocr.prepare_image_for_ocr(rendered)
+        image_path = _save_page_image(book_dir, page_number, prepared)
+
+        extracted_text = llm.read_image(
+            prepared, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
+        )
+
+        records.append({
+            "page_number": page_number,
+            "extracted_text": extracted_text,
+            "method": "ocr",
+            "review_status": "needs_review" if review_ocr else "auto_approved",
+            "image_path": image_path,
+        })
+
+        ocr_done += 1
+        book.pages_done = ocr_done
+        db.commit()
+
+    return records
+
+
+def _extract_images_as_pages(db, book, file_paths: list, book_dir: str, review_ocr: bool) -> list:
+    """Every image is its own page, always OCR'd, in the order given."""
+    if len(file_paths) > MAX_OCR_PAGES:
+        raise ValueError(
+            f"This document has {len(file_paths)} images, over the {MAX_OCR_PAGES}-page OCR limit."
+        )
+
+    book.pages_total = len(file_paths)
+    book.pages_done = 0
+    db.commit()
+
+    records = []
+
+    for index, path in enumerate(file_paths, start=1):
+        with open(path, "rb") as f:
+            raw_bytes = f.read()
+
+        prepared = ocr.prepare_image_for_ocr(raw_bytes)
+        image_path = _save_page_image(book_dir, index, prepared)
+
+        extracted_text = llm.read_image(
+            prepared, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
+        )
+
+        records.append({
+            "page_number": index,
+            "extracted_text": extracted_text,
+            "method": "ocr",
+            "review_status": "needs_review" if review_ocr else "auto_approved",
+            "image_path": image_path,
+        })
+
+        book.pages_done = index
+        db.commit()
+
+    return records
+
+
+def _extract_document_as_pages(db, book, file_path: str, filename: str, book_dir: str, review_ocr: bool) -> list:
+    """PDF gets the per-page OCR-aware treatment above; everything else is unchanged from Phase 3A (always method="text")."""
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext == ".pdf":
+        return _extract_pdf_as_pages(db, book, file_path, book_dir, review_ocr)
+
+    with open(file_path, "rb") as f:
+        pages_data = document_parsers.parse_document(f, filename)
+
+    return [
+        {
+            "page_number": p["page_number"],
+            "extracted_text": p["content"],
+            "method": "text",
+            "review_status": "auto_approved",
+            "image_path": None,
+        }
+        for p in pages_data
+    ]
+
+
+def _process_book(book_id: int, kind: str, file_paths: list, filename: str, review_ocr: bool):
     # Looked up on the database module at call time (not imported by name)
     # so tests can redirect it to an isolated test database -- see
     # tests/test_api.py's `database.SessionLocal = TestSessionLocal`.
     db = database.SessionLocal()
     try:
-        _run_pipeline(db, book_id, file_path, filename)
+        _run_pipeline(db, book_id, kind, file_paths, filename, review_ocr)
     except Exception:
         logger.exception("Unhandled error while processing book_id=%d ('%s')", book_id, filename)
         try:
@@ -91,26 +231,84 @@ def _process_book(book_id: int, file_path: str, filename: str):
         db.close()
 
 
-def _run_pipeline(db, book_id: int, file_path: str, filename: str):
+def _run_pipeline(db, book_id: int, kind: str, file_paths: list, filename: str, review_ocr: bool):
     book = db.query(Book).filter(Book.id == book_id).first()
     if not book:
         logger.error("Background job: book_id=%d no longer exists, skipping", book_id)
         return
 
+    # A retry re-extracts from scratch (simple and correct, if not the
+    # cheapest possible option for a book that already got partway through
+    # OCR before failing) -- clear any DocumentPage rows left over from a
+    # previous attempt so this run's rows aren't mixed in with stale ones.
+    db.query(DocumentPage).filter(DocumentPage.book_id == book_id).delete()
+    db.commit()
+
+    book_dir = os.path.dirname(file_paths[0]) if kind == "document" else os.path.dirname(os.path.dirname(file_paths[0]))
+
     try:
-        with open(file_path, "rb") as f:
-            pages_data = parse_document(f, filename)
+        if kind == "images":
+            page_records = _extract_images_as_pages(db, book, file_paths, book_dir, review_ocr)
+        else:
+            page_records = _extract_document_as_pages(db, book, file_paths[0], filename, book_dir, review_ocr)
+    except NotImplementedError as e:
+        _mark_failed(db, book_id, str(e))
+        return
+    except llm.LLMUnavailableError:
+        logger.warning("OCR service busy while processing book_id=%d ('%s')", book_id, filename)
+        _mark_failed(db, book_id, OCR_BUSY_ERROR)
+        return
     except ValueError as e:
         _mark_failed(db, book_id, str(e))
         return
     except Exception:
-        logger.exception("Failed to parse document for book_id=%d ('%s')", book_id, filename)
+        logger.exception("Failed to extract pages for book_id=%d ('%s')", book_id, filename)
         _mark_failed(db, book_id, GENERIC_PROCESSING_ERROR)
         return
 
-    book.source_type = _detect_source_type(pages_data)
+    if not page_records:
+        _mark_failed(db, book_id, NO_READABLE_TEXT_ERROR)
+        return
+
+    methods = {p["method"] for p in page_records}
+    if methods == {"text"}:
+        book.source_type = "text"
+    elif methods == {"ocr"}:
+        book.source_type = "scanned"
+    else:
+        book.source_type = "mixed"
+
+    for p in page_records:
+        db.add(DocumentPage(
+            book_id=book_id,
+            page_number=p["page_number"],
+            image_path=p["image_path"],
+            extracted_text=p["extracted_text"],
+            method=p["method"],
+            review_status=p["review_status"],
+        ))
+    db.commit()
+
+    if any(p["review_status"] == "needs_review" for p in page_records):
+        # Nothing is chunked/embedded yet -- the uploaded/rendered pages and
+        # their transcriptions are saved, but Page rows (the searchable
+        # index) are only ever built once every page is approved. No
+        # review/approve endpoint exists yet; a later phase adds one.
+        book.status = "needs_review"
+        db.commit()
+        return
+
+    _chunk_embed_and_save(db, book, book_id, page_records, filename)
+
+
+def _chunk_embed_and_save(db, book, book_id: int, page_records: list, filename: str):
+    pages_data = [
+        {"page_number": p["page_number"], "content": p["extracted_text"] or ""}
+        for p in page_records
+    ]
     chunks = chunk_parsed_document(pages_data)
     book.pages_total = len(chunks)
+    book.pages_done = 0
     db.commit()
 
     if not chunks:

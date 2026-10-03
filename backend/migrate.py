@@ -14,9 +14,11 @@ background-processing columns (books.status/error/source_type/pages_total/
 pages_done/created_at) if missing -- every book that existed before these
 columns did was fully processed synchronously, so it backfills
 status="ready" on those rows (never "processing" or "failed", which only
-apply to the new background pipeline). Safe to run more than once: every
-ALTER TABLE / CREATE INDEX is skipped once it already exists, and every
-UPDATE only ever touches rows that still need it.
+apply to the new background pipeline). Also adds the Phase 3B OCR columns
+(books.review_ocr, and the whole document_pages table) if missing. Safe to
+run more than once: every ALTER TABLE / CREATE TABLE / CREATE INDEX is
+skipped once it already exists, and every UPDATE only ever touches rows
+that still need it.
 
 Usage:
     python migrate.py <username>
@@ -123,6 +125,34 @@ def main():
     cursor.execute("UPDATE books SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
     conn.commit()
     logger.info("Set status='ready' on %d existing book(s).", unset_status_count)
+
+    # Phase 3B: OCR. A pre-existing book was never OCR'd, so review_ocr's
+    # actual historical value doesn't matter -- it's only read again if that
+    # book is later retried, and a non-OCR'd document ignores it entirely.
+    if column_exists(cursor, "books", "review_ocr"):
+        logger.info("books.review_ocr column already exists, skipping ALTER TABLE.")
+    else:
+        cursor.execute("ALTER TABLE books ADD COLUMN review_ocr BOOLEAN")
+        conn.commit()
+        logger.info("Added books.review_ocr column.")
+    cursor.execute("UPDATE books SET review_ocr = 1 WHERE review_ocr IS NULL")
+    conn.commit()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS document_pages (
+            id INTEGER PRIMARY KEY,
+            book_id INTEGER NOT NULL REFERENCES books(id),
+            page_number INTEGER NOT NULL,
+            image_path VARCHAR,
+            extracted_text TEXT,
+            method VARCHAR NOT NULL,
+            review_status VARCHAR NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS ix_document_pages_book_id ON document_pages (book_id)")
+    conn.commit()
+    logger.info("Ensured document_pages table and index exist.")
 
     cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()

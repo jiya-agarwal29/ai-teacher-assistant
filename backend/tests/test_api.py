@@ -25,7 +25,7 @@ TestSessionLocal = sessionmaker(bind=test_engine)
 import database
 import main
 from database import get_db
-from models import Base
+from models import Base, DocumentPage, Page
 
 # Redirect uploaded-file storage to a test-only folder -- otherwise uploads
 # made here would land in the same backend/uploads/ used by a real dev
@@ -651,3 +651,244 @@ def test_interrupted_processing_books_become_failed_on_startup():
         db.query(main.Book).filter(main.Book.id == book_id).delete()
         db.commit()
         db.close()
+
+
+# -----------------------------
+# PHASE 3B: OCR
+# -----------------------------
+def _make_test_image_bytes(color=(200, 40, 40), size=(20, 20), fmt="PNG"):
+    from PIL import Image
+    import io
+    img = Image.new("RGB", size, color)
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def _get_document_pages(book_id):
+    db = TestSessionLocal()
+    try:
+        rows = db.query(DocumentPage).filter(
+            DocumentPage.book_id == book_id
+        ).order_by(DocumentPage.page_number).all()
+        return [
+            {"page_number": r.page_number, "extracted_text": r.extracted_text,
+             "method": r.method, "review_status": r.review_status}
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+def _get_pages(book_id):
+    db = TestSessionLocal()
+    try:
+        return db.query(Page).filter(Page.book_id == book_id).all()
+    finally:
+        db.close()
+
+
+def test_pdf_mixed_text_and_scanned_pages(client, phase3a_headers, monkeypatch):
+    import document_parsers
+    import llm as llm_module
+    import ocr as ocr_module
+
+    headers = phase3a_headers
+
+    monkeypatch.setattr(document_parsers, "parse_pdf", lambda f: [
+        {"page_number": 1, "content": "A" * 100},  # plenty of real text -> stays "text"
+        {"page_number": 2, "content": "hi"},         # far below OCR_MIN_CHARS -> OCR'd
+    ])
+    monkeypatch.setattr(ocr_module, "render_pdf_page_to_png", lambda path, page_index: _make_test_image_bytes())
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Transcribed handwriting.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("scan.pdf", b"not a real pdf -- parse_pdf is mocked", "application/pdf")}
+    )
+    assert res.status_code == 202
+    data = res.json()
+    book_id = data["book_id"]
+    # review_ocr defaults to True -- the OCR'd page needs review, so the
+    # whole book stops at "needs_review" (JOBS_SYNC=true already ran this).
+    assert data["status"] == "needs_review"
+
+    status_res = client.get(f"/books/{book_id}/status", headers=headers)
+    status_data = status_res.json()
+    assert status_data["status"] == "needs_review"
+    assert status_data["source_type"] == "mixed"  # one text page + one OCR'd page
+
+    doc_pages = _get_document_pages(book_id)
+    assert len(doc_pages) == 2
+    assert doc_pages[0]["method"] == "text"
+    assert doc_pages[0]["review_status"] == "auto_approved"
+    assert doc_pages[1]["method"] == "ocr"
+    assert doc_pages[1]["review_status"] == "needs_review"
+    assert doc_pages[1]["extracted_text"] == "Transcribed handwriting."
+
+    # Nothing is chunked/embedded while any page still needs review.
+    assert _get_pages(book_id) == []
+
+
+def test_multiple_images_become_one_book_in_order(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+
+    call_order = []
+
+    def fake_read_image(image_bytes, mime_type, max_wait_seconds=None):
+        call_order.append(image_bytes)
+        return f"Page text #{len(call_order)}"
+
+    monkeypatch.setattr(llm_module, "read_image", fake_read_image)
+
+    images = [
+        ("page_a.png", _make_test_image_bytes(color=(10, 10, 10)), "image/png"),
+        ("page_b.png", _make_test_image_bytes(color=(20, 20, 20)), "image/png"),
+        ("page_c.png", _make_test_image_bytes(color=(30, 30, 30)), "image/png"),
+    ]
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files=[("files", img) for img in images],
+        data={"review_ocr": "false"}
+    )
+    assert res.status_code == 202
+    data = res.json()
+    book_id = data["book_id"]
+    assert data["status"] == "ready"  # review_ocr=false -- no review gate
+
+    doc_pages = _get_document_pages(book_id)
+    assert len(doc_pages) == 3
+    assert [p["page_number"] for p in doc_pages] == [1, 2, 3]
+    assert [p["method"] for p in doc_pages] == ["ocr", "ocr", "ocr"]
+    assert [p["review_status"] for p in doc_pages] == ["auto_approved"] * 3
+    # The three images were OCR'd in submission order, not some other order.
+    assert doc_pages[0]["extracted_text"] == "Page text #1"
+    assert doc_pages[1]["extracted_text"] == "Page text #2"
+    assert doc_pages[2]["extracted_text"] == "Page text #3"
+
+    assert len(_get_pages(book_id)) >= 1  # chunked + embedded since all pages were auto-approved
+
+
+def test_heic_image_extension_is_accepted(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+    import ocr as ocr_module
+
+    headers = phase3a_headers
+
+    # A real .heic file isn't needed to prove the upload path accepts the
+    # extension -- prepare_image_for_ocr (which would otherwise need to
+    # actually decode it) is mocked out here too.
+    monkeypatch.setattr(ocr_module, "prepare_image_for_ocr", lambda raw_bytes: _make_test_image_bytes())
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Handwritten note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("photo.heic", b"not real heic bytes -- prepare_image_for_ocr is mocked", "image/heic")},
+        data={"review_ocr": "false"}
+    )
+    assert res.status_code == 202
+    assert res.json()["status"] == "ready"
+
+
+def test_review_ocr_true_leaves_needs_review_with_no_pages(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    assert res.status_code == 202
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "needs_review"
+    assert _get_pages(book_id) == []
+    assert _get_document_pages(book_id)[0]["review_status"] == "needs_review"
+
+
+def test_review_ocr_false_processes_straight_to_ready(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "false"}
+    )
+    assert res.status_code == 202
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "ready"
+    assert len(_get_pages(book_id)) >= 1
+    assert _get_document_pages(book_id)[0]["review_status"] == "auto_approved"
+
+
+def test_illegible_ocr_text_is_kept(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(
+        llm_module, "read_image",
+        lambda image_bytes, mime_type, max_wait_seconds=None: "Dear [illegible], see you soon."
+    )
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "false"}
+    )
+    assert res.status_code == 202
+    book_id = res.json()["book_id"]
+
+    pages = _get_pages(book_id)
+    assert any("[illegible]" in p.content for p in pages)
+
+
+def test_ocr_fails_with_friendly_message_on_local_provider(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "_provider", lambda: "local")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "false"}
+    )
+    assert res.status_code == 202
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "failed"
+
+    status_res = client.get(f"/books/{book_id}/status", headers=headers)
+    assert status_res.json()["error"] == "Reading scanned or handwritten pages needs the Gemini provider."
+
+
+def test_max_ocr_pages_enforced(client, phase3a_headers, monkeypatch):
+    headers = phase3a_headers
+    monkeypatch.setattr(main, "MAX_OCR_PAGES", 2)
+
+    images = [
+        ("p1.png", _make_test_image_bytes(), "image/png"),
+        ("p2.png", _make_test_image_bytes(), "image/png"),
+        ("p3.png", _make_test_image_bytes(), "image/png"),
+    ]
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files=[("files", img) for img in images]
+    )
+    assert res.status_code == 400
+    assert "limit is 2" in res.json()["detail"]
