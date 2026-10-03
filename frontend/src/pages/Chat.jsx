@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
-import { api, userScopedKey } from '../services/api';
+import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
 import { recordQuery } from '../hooks/useQueryHistory';
 import { useDraftPersistence } from '../hooks/useDraftPersistence';
+import MessageWithDocsLink from '../components/MessageWithDocsLink';
 import {
   Send,
   Plus,
@@ -450,7 +451,9 @@ export default function Chat() {
               >
                 {/* Message Text */}
                 <div className="space-y-2">
-                  {renderMessageContent(msg.content)}
+                  {msg.content === PENDING_DOCUMENTS_MESSAGE
+                    ? <MessageWithDocsLink message={msg.content} />
+                    : renderMessageContent(msg.content)}
                 </div>
 
                 {/* Citations list */}

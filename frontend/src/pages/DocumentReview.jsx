@@ -10,6 +10,7 @@ import {
   Save,
   CheckCircle2,
   RotateCw,
+  RotateCcw,
   ChevronLeft,
   ChevronRight,
   AlertCircle,
@@ -68,6 +69,7 @@ export default function DocumentReview() {
   const [isApprovingPage, setIsApprovingPage] = useState(false);
   const [isApprovingAll, setIsApprovingAll] = useState(false);
   const [rereadingPage, setRereadingPage] = useState(null);
+  const [isRotating, setIsRotating] = useState(false);
 
   const [indexingPhase, setIndexingPhase] = useState(false);
   const [finalOutcome, setFinalOutcome] = useState(null); // null | 'ready' | 'failed'
@@ -322,18 +324,11 @@ export default function DocumentReview() {
     }
   };
 
-  const handleReread = async () => {
-    if (currentPageNumber == null) return;
-
-    const wasEdited = isDirty || editedPageNumbersRef.current.has(currentPageNumber);
-    if (wasEdited && !window.confirm(
-      'Re-reading will replace your edits on this page with a fresh transcription. Continue?'
-    )) {
-      return;
-    }
-
-    const pageNumber = currentPageNumber;
-    setIsDirty(false); // the confirmed re-read is about to overwrite this page's text either way
+  // Core re-read flow, shared by the "Re-read page" button (which confirms
+  // first if the page was edited) and the post-rotate "Re-read this page
+  // now?" prompt (which is already its own explicit confirmation).
+  const performReread = async (pageNumber) => {
+    setIsDirty(false); // a re-read is about to overwrite this page's text either way
     editedPageNumbersRef.current.delete(pageNumber); // starting fresh from the new transcription
     setRereadingPage(pageNumber);
     setActionError('');
@@ -371,6 +366,52 @@ export default function DocumentReview() {
     } catch (err) {
       setActionError(err.message || 'Failed to re-read this page.');
       setRereadingPage(null);
+    }
+  };
+
+  const handleReread = async () => {
+    if (currentPageNumber == null) return;
+
+    const wasEdited = isDirty || editedPageNumbersRef.current.has(currentPageNumber);
+    if (wasEdited && !window.confirm(
+      'Re-reading will replace your edits on this page with a fresh transcription. Continue?'
+    )) {
+      return;
+    }
+
+    await performReread(currentPageNumber);
+  };
+
+  const handleRotate = async (direction) => {
+    if (currentPageNumber == null) return;
+    const pageNumber = currentPageNumber;
+
+    setIsRotating(true);
+    setActionError('');
+    try {
+      await api.books.pages.rotate(bookId, pageNumber, direction);
+
+      // The saved image file was overwritten in place -- the object URL
+      // we're already holding still points at the old (cached) bytes, so
+      // it has to be replaced, not just left alone.
+      setImageUrl((previousUrl) => {
+        if (previousUrl) URL.revokeObjectURL(previousUrl);
+        return null;
+      });
+      const freshUrl = await api.books.pages.getImageUrl(bookId, pageNumber);
+      if (currentPageNumberRef.current === pageNumber) {
+        setImageUrl(freshUrl);
+      } else {
+        URL.revokeObjectURL(freshUrl); // the user navigated away while this was in flight
+      }
+
+      if (window.confirm('Re-read this page now?')) {
+        await performReread(pageNumber);
+      }
+    } catch (err) {
+      setActionError(err.message || 'Failed to rotate this page.');
+    } finally {
+      setIsRotating(false);
     }
   };
 
@@ -515,6 +556,28 @@ export default function DocumentReview() {
                     <button onClick={() => setZoomPercent(100)} className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800/60" title="Fit to width">
                       <Maximize2 size={14} />
                     </button>
+                    {currentPage.has_image && (
+                      <>
+                        <span className="w-px h-4 bg-slate-200 dark:bg-slate-700 mx-1" />
+                        <button
+                          onClick={() => handleRotate('left')}
+                          disabled={isRotating}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800/60 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Rotate left"
+                        >
+                          <RotateCcw size={14} />
+                        </button>
+                        <button
+                          onClick={() => handleRotate('right')}
+                          disabled={isRotating}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800/60 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Rotate right"
+                        >
+                          <RotateCw size={14} />
+                        </button>
+                        {isRotating && <Loader2 size={14} className="animate-spin text-violet-500 ml-1" />}
+                      </>
+                    )}
                   </div>
                 </div>
                 <div className="overflow-auto p-3 flex-1 min-h-[260px] max-h-[55vh]">

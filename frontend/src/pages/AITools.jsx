@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api, userScopedKey } from '../services/api';
+import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
 import { recordQuizAttempt } from '../hooks/useQuizHistory';
-import { 
+import MessageWithDocsLink from '../components/MessageWithDocsLink';
+import {
   Brain, 
   Search, 
   FileText, 
@@ -646,12 +647,12 @@ export default function AITools() {
                     })}
                   </div>
                 </div>
-              ) : quizResult && (quizResult.toLowerCase().includes("not enough information") || quizResult.toLowerCase().includes("no documents")) ? (
+              ) : quizResult && (quizResult === PENDING_DOCUMENTS_MESSAGE || quizResult.toLowerCase().includes("not enough information") || quizResult.toLowerCase().includes("no documents")) ? (
                 <div className="p-6 rounded-[28px] bg-rose-500/5 border border-rose-500/10 text-center max-w-md mx-auto space-y-3 animate-fadeIn">
                   <AlertCircle size={36} className="text-rose-500 mx-auto" />
                   <h4 className="text-xs font-bold text-rose-600 dark:text-rose-400">Context Insufficient</h4>
                   <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed">
-                    {quizResult}
+                    <MessageWithDocsLink message={quizResult} />
                   </p>
                 </div>
               ) : quizResult ? (
@@ -738,7 +739,7 @@ export default function AITools() {
                   </div>
                 ) : (
                   <div className="p-6 text-center text-xs text-slate-400 dark:text-slate-500 bg-white/20 border border-slate-200 dark:border-slate-800 rounded-[28px]">
-                    {semanticResult.message || 'No vector matches found.'}
+                    <MessageWithDocsLink message={semanticResult.message || 'No vector matches found.'} />
                   </div>
                 )
               ) : (
@@ -826,7 +827,7 @@ export default function AITools() {
 
               {flashcardMessage && (
                 <div className="p-6 text-center text-xs text-slate-400 dark:text-slate-500 bg-white/20 border border-slate-200 dark:border-slate-800 rounded-[28px]">
-                  {flashcardMessage}
+                  <MessageWithDocsLink message={flashcardMessage} />
                 </div>
               )}
 
@@ -901,7 +902,7 @@ export default function AITools() {
                     AI Professor Explanation
                   </h4>
                   <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/20 text-xs text-slate-600 dark:text-slate-300 leading-relaxed border whitespace-pre-wrap select-all font-sans">
-                    {tutorResult}
+                    <MessageWithDocsLink message={tutorResult} />
                   </div>
                 </div>
               )}

@@ -59,3 +59,33 @@ def prepare_image_for_ocr(image_bytes: bytes) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=90)
     return buffer.getvalue()
+
+
+# PIL's ROTATE_90 turns the image 90 degrees counter-clockwise (what was on
+# the right edge ends up on top) -- i.e. a "rotate left"; ROTATE_270 is the
+# other way around, a "rotate right". Verified empirically, not just by the
+# PIL docs' wording, since getting this backwards would be a confusing bug.
+_ROTATE_TRANSPOSE = {
+    "left": Image.Transpose.ROTATE_90,
+    "right": Image.Transpose.ROTATE_270,
+}
+
+
+def rotate_image(image_bytes: bytes, direction: str) -> bytes:
+    """
+    Rotates a saved page image 90 degrees "left" (counter-clockwise) or
+    "right" (clockwise) -- used by the review page's Rotate buttons when a
+    page image was saved sideways/upside down. Returns JPEG bytes, matching
+    the format every page image is already saved in (see jobs.py's
+    _save_page_image).
+    """
+    if direction not in _ROTATE_TRANSPOSE:
+        raise ValueError(f"Unknown rotate direction '{direction}'; expected 'left' or 'right'.")
+
+    image = Image.open(io.BytesIO(image_bytes))
+    image = image.convert("RGB")
+    image = image.transpose(_ROTATE_TRANSPOSE[direction])
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()

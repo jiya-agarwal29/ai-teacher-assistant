@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 import embeddings
 import jobs
 import llm
+import ocr
 from rag import (
     generate_quiz,
     format_quiz_text,
@@ -28,7 +29,7 @@ from rag import (
     clean_pdf_text_for_quiz,
     clean_extracted_text
 )
-from retrieval import retrieve, invalidate_cache, user_has_documents, needs_reembedding
+from retrieval import retrieve, invalidate_cache, user_has_documents, user_has_any_books, needs_reembedding
 
 import database
 from database import engine, get_db
@@ -217,6 +218,21 @@ MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "50"))
 MAX_SUMMARIZE_CHARS = 20000
 
 AI_BUSY_DETAIL = "AI service is busy. Please try again in a minute."
+
+PENDING_DOCUMENTS_MESSAGE = "Your documents are still being processed or waiting for review."
+
+
+def _pending_documents_message_or_none(db: Session, user_id: int):
+    """
+    None if the user has no documents at all (each AI route keeps its own
+    existing wording for that case); PENDING_DOCUMENTS_MESSAGE if they have
+    at least one book that just isn't "ready" yet (still processing,
+    awaiting OCR review, or failed) -- so those routes don't claim "no
+    documents uploaded" when the user has, in fact, uploaded some.
+    """
+    if user_has_any_books(db, user_id):
+        return PENDING_DOCUMENTS_MESSAGE
+    return None
 
 CHAT_SYSTEM_INSTRUCTION = (
     "You are a helpful teaching assistant. Answer ONLY from the provided sources. "
@@ -681,6 +697,13 @@ class PageTextUpdateRequest(BaseModel):
     extracted_text: str
 
 
+ROTATE_DIRECTIONS = ("left", "right")
+
+
+class RotatePageRequest(BaseModel):
+    direction: str
+
+
 def _get_document_page_or_404(db: Session, book_id: int, page_number: int) -> DocumentPage:
     page = db.query(DocumentPage).filter(
         DocumentPage.book_id == book_id,
@@ -750,6 +773,35 @@ def get_book_pages(
     ]
 
 
+def _resolve_page_image_path(user_id: int, book_id: int, page: DocumentPage) -> Path:
+    """
+    Validates and returns the on-disk path of a page's saved image, raising
+    a 404 for anything that isn't an actual, existing file strictly inside
+    this book's own upload folder. Used by both the image-serving route and
+    the rotate route, which are the only two things that ever touch a page
+    image file on disk -- defense in depth against a corrupted/tampered
+    image_path, regardless of what's stored in the database.
+    """
+    if not page.image_path:
+        raise HTTPException(status_code=404, detail="This page has no saved image.")
+
+    book_dir = _book_upload_dir(user_id, book_id).resolve()
+    image_path = Path(page.image_path).resolve()
+    try:
+        image_path.relative_to(book_dir)
+    except ValueError:
+        logger.error(
+            "Refusing to touch a page image outside its book's upload folder (book_id=%d, page=%d)",
+            book_id, page.page_number
+        )
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return image_path
+
+
 @app.get("/books/{book_id}/pages/{page_number}/image")
 def get_page_image(
     book_id: int,
@@ -759,25 +811,7 @@ def get_page_image(
 ):
     _get_owned_book_or_404(db, book_id, current_user.id)
     page = _get_document_page_or_404(db, book_id, page_number)
-
-    if not page.image_path:
-        raise HTTPException(status_code=404, detail="This page has no saved image.")
-
-    # Defense in depth: only ever serve a file that's actually inside this
-    # book's own upload folder, regardless of what's stored in image_path.
-    book_dir = _book_upload_dir(current_user.id, book_id).resolve()
-    image_path = Path(page.image_path).resolve()
-    try:
-        image_path.relative_to(book_dir)
-    except ValueError:
-        logger.error(
-            "Refusing to serve page image outside its book's upload folder (book_id=%d, page=%d)",
-            book_id, page_number
-        )
-        raise HTTPException(status_code=404, detail="Image not found")
-
-    if not image_path.is_file():
-        raise HTTPException(status_code=404, detail="Image not found")
+    image_path = _resolve_page_image_path(current_user.id, book_id, page)
 
     return FileResponse(image_path, media_type="image/jpeg")
 
@@ -865,6 +899,32 @@ def reread_page(
     jobs.submit_reread_job(book_id, page_number)
 
     return {"book_id": book_id, "page_number": page_number, "review_status": page.review_status, "status": book.status}
+
+
+@app.post("/books/{book_id}/pages/{page_number}/rotate")
+def rotate_page_image(
+    book_id: int,
+    page_number: int,
+    payload: RotatePageRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    _get_owned_book_or_404(db, book_id, current_user.id)
+    page = _get_document_page_or_404(db, book_id, page_number)
+
+    if payload.direction not in ROTATE_DIRECTIONS:
+        raise HTTPException(status_code=400, detail="direction must be 'left' or 'right'.")
+
+    image_path = _resolve_page_image_path(current_user.id, book_id, page)
+
+    try:
+        rotated_bytes = ocr.rotate_image(image_path.read_bytes(), payload.direction)
+        image_path.write_bytes(rotated_bytes)
+    except Exception:
+        logger.exception("Failed to rotate page image for book_id=%d page=%d", book_id, page_number)
+        raise HTTPException(status_code=500, detail="Failed to rotate this page's image.")
+
+    return {"book_id": book_id, "page_number": page_number, "direction": payload.direction}
 
 
 # -----------------------------
@@ -961,7 +1021,7 @@ def semantic_search(
     if not user_has_documents(db, current_user.id):
 
         return {
-            "message": "No documents available"
+            "message": _pending_documents_message_or_none(db, current_user.id) or "No documents available"
         }
 
     if needs_reembedding(db, current_user.id):
@@ -996,7 +1056,7 @@ def _answer_question(question: str, current_user: User, db: Session):
     """
     if not user_has_documents(db, current_user.id):
         return {
-            "message": "No documents uploaded"
+            "message": _pending_documents_message_or_none(db, current_user.id) or "No documents uploaded"
         }
 
     if needs_reembedding(db, current_user.id):
@@ -1125,7 +1185,7 @@ def generate_flashcards(
         raise HTTPException(status_code=400, detail="Please provide a topic.")
 
     if not user_has_documents(db, current_user.id):
-        return {"cards": [], "message": "No documents uploaded yet."}
+        return {"cards": [], "message": _pending_documents_message_or_none(db, current_user.id) or "No documents uploaded yet."}
 
     if needs_reembedding(db, current_user.id):
         return {"cards": [], "message": "Your documents need re-indexing"}
@@ -1356,7 +1416,7 @@ def generate_ai_quiz(
     if not user_has_documents(db, current_user.id):
         return {
             "topic": topic,
-            "quiz": "Not enough information found in uploaded documents.",
+            "quiz": _pending_documents_message_or_none(db, current_user.id) or "Not enough information found in uploaded documents.",
             "questions": []
         }
 

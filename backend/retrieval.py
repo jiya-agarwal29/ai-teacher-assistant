@@ -26,6 +26,17 @@ def user_has_documents(db: Session, user_id: int) -> bool:
     ).filter(Book.user_id == user_id, Book.status == "ready").first() is not None
 
 
+def user_has_any_books(db: Session, user_id: int) -> bool:
+    """
+    True if the user has uploaded anything at all, regardless of status --
+    used to tell "never uploaded anything" apart from "uploaded, but not
+    searchable yet" (still processing, awaiting OCR review, or failed) so
+    the AI routes can give a more accurate message than a flat "no
+    documents uploaded" in the latter case.
+    """
+    return db.query(Book.id).filter(Book.user_id == user_id).first() is not None
+
+
 def needs_reembedding(db: Session, user_id: int) -> bool:
     """
     True when the user has documents, but none of them are embedded with

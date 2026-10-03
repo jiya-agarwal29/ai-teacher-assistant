@@ -1,6 +1,16 @@
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
 /**
+ * Exact text main.py returns from /chat, /tools/tutor, /semantic-search,
+ * /tools/flashcards, and /generate-quiz when the user has uploaded
+ * documents but none are "ready" yet (still processing, awaiting OCR
+ * review, or failed) -- kept here, not duplicated per-page, so every
+ * surface that checks for it (to add a link to Documents) stays in sync
+ * with the backend's exact wording.
+ */
+export const PENDING_DOCUMENTS_MESSAGE = 'Your documents are still being processed or waiting for review.';
+
+/**
  * Helper to get the JWT token from localStorage
  */
 export const getToken = () => localStorage.getItem('token');
@@ -354,6 +364,17 @@ export const api = {
        */
       reread: (bookId, pageNumber) => request(`/books/${bookId}/pages/${pageNumber}/reread`, {
         method: 'POST',
+      }),
+
+      /**
+       * POST /books/{book_id}/pages/{page_number}/rotate {direction}
+       * direction is "left" (counter-clockwise) or "right" (clockwise).
+       * Rotates and overwrites the saved page image in place.
+       */
+      rotate: (bookId, pageNumber, direction) => request(`/books/${bookId}/pages/${pageNumber}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ direction }),
       }),
     }
   },

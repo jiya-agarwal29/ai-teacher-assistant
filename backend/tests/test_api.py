@@ -773,6 +773,8 @@ def test_multiple_images_become_one_book_in_order(client, phase3a_headers, monke
 
     assert len(_get_pages(book_id)) >= 1  # chunked + embedded since all pages were auto-approved
 
+    client.delete(f"/books/{book_id}", headers=headers)
+
 
 def test_heic_image_extension_is_accepted(client, phase3a_headers, monkeypatch):
     import llm as llm_module
@@ -794,6 +796,8 @@ def test_heic_image_extension_is_accepted(client, phase3a_headers, monkeypatch):
     )
     assert res.status_code == 202
     assert res.json()["status"] == "ready"
+
+    client.delete(f"/books/{res.json()['book_id']}", headers=headers)
 
 
 def test_review_ocr_true_leaves_needs_review_with_no_pages(client, phase3a_headers, monkeypatch):
@@ -833,6 +837,8 @@ def test_review_ocr_false_processes_straight_to_ready(client, phase3a_headers, m
     assert len(_get_pages(book_id)) >= 1
     assert _get_document_pages(book_id)[0]["review_status"] == "auto_approved"
 
+    client.delete(f"/books/{book_id}", headers=headers)
+
 
 def test_illegible_ocr_text_is_kept(client, phase3a_headers, monkeypatch):
     import llm as llm_module
@@ -854,6 +860,8 @@ def test_illegible_ocr_text_is_kept(client, phase3a_headers, monkeypatch):
 
     pages = _get_pages(book_id)
     assert any("[illegible]" in p.content for p in pages)
+
+    client.delete(f"/books/{book_id}", headers=headers)
 
 
 def test_ocr_fails_with_friendly_message_on_local_provider(client, phase3a_headers, monkeypatch):
@@ -1150,3 +1158,133 @@ def test_refresh_token_rejects_expired_token(client):
 
     res = client.post("/refresh-token", headers={"Authorization": f"Bearer {expired_token}"})
     assert res.status_code == 401
+
+
+# -----------------------------
+# PHASE 3 FIX: "DOCUMENTS STILL PENDING" MESSAGE
+# -----------------------------
+def test_pending_message_shown_when_documents_not_ready(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("pending_message_note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "needs_review"  # has a document, but it isn't "ready"
+
+    expected = "Your documents are still being processed or waiting for review."
+
+    assert client.get("/chat", headers=headers, params={"question": "anything"}).json()["message"] == expected
+    assert client.post("/tools/tutor", headers=headers, json={"question": "anything"}).json()["message"] == expected
+    assert client.get("/semantic-search", headers=headers, params={"query": "anything"}).json()["message"] == expected
+    assert client.post("/tools/flashcards", headers=headers, json={"topic": "anything"}).json()["message"] == expected
+    assert client.get("/generate-quiz", headers=headers, params={"topic": "anything"}).json()["quiz"] == expected
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_no_documents_message_unchanged_when_user_has_none(client, phase3a_other_headers):
+    # phase3a_other_headers is only ever used elsewhere as the "other user"
+    # checking a 404 on someone else's book -- it never uploads one of its
+    # own, so it reliably has zero books here without needing (and burning
+    # the register-rate-limit budget on) yet another throwaway account.
+    headers = phase3a_other_headers
+
+    assert client.get("/chat", headers=headers, params={"question": "anything"}).json()["message"] == "No documents uploaded"
+    assert client.get("/generate-quiz", headers=headers, params={"topic": "anything"}).json()["quiz"] == \
+        "Not enough information found in uploaded documents."
+
+
+# -----------------------------
+# PHASE 3 FIX: ROTATE A REVIEW PAGE IMAGE
+# -----------------------------
+def test_rotate_page_requires_ownership(client, phase3a_headers, phase3a_other_headers, monkeypatch):
+    import llm as llm_module
+
+    headers_owner = phase3a_headers
+    headers_other = phase3a_other_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers_owner,
+        files={"files": ("rotate_ownership.png", _make_test_image_bytes(size=(40, 20)), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    book_id = res.json()["book_id"]
+
+    other_res = client.post(
+        f"/books/{book_id}/pages/1/rotate", headers=headers_other, json={"direction": "left"}
+    )
+    assert other_res.status_code == 404
+
+    client.delete(f"/books/{book_id}", headers=headers_owner)
+
+
+def test_rotate_page_actually_rotates_image(client, phase3a_headers, monkeypatch):
+    import io
+    import llm as llm_module
+    from PIL import Image
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("rotate_test.png", _make_test_image_bytes(size=(40, 20)), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    book_id = res.json()["book_id"]
+
+    before_res = client.get(f"/books/{book_id}/pages/1/image", headers=headers)
+    assert before_res.status_code == 200
+    before_image = Image.open(io.BytesIO(before_res.content))
+    assert before_image.size == (40, 20)
+
+    rotate_res = client.post(f"/books/{book_id}/pages/1/rotate", headers=headers, json={"direction": "left"})
+    assert rotate_res.status_code == 200
+    assert rotate_res.json()["direction"] == "left"
+
+    # A 90-degree rotation swaps width/height -- the clearest proof the
+    # saved image file was actually replaced with a rotated version, not
+    # just that the endpoint returned 200.
+    after_res = client.get(f"/books/{book_id}/pages/1/image", headers=headers)
+    assert after_res.status_code == 200
+    after_image = Image.open(io.BytesIO(after_res.content))
+    assert after_image.size == (20, 40)
+
+    # Rotating the other way should swap the dimensions back.
+    rotate_back_res = client.post(f"/books/{book_id}/pages/1/rotate", headers=headers, json={"direction": "right"})
+    assert rotate_back_res.status_code == 200
+    final_res = client.get(f"/books/{book_id}/pages/1/image", headers=headers)
+    final_image = Image.open(io.BytesIO(final_res.content))
+    assert final_image.size == (40, 20)
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_rotate_page_rejects_invalid_direction(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("rotate_invalid.png", _make_test_image_bytes(size=(40, 20)), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    book_id = res.json()["book_id"]
+
+    bad_res = client.post(f"/books/{book_id}/pages/1/rotate", headers=headers, json={"direction": "sideways"})
+    assert bad_res.status_code == 400
+
+    client.delete(f"/books/{book_id}", headers=headers)
