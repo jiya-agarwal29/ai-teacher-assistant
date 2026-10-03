@@ -197,9 +197,24 @@ export const api = {
     delete: (bookId) => request(`/books/${bookId}`, {
       method: 'DELETE',
     }),
-    
+
     /**
-     * POST /upload-book (with XHR for upload progress estimation)
+     * GET /books/{book_id}/status -- poll while a document is "processing".
+     */
+    status: (bookId) => request(`/books/${bookId}/status`),
+
+    /**
+     * POST /books/{book_id}/retry -- re-runs processing for a "failed" document.
+     */
+    retry: (bookId) => request(`/books/${bookId}/retry`, {
+      method: 'POST',
+    }),
+
+    /**
+     * POST /upload-book (with XHR for upload progress estimation).
+     * Returns immediately once the file is saved (202 {book_id, status:
+     * "processing"}) -- the caller should refresh the book list and poll
+     * status() until it reaches "ready"/"failed".
      */
     upload: (file, onProgress) => {
       return new Promise((resolve, reject) => {

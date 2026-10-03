@@ -6,7 +6,7 @@ Gemini (`GEMINI_API_KEY`, free tier) is the main AI provider for both answer gen
 
 ## Features
 
-- **Document upload** — PDF / DOCX / PPTX, parsed and chunked into a semantic index
+- **Document upload** — PDF / DOCX / PPTX, parsed and chunked into a semantic index; processing runs in the background with a live status (`processing` → `ready`/`failed`, with a progress count and a one-click retry on failure) so an upload never blocks the request
 - **AI Chat** — ask questions, get answers grounded in your uploaded material with cited sources
 - **Semantic search** — find relevant passages by meaning, not just keyword match
 - **Quiz Builder** — generates MCQ / true-false / fill-in-the-blank / short & long answer / scenario / viva / interview questions from your material, with grading
@@ -25,6 +25,7 @@ Gemini (`GEMINI_API_KEY`, free tier) is the main AI provider for both answer gen
 backend/
   main.py               FastAPI app & routes
   auth.py                JWT auth, password hashing
+  jobs.py                 Background document-processing worker (ThreadPoolExecutor)
   models.py               SQLAlchemy models (User, Book, Page)
   database.py            SQLite engine/session setup
   document_parsers.py    PDF/DOCX/PPTX parsing + chunking
@@ -32,9 +33,10 @@ backend/
   llm.py                   Swappable answer generation (Gemini / local Flan-T5)
   rag.py                   Local Flan-T5 generation, quiz generation, relevance checking
   scripts/reembed.py      Re-embeds stored pages after switching EMBEDDING_PROVIDER
+  uploads/                Saved original files, one folder per <user_id>/<book_id> (gitignored)
 frontend/
   src/pages/               Home, Chat, Documents, AITools, Analytics, Login
-  src/components/          Sidebar, PageLayout, ProtectedRoute
+  src/components/          Sidebar, PageLayout, ProtectedRoute, DocumentStatusBadge
   src/hooks/                Auth, active-time tracking, quiz/query history
   src/services/api.js      Backend API client
 ```
@@ -74,6 +76,9 @@ Create `backend/.env` — see `backend/.env.example` for the full list with desc
 | `MAX_UPLOAD_MB` | `25` | Maximum accepted document upload size. |
 | `LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`). |
 | `DATABASE_URL` | an absolute `sqlite:///.../backend/teacher_ai.db` path next to `database.py` | SQLAlchemy database URL. Only set this to point at a different file or a different database engine for production. |
+| `UPLOAD_DIR` | an absolute `uploads/` folder next to `main.py` | Where uploaded original files are saved (`<UPLOAD_DIR>/<user_id>/<book_id>/original<ext>`) for background processing and retry. |
+| `JOB_WORKERS` | `2` | Thread pool size for background document processing (`jobs.py`). |
+| `EMBED_JOB_MAX_WAIT_SECONDS` | `1800` | How long a background upload job waits out Gemini embedding rate limits before marking the document `failed` — see [AI providers](#ai-providers). |
 
 See [AI providers](#ai-providers) for `LLM_PROVIDER`, `EMBEDDING_PROVIDER`, and the Gemini/Voyage-specific variables.
 
@@ -147,7 +152,20 @@ python scripts/reembed.py --username alice    # only one user's pages
 
 This re-embeds in batches with progress output and invalidates the retrieval cache when done; running it again when nothing needs re-embedding is a harmless no-op (each page keeps its existing vector if `embedding_model` already matches the active one — no need to re-run it after every restart, only after an actual provider/model change).
 
-Rate limits: both Gemini paths retry transient failures automatically, and a Gemini **embedding** call specifically paces itself around the free tier's per-minute quota (waiting out a `429` and continuing) rather than failing outright — see `EMBED_MAX_WAIT_SECONDS` / `EMBED_QUERY_MAX_WAIT_SECONDS` in `.env.example`. If the service is still unavailable after that, routes return a `503` instead of a generic error or a stack trace: `/upload-book` replies `"Search service is busy. Please try uploading again in a minute."` (nothing is saved), and `/chat`, `/tools/tutor`, `/tools/summarize`, `/tools/flashcards`, `/generate-quiz`, and `/semantic-search` all reply `"AI service is busy. Please try again in a minute."` — just retry shortly after.
+Rate limits: both Gemini paths retry transient failures automatically, and a Gemini **embedding** call specifically paces itself around the free tier's per-minute quota (waiting out a `429` and continuing) rather than failing outright — see `EMBED_MAX_WAIT_SECONDS` / `EMBED_QUERY_MAX_WAIT_SECONDS` / `EMBED_JOB_MAX_WAIT_SECONDS` in `.env.example`. On the interactive request path (chat/search/tutor/flashcards/quiz), if the service is still unavailable after that, routes return a `503`: `/chat`, `/tools/tutor`, `/tools/summarize`, `/tools/flashcards`, `/generate-quiz`, and `/semantic-search` all reply `"AI service is busy. Please try again in a minute."` — just retry shortly after. The background upload job (see [Document processing](#document-processing)) uses a much longer wait budget instead, since no request is blocked on it, and marks the document `failed` with `"Search service is busy, please retry."` only if that's exhausted too.
+
+## Document processing
+
+`POST /upload-book` validates the file, saves it to `UPLOAD_DIR`, creates the `Book` row with `status="processing"`, and returns `202 {"book_id", "status": "processing"}` immediately — parsing, chunking, embedding, and saving pages all happen afterward in a background worker (`jobs.py`, a small `ThreadPoolExecutor` sized by `JOB_WORKERS`), each job with its own database session. A book ends up `ready` (searchable) or `failed` (with a short, user-facing `error` and the original file kept on disk for a retry) — `source_type` (`text`/`scanned`/`mixed`) is recorded from what was actually extracted, though no OCR step exists yet, so a fully scanned document still ends up `failed`.
+
+- `GET /books` now also returns each book's `status`, `error`, `source_type`, `pages_total`, `pages_done`, and `created_at`.
+- `GET /books/{id}/status` — poll this while `status == "processing"` for live progress (`pages_done`/`pages_total`).
+- `POST /books/{id}/retry` — re-runs processing for a `failed` book from its saved original file; `400` if the book isn't `failed` or the file is missing.
+- `DELETE /books/{id}` also removes the book's `UPLOAD_DIR` folder.
+- Chat, search, semantic search, flashcards, and quiz generation only ever see pages from `ready` books.
+- If the server restarts while a book is still `processing`, it's marked `failed` on the next startup (`"Processing was interrupted. Please re-upload."`) — jobs aren't resumed across a restart.
+
+The frontend (`Documents.jsx`/`Home.jsx`) shows the new book immediately with a status badge and polls `GET /books/{id}/status` every 2 seconds until it's `ready` or `failed`, then stops.
 
 ## Migrating an existing database
 
@@ -158,7 +176,7 @@ cd backend
 python migrate.py <username>
 ```
 
-This adds the `books.user_id` column if it's missing and assigns every currently-unowned book to `<username>` (which must already be a registered account), and adds `pages.embedding_model` if missing, backfilling it to `"local:all-MiniLM-L6-v2"` on existing rows (all pages embedded before this column existed used local MiniLM). Safe to run more than once — every column is only added once, and every backfill only ever touches rows that still need it.
+This adds the `books.user_id` column if it's missing and assigns every currently-unowned book to `<username>` (which must already be a registered account), adds `pages.embedding_model` if missing, backfilling it to `"local:all-MiniLM-L6-v2"` on existing rows (all pages embedded before this column existed used local MiniLM), and adds the Phase 3A processing columns (`books.status`/`error`/`source_type`/`pages_total`/`pages_done`/`created_at`) if missing, backfilling `status="ready"` on existing rows (they were fully processed synchronously before the background pipeline existed). Safe to run more than once — every column is only added once, and every backfill only ever touches rows that still need it.
 
 ## Running tests
 
@@ -168,9 +186,9 @@ pip install -r requirements-dev.txt   # installs requirements.txt + pytest
 python -m pytest tests/ -v
 ```
 
-The whole suite runs with **no internet connection and no real `backend/.env`** — `tests/conftest.py` sets a dummy `SECRET_KEY`/`GEMINI_API_KEY` (so the app's startup lifespan succeeds without a real key or a config file) and replaces `embeddings.embed_documents()`/`embed_query()` with deterministic fake vectors everywhere except `tests/test_embeddings.py` itself and the handful of tests that deliberately exercise the real embeddings pipeline against a mocked low-level client (marked `@pytest.mark.real_embeddings_path`) to test rate-limit handling; `tests/test_llm.py` and the LLM-dependent `tests/test_api.py` cases mock `llm.generate()`/`generate_json()` directly. No test makes a real API call.
+The whole suite runs with **no internet connection and no real `backend/.env`** — `tests/conftest.py` sets a dummy `SECRET_KEY`/`GEMINI_API_KEY` (so the app's startup lifespan succeeds without a real key or a config file), sets `JOBS_SYNC=true` (so `jobs.py`'s background document processing runs inline instead of racing a real worker thread), and replaces `embeddings.embed_documents()`/`embed_query()` with deterministic fake vectors everywhere except `tests/test_embeddings.py` itself and the handful of tests that deliberately exercise the real embeddings pipeline against a mocked low-level client (marked `@pytest.mark.real_embeddings_path`) to test rate-limit handling; `tests/test_llm.py` and the LLM-dependent `tests/test_api.py` cases mock `llm.generate()`/`generate_json()` directly. No test makes a real API call.
 
-`tests/test_quiz.py` exercises quiz fairness rules (no scenario-question answer leaks, True/False isn't always the same value, no repeated concepts) directly against `rag.py` — no server or database needed. `tests/test_api.py` drives the real FastAPI app through `TestClient` against an isolated on-disk SQLite database (`tests/test_api.db`, created and deleted automatically — it never touches `teacher_ai.db`): register, login, the generic bad-login message, uploading a small `.txt`, listing books, per-user isolation (a second account can neither see nor delete another account's book), delete, plus the Gemini-backed chat/summarize/flashcards/quiz routes and their 503/429 edge cases, all against mocked LLM/embedding clients.
+`tests/test_quiz.py` exercises quiz fairness rules (no scenario-question answer leaks, True/False isn't always the same value, no repeated concepts) directly against `rag.py` — no server or database needed. `tests/test_api.py` drives the real FastAPI app through `TestClient` against an isolated on-disk SQLite database and upload folder (`tests/test_api.db` / `tests/test_uploads/`, created and deleted automatically — neither ever touches the real `teacher_ai.db` or `uploads/`): register, login, the generic bad-login message, uploading a small `.txt`, listing books, per-user isolation (a second account can neither see nor delete another account's book), delete, the Gemini-backed chat/summarize/flashcards/quiz routes and their 503/429 edge cases (all against mocked LLM/embedding clients), and the background-processing flow — a background failure (no extractable text, or an embedding service that stays rate-limited) leaves the book `status="failed"` with a friendly error instead of erroring the upload itself, `/books/{id}/status` and `/books/{id}/retry` 404 for a non-owner, retry re-processes a failed book back to `ready` from its saved file, delete removes the book's upload folder, and a book stuck `processing` from an interrupted run is marked `failed` on the next startup.
 
 ## Production deployment
 
@@ -188,7 +206,7 @@ Before deploying, set:
 - **`CORS_ORIGINS`** — set to your real frontend origin(s) (comma-separated for more than one), e.g. `CORS_ORIGINS=https://app.your-domain.com`. Left unset, the backend only allows the local Vite dev ports and will reject the deployed frontend's requests.
 - **`VITE_API_URL`** (frontend) — the backend's public URL, set before running `npm run build` (see [Frontend](#frontend) above — it's compiled into the bundle, not read at runtime).
 
-Also worth setting for a real deployment: `ACCESS_TOKEN_EXPIRE_MINUTES`, `MAX_UPLOAD_MB`, and `LOG_LEVEL` (see the env var table in [Setup](#setup)).
+Also worth setting for a real deployment: `ACCESS_TOKEN_EXPIRE_MINUTES`, `MAX_UPLOAD_MB`, `LOG_LEVEL`, and `UPLOAD_DIR` (see the env var table in [Setup](#setup)) — point `UPLOAD_DIR` at persistent storage, since a failed book can only be retried while its original file is still there, and a restart marks any book still `processing` as `failed` (jobs aren't resumed).
 
 `POST /login` and `POST /register` are rate-limited to 10 requests/minute per IP (`slowapi`) to slow down credential-stuffing and account-creation abuse; a client over the limit gets `429` with `{"error": "Rate limit exceeded: ..."}`. The AI routes are separately rate-limited **per logged-in user** (not per IP, so one user can't exhaust another's budget): `/chat` and `/tools/tutor` at 20/minute, `/tools/summarize` and `/tools/flashcards` at 10/minute, `/generate-quiz` at 5/minute — a client over one of those limits gets `429` with `{"detail": "Too many requests. Please wait a minute."}`. The limiter's counters are in-memory and per-process, so they reset on restart and aren't shared across multiple worker processes or machines — fine for the single-worker setup above, but wouldn't rate-limit correctly if scaled to multiple workers without switching to a shared backing store (e.g. Redis).
 
@@ -196,7 +214,7 @@ Unexpected server errors (anything not raised deliberately as an `HTTPException`
 
 ## Known limitations
 
-- **No OCR or handwriting recognition yet.** A scanned PDF with no text layer (an image of a page, not extracted text) or a handwritten document returns a `422` with a clear message rather than silently producing an empty or garbled document — reading scanned/handwritten content is planned for Phase 3, not implemented yet.
+- **No OCR or handwriting recognition yet.** A scanned PDF with no text layer (an image of a page, not extracted text) or a handwritten document ends up `status="failed"` with a clear error (`source_type="scanned"`) rather than silently producing an empty or garbled document — reading scanned/handwritten content is planned for a later phase, not implemented yet.
 - **`flan-t5-small` answer quality (LLM_PROVIDER=local only).** The default `LLM_PROVIDER=gemini` doesn't have this limitation. The local answer-generation model is intentionally small (so it runs on a CPU with no external API key), which means answers can be shallow, occasionally repetitive, or misphrase a nuance from the source text. For sharper answers on `local`, uploading more specific/well-structured source material tends to help more than rephrasing the question.
 - **Free-tier rate limits.** Gemini's free tier enforces per-minute quotas on both embeddings and generation; a large upload or a burst of chat/quiz/summarize/flashcard requests can hit them. Embedding requests pace themselves and wait out the quota automatically instead of failing (see [AI providers](#ai-providers)); generation requests retry briefly and then return a `503` ("AI service is busy...") if the service is still unavailable — just retry shortly after. Voyage's free tier (no payment method on the account) is similarly capped, at ~10K tokens/minute.
 - **Single SQLite file, single worker.** Fine for individual or small-team use; not built for high-concurrency or multi-instance deployment (see the `--workers 1` note above).

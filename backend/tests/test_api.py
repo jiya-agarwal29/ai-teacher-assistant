@@ -5,6 +5,8 @@ dev database (teacher_ai.db). Exercises the full auth + upload + per-user
 isolation flow described in the deployment checklist.
 """
 import os
+import shutil
+from pathlib import Path
 
 # Dummy SECRET_KEY / GEMINI_API_KEY are set in tests/conftest.py (loaded
 # before this module) so this file doesn't need to set them itself.
@@ -20,9 +22,24 @@ TEST_DATABASE_URL = f"sqlite:///{TEST_DB_PATH}"
 test_engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
 TestSessionLocal = sessionmaker(bind=test_engine)
 
+import database
 import main
 from database import get_db
 from models import Base
+
+# Redirect uploaded-file storage to a test-only folder -- otherwise uploads
+# made here would land in the same backend/uploads/ used by a real dev
+# server, where book ids from this throwaway test database could collide
+# with (and overwrite) a real book's saved file.
+TEST_UPLOAD_DIR = Path(os.path.dirname(__file__)) / "test_uploads"
+main.UPLOAD_DIR = TEST_UPLOAD_DIR
+
+# main.py's lifespan (interrupted-job cleanup) and jobs.py's background
+# worker each open their own session via `database.SessionLocal()` looked
+# up at call time rather than imported by name, specifically so this
+# redirect reaches them too -- otherwise they'd silently operate on the
+# real dev database (teacher_ai.db) instead of this test one.
+database.SessionLocal = TestSessionLocal
 
 
 def _override_get_db():
@@ -40,11 +57,13 @@ main.app.dependency_overrides[get_db] = _override_get_db
 def test_database():
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
+    shutil.rmtree(TEST_UPLOAD_DIR, ignore_errors=True)
     Base.metadata.create_all(bind=test_engine)
     yield
     test_engine.dispose()
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
+    shutil.rmtree(TEST_UPLOAD_DIR, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -80,6 +99,20 @@ def llm_mock_headers(client):
     """
     _register(client, "llm_mock_test_user", "llmmocktestpass1")
     return _auth_headers(client, "llm_mock_test_user", "llmmocktestpass1")
+
+
+@pytest.fixture(scope="session")
+def phase3a_headers(client):
+    """Shared account (same rate-limit-budget reasoning as llm_mock_headers above) for the background-processing tests that only need one account."""
+    _register(client, "phase3a_test_user", "phase3apass1")
+    return _auth_headers(client, "phase3a_test_user", "phase3apass1")
+
+
+@pytest.fixture(scope="session")
+def phase3a_other_headers(client):
+    """A second shared account, for the one background-processing test that needs to check cross-user isolation (404 for a non-owner)."""
+    _register(client, "phase3a_other_user", "phase3aotherpass1")
+    return _auth_headers(client, "phase3a_other_user", "phase3aotherpass1")
 
 
 def test_register(client):
@@ -131,10 +164,12 @@ def test_upload_list_isolation_and_delete(client):
         headers=headers_owner,
         files={"file": ("bees.txt", file_content, "text/plain")}
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     upload_data = res.json()
-    assert upload_data["chunks"] >= 1
-    assert upload_data["pages"] >= 1
+    # JOBS_SYNC=true in tests (see conftest.py) runs the background
+    # processing job inline, so by the time this response is built the
+    # book has already reached a terminal status.
+    assert upload_data["status"] == "ready"
     book_id = upload_data["book_id"]
 
     # Owner sees it in their book list
@@ -173,8 +208,9 @@ def test_endpoints_require_auth(client):
 
 
 @pytest.mark.real_embeddings_path
-def test_upload_returns_503_when_embedding_service_stays_rate_limited(client, monkeypatch):
+def test_upload_processing_fails_when_embedding_service_stays_rate_limited(client, monkeypatch):
     import embeddings
+    import jobs
     import llm as llm_module
     from google.genai import errors as genai_errors
 
@@ -191,17 +227,28 @@ def test_upload_returns_503_when_embedding_service_stays_rate_limited(client, mo
     monkeypatch.setattr(llm_module, "get_client", lambda: _AlwaysRateLimitedClient())
     monkeypatch.setattr(embeddings.time, "sleep", lambda seconds: None)
 
+    # /upload-book itself still succeeds (202) -- the file is saved and the
+    # book created immediately, before any embedding is attempted. The
+    # rate limit only ever surfaces in the background job's outcome.
     res = client.post(
         "/upload-book",
         headers=headers,
         files={"file": ("busy.txt", b"some content that needs to be embedded", "text/plain")}
     )
-    assert res.status_code == 503
-    assert res.json()["detail"] == "Search service is busy. Please try uploading again in a minute."
+    assert res.status_code == 202
+    data = res.json()
+    assert data["status"] == "failed"  # JOBS_SYNC=true already ran the job inline
+    book_id = data["book_id"]
 
-    # Nothing was saved
+    status_res = client.get(f"/books/{book_id}/status", headers=headers)
+    assert status_res.status_code == 200
+    assert status_res.json()["status"] == "failed"
+    assert status_res.json()["error"] == jobs.EMBEDDING_BUSY_ERROR
+
+    # Unlike the old synchronous 503 behaviour, the book row (and its saved
+    # upload) is kept so the user can retry it later.
     books_res = client.get("/books", headers=headers)
-    assert books_res.json() == []
+    assert any(b["id"] == book_id and b["status"] == "failed" for b in books_res.json())
 
 
 BEES_CONTENT = b"Bees pollinate flowering plants and are essential for many food crops around the world."
@@ -213,7 +260,8 @@ def _upload_bees_doc(client, headers, filename="bees.txt"):
         headers=headers,
         files={"file": (filename, BEES_CONTENT, "text/plain")}
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "ready"  # JOBS_SYNC=true: already processed
     return res.json()["book_id"]
 
 
@@ -372,7 +420,8 @@ def _upload_water_cycle_doc(client, headers, filename="water_cycle.txt"):
         headers=headers,
         files={"file": (filename, WATER_CYCLE_CONTENT, "text/plain")}
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "ready"  # JOBS_SYNC=true: already processed
     return res.json()["book_id"]
 
 
@@ -461,3 +510,144 @@ def test_quiz_returns_503_on_llm_unavailable(client, llm_mock_headers, monkeypat
     assert res.json()["detail"] == "AI service is busy. Please try again in a minute."
 
     client.delete(f"/books/{book_id}", headers=headers)
+
+
+# -----------------------------
+# PHASE 3A: BACKGROUND PROCESSING
+# -----------------------------
+def test_upload_with_no_extractable_text_ends_failed(client, phase3a_headers):
+    import jobs
+
+    headers = phase3a_headers
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("blank.txt", b"   ", "text/plain")}
+    )
+    assert res.status_code == 202
+    data = res.json()
+    assert data["status"] == "failed"  # JOBS_SYNC=true: already processed
+    book_id = data["book_id"]
+
+    status_res = client.get(f"/books/{book_id}/status", headers=headers)
+    assert status_res.status_code == 200
+    assert status_res.json()["status"] == "failed"
+    assert status_res.json()["error"] == jobs.NO_READABLE_TEXT_ERROR
+
+
+def test_book_status_and_retry_require_ownership(client, phase3a_headers, phase3a_other_headers):
+    headers_owner = phase3a_headers
+    headers_other = phase3a_other_headers
+
+    book_id = _upload_bees_doc(client, headers_owner, "status_bees.txt")
+
+    res = client.get(f"/books/{book_id}/status", headers=headers_other)
+    assert res.status_code == 404
+
+    res = client.post(f"/books/{book_id}/retry", headers=headers_other)
+    assert res.status_code == 404
+
+    res = client.get(f"/books/{book_id}/status", headers=headers_owner)
+    assert res.status_code == 200
+    assert res.json()["status"] == "ready"
+
+    client.delete(f"/books/{book_id}", headers=headers_owner)
+
+
+def test_retry_reprocesses_failed_book_to_ready(client, phase3a_headers, monkeypatch):
+    import embeddings
+    import jobs
+
+    headers = phase3a_headers
+
+    # The autouse fake, captured here so the wrapper below can fall through
+    # to it once "should_fail" flips off.
+    fake_embed_documents = embeddings.embed_documents
+    state = {"should_fail": True}
+
+    def flaky_embed_documents(texts, max_wait_seconds=None, on_batch_done=None):
+        if state["should_fail"]:
+            raise embeddings.EmbeddingServiceBusyError("busy")
+        return fake_embed_documents(texts, max_wait_seconds=max_wait_seconds, on_batch_done=on_batch_done)
+
+    monkeypatch.setattr(embeddings, "embed_documents", flaky_embed_documents)
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("retry_bees.txt", BEES_CONTENT, "text/plain")}
+    )
+    assert res.status_code == 202
+    data = res.json()
+    assert data["status"] == "failed"
+    book_id = data["book_id"]
+
+    status_res = client.get(f"/books/{book_id}/status", headers=headers)
+    assert status_res.json()["error"] == jobs.EMBEDDING_BUSY_ERROR
+
+    # The original content was always fine -- only the embedding call was
+    # failing. Once that clears, retrying should succeed using the same
+    # saved file (no new upload).
+    state["should_fail"] = False
+    retry_res = client.post(f"/books/{book_id}/retry", headers=headers)
+    assert retry_res.status_code == 202
+    assert retry_res.json()["status"] == "ready"
+
+    status_res2 = client.get(f"/books/{book_id}/status", headers=headers)
+    data2 = status_res2.json()
+    assert data2["status"] == "ready"
+    assert data2["error"] is None
+    assert data2["pages_total"] == data2["pages_done"] > 0
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_retry_rejects_a_book_that_is_not_failed(client, phase3a_headers):
+    headers = phase3a_headers
+
+    book_id = _upload_bees_doc(client, headers, "notfailed_bees.txt")
+
+    res = client.post(f"/books/{book_id}/retry", headers=headers)
+    assert res.status_code == 400
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_delete_book_removes_upload_folder(client, phase3a_headers):
+    headers = phase3a_headers
+
+    book_id = _upload_bees_doc(client, headers, "folder_bees.txt")
+
+    matching_dirs = list(Path(main.UPLOAD_DIR).glob(f"*/{book_id}"))
+    assert len(matching_dirs) == 1
+    book_dir = matching_dirs[0]
+    assert list(book_dir.glob("original.*"))  # the saved original file is there
+
+    res = client.delete(f"/books/{book_id}", headers=headers)
+    assert res.status_code == 200
+    assert not book_dir.exists()
+
+
+def test_interrupted_processing_books_become_failed_on_startup():
+    # Simulates a server restart finding a book stuck mid-upload from a
+    # worker thread that no longer exists -- main._fail_interrupted_books()
+    # is the same function the real lifespan calls on startup.
+    db = TestSessionLocal()
+    try:
+        book = main.Book(name="interrupted.txt", user_id=None, status="processing")
+        db.add(book)
+        db.commit()
+        db.refresh(book)
+        book_id = book.id
+
+        failed_count = main._fail_interrupted_books(db)
+        assert failed_count >= 1
+
+        db.refresh(book)
+        assert book.status == "failed"
+        assert book.error == "Processing was interrupted. Please re-upload."
+    finally:
+        db.query(main.Book).filter(main.Book.id == book_id).delete()
+        db.commit()
+        db.close()

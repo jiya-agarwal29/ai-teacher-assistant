@@ -1,7 +1,10 @@
+import glob
 import logging
 import os
 import re
+import shutil
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
@@ -12,9 +15,9 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
-import json
 
 import embeddings
+import jobs
 import llm
 from rag import (
     generate_quiz,
@@ -25,9 +28,9 @@ from rag import (
     clean_pdf_text_for_quiz,
     clean_extracted_text
 )
-from document_parsers import parse_document, chunk_parsed_document
 from retrieval import retrieve, invalidate_cache, user_has_documents, needs_reembedding
 
+import database
 from database import engine, get_db
 from models import Base, Book, Page, User
 
@@ -51,6 +54,23 @@ logger = logging.getLogger(__name__)
 app_state = {"models_ready": False, "database_ready": False}
 
 
+def _fail_interrupted_books(db: Session) -> int:
+    """
+    We don't resume jobs across a restart -- any book still "processing"
+    belonged to a worker thread that no longer exists, so it can never reach
+    "ready" on its own. Fail it now with a clear, re-uploadable error instead
+    of leaving it stuck "processing" forever. Returns the number marked
+    failed (also directly unit-testable without a real server restart).
+    """
+    interrupted = db.query(Book).filter(Book.status == "processing").all()
+    for book in interrupted:
+        book.status = "failed"
+        book.error = "Processing was interrupted. Please re-upload."
+    if interrupted:
+        db.commit()
+    return len(interrupted)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up: loading AI models and preparing database")
@@ -64,6 +84,16 @@ async def lifespan(app: FastAPI):
 
     Base.metadata.create_all(bind=engine)
     app_state["database_ready"] = True
+
+    # Looked up on the database module at call time (not imported by name)
+    # so tests can redirect it to an isolated test database.
+    db = database.SessionLocal()
+    try:
+        failed_count = _fail_interrupted_books(db)
+        if failed_count:
+            logger.warning("Marked %d interrupted upload(s) as failed on startup", failed_count)
+    finally:
+        db.close()
 
     logger.info("Startup complete")
     yield
@@ -144,6 +174,21 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".pptx", ".doc", ".ppt", ".txt", ".md"}
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
+
+# Absolute path next to this file by default, not a "./"-relative one, for
+# the same reason as database.py's DEFAULT_DB_PATH -- it must not depend on
+# the working directory the server happens to be launched from.
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR") or (Path(__file__).resolve().parent / "uploads"))
+
+
+def _book_upload_dir(user_id: int, book_id: int) -> Path:
+    return UPLOAD_DIR / str(user_id) / str(book_id)
+
+
+def _find_original_file(user_id: int, book_id: int) -> str | None:
+    """Locates the saved original<ext> file for a book, regardless of extension."""
+    matches = glob.glob(str(_book_upload_dir(user_id, book_id) / "original.*"))
+    return matches[0] if matches else None
 
 MAX_SUMMARIZE_CHARS = 20000
 
@@ -356,7 +401,7 @@ def login(
 # -----------------------------
 # PDF UPLOAD + CHUNKING
 # -----------------------------
-@app.post("/upload-book")
+@app.post("/upload-book", status_code=202)
 def upload_book(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
@@ -382,83 +427,53 @@ def upload_book(
             detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_MB:g} MB"
         )
 
-    # Parse and chunk before touching the database — nothing is saved unless
-    # the whole pipeline succeeds, so a failed upload never leaves an empty book.
-    try:
-        pages_data = parse_document(file.file, filename)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("Failed to parse uploaded document '%s'", filename)
-        raise HTTPException(status_code=500, detail="Failed to process document file.")
+    new_book = Book(name=filename, user_id=current_user.id, status="processing")
+    db.add(new_book)
+    db.flush()  # assigns new_book.id, needed for the upload folder name below
 
-    chunks = chunk_parsed_document(pages_data)
-
-    if not chunks:
-        raise HTTPException(
-            status_code=422,
-            detail="No readable text found. This looks like a scanned document — OCR support is coming soon."
-        )
-
-    texts = [chunk_item["content"] for chunk_item in chunks]
+    book_dir = _book_upload_dir(current_user.id, new_book.id)
+    saved_path = book_dir / f"original{ext}"
 
     try:
-        embedding_vectors = embeddings.embed_documents(texts)
-    except embeddings.EmbeddingServiceBusyError:
-        logger.warning("Embedding service busy while embedding %d chunk(s) for '%s'", len(texts), filename)
-        raise HTTPException(
-            status_code=503,
-            detail="Search service is busy. Please try uploading again in a minute."
-        )
-    except Exception:
-        logger.exception("Failed to embed %d chunk(s) for '%s'", len(texts), filename)
-        raise HTTPException(status_code=500, detail="Failed to generate embeddings for this document.")
-
-    if len(embedding_vectors) != len(texts):
-        logger.error(
-            "Embedding count mismatch for '%s': expected %d chunks, got %d embeddings",
-            filename, len(texts), len(embedding_vectors)
-        )
-        raise HTTPException(status_code=500, detail="Failed to embed all chunks of this document.")
-
-    embedding_model = embeddings.active_model_name()
-
-    try:
-        new_book = Book(name=filename, user_id=current_user.id)
-        db.add(new_book)
-        db.flush()
-
-        for chunk_index, (chunk_item, embedding) in enumerate(zip(chunks, embedding_vectors)):
-            db.add(Page(
-                book_id=new_book.id,
-                page_number=chunk_item["page_number"],
-                chunk_number=chunk_index + 1,
-                content=chunk_item["content"],
-                embedding=json.dumps(embedding.tolist()),
-                embedding_model=embedding_model
-            ))
-
-        db.commit()
-        db.refresh(new_book)
-
+        book_dir.mkdir(parents=True, exist_ok=True)
+        file.file.seek(0)
+        with open(saved_path, "wb") as out:
+            shutil.copyfileobj(file.file, out)
     except Exception:
         db.rollback()
-        logger.exception("Failed to save uploaded document '%s' to the database", filename)
+        logger.exception("Failed to save uploaded file '%s' to disk", filename)
         raise HTTPException(status_code=500, detail="Failed to save the uploaded document.")
 
-    invalidate_cache(current_user.id)
+    db.commit()
+    db.refresh(new_book)
 
-    return {
-        "status": "Document uploaded and chunked successfully",
-        "book_id": new_book.id,
-        "chunks": len(chunks),
-        "pages": len(pages_data)
-    }
+    jobs.submit_processing_job(new_book.id, str(saved_path), filename)
+
+    # In production this job runs on a worker thread and is still
+    # "processing" by the time we get here. In tests (jobs.JOBS_SYNC=True)
+    # it just ran inline on a separate session -- refresh so the response
+    # (and tests asserting against it) reflect the real outcome either way.
+    db.refresh(new_book)
+
+    return {"book_id": new_book.id, "status": new_book.status}
 
 
 # -----------------------------
 # GET ALL BOOKS
 # -----------------------------
+def _book_summary(book: Book) -> dict:
+    return {
+        "id": book.id,
+        "name": book.name,
+        "status": book.status,
+        "error": book.error,
+        "source_type": book.source_type,
+        "pages_total": book.pages_total,
+        "pages_done": book.pages_done,
+        "created_at": book.created_at.isoformat() if book.created_at else None
+    }
+
+
 @app.get("/books")
 def get_books(
     current_user: User = Depends(get_current_user),
@@ -467,13 +482,74 @@ def get_books(
 
     books = db.query(Book).filter(Book.user_id == current_user.id).all()
 
-    return [
-        {
-            "id": book.id,
-            "name": book.name
-        }
-        for book in books
-    ]
+    return [_book_summary(book) for book in books]
+
+
+def _get_owned_book_or_404(db: Session, book_id: int, user_id: int) -> Book:
+    book = db.query(Book).filter(
+        Book.id == book_id,
+        Book.user_id == user_id
+    ).first()
+
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    return book
+
+
+# -----------------------------
+# BOOK PROCESSING STATUS
+# -----------------------------
+@app.get("/books/{book_id}/status")
+def get_book_status(
+    book_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
+
+    return {
+        "id": book.id,
+        "name": book.name,
+        "status": book.status,
+        "error": book.error,
+        "pages_total": book.pages_total,
+        "pages_done": book.pages_done,
+        "source_type": book.source_type
+    }
+
+
+# -----------------------------
+# RETRY FAILED PROCESSING
+# -----------------------------
+@app.post("/books/{book_id}/retry", status_code=202)
+def retry_book(
+    book_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
+
+    if book.status != "failed":
+        raise HTTPException(status_code=400, detail="Only a failed document can be retried.")
+
+    saved_path = _find_original_file(current_user.id, book_id)
+    if not saved_path:
+        raise HTTPException(
+            status_code=400,
+            detail="The original uploaded file is no longer available. Please upload it again."
+        )
+
+    book.status = "processing"
+    book.error = None
+    book.pages_total = 0
+    book.pages_done = 0
+    db.commit()
+
+    jobs.submit_processing_job(book.id, saved_path, book.name)
+    db.refresh(book)
+
+    return {"book_id": book.id, "status": book.status}
 
 
 # -----------------------------
@@ -486,22 +562,14 @@ def delete_book(
     db: Session = Depends(get_db)
 ):
 
-    book = db.query(Book).filter(
-        Book.id == book_id,
-        Book.user_id == current_user.id
-    ).first()
-
-    if not book:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Book not found"
-        )
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
 
     # Cascades to the book's pages via the Book.pages relationship
     db.delete(book)
     db.commit()
     invalidate_cache(current_user.id)
+
+    shutil.rmtree(_book_upload_dir(current_user.id, book_id), ignore_errors=True)
 
     return {
         "status": "Book and associated chunks deleted successfully"
@@ -531,6 +599,7 @@ def search_content(
         Book, Page.book_id == Book.id
     ).filter(
         Book.user_id == current_user.id,
+        Book.status == "ready",
         Page.content.ilike(f"%{_escape_like(query)}%", escape="\\")
     ).all()
 

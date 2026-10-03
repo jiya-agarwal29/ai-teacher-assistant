@@ -267,7 +267,7 @@ def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def _embed_voyage(texts: list[str], input_type: str) -> np.ndarray:
+def _embed_voyage(texts: list[str], input_type: str, on_batch_done=None) -> np.ndarray:
     client = _get_voyage_client()
     model = _voyage_model()
     all_vectors = []
@@ -285,12 +285,14 @@ def _embed_voyage(texts: list[str], input_type: str) -> np.ndarray:
             base_backoff_seconds=_VOYAGE_BASE_BACKOFF_SECONDS,
         )
         all_vectors.extend(result.embeddings)
+        if on_batch_done:
+            on_batch_done(len(all_vectors))
 
     matrix = np.asarray(all_vectors, dtype=np.float32)
     return _l2_normalize(matrix)
 
 
-def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
+def _embed_gemini(texts: list[str], task_type: str, max_wait_override: float = None, on_batch_done=None) -> np.ndarray:
     """
     Embeds `texts` in batches via Gemini. On a 429 (free-tier quota), waits
     for the quota to reset (Retry-After if given, otherwise
@@ -310,11 +312,16 @@ def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
     batch_size = _gemini_embed_batch_size()
     # Query embedding is on the interactive request path (chat/search/
     # tutor/flashcards/quiz) and gets a much shorter wait budget than a
-    # bulk document upload.
-    max_wait = (
-        _embed_query_max_wait_seconds() if task_type == "RETRIEVAL_QUERY"
-        else _embed_max_wait_seconds()
-    )
+    # bulk document upload. A caller may override this entirely (e.g. a
+    # background upload-processing job uses a much longer budget since no
+    # user request is blocked on it -- see jobs.py).
+    if max_wait_override is not None:
+        max_wait = max_wait_override
+    else:
+        max_wait = (
+            _embed_query_max_wait_seconds() if task_type == "RETRIEVAL_QUERY"
+            else _embed_max_wait_seconds()
+        )
 
     all_vectors = []
     total_wait = 0.0
@@ -389,6 +396,8 @@ def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
 
         all_vectors.extend(vectors)
         embedded_count += len(batch)
+        if on_batch_done:
+            on_batch_done(embedded_count)
 
     matrix = np.asarray(all_vectors, dtype=np.float32)
     # gemini-embedding-001 does not L2-normalise its output when
@@ -397,10 +406,16 @@ def _embed_gemini(texts: list[str], task_type: str) -> np.ndarray:
     return _l2_normalize(matrix)
 
 
-def embed_documents(texts: list[str]) -> np.ndarray:
+def embed_documents(texts: list[str], max_wait_seconds: float = None, on_batch_done=None) -> np.ndarray:
     """
     Embeds document chunks for storage (upload). Returns an (N, dim)
     L2-normalised matrix.
+
+    max_wait_seconds overrides the default Gemini rate-limit wait budget
+    (ignored by the local/Voyage providers, which don't use a time-based
+    budget). on_batch_done(count_embedded_so_far), if given, is called
+    after each embedding batch completes -- used by jobs.py to report
+    live progress on a background upload.
     """
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
@@ -409,12 +424,17 @@ def embed_documents(texts: list[str]) -> np.ndarray:
 
     if provider == "local":
         vectors = np.asarray(_load_local_model().encode(texts, batch_size=32), dtype=np.float32)
+        if on_batch_done:
+            on_batch_done(len(texts))
         return _l2_normalize(vectors)
 
     if provider == "gemini":
-        return _embed_gemini(texts, task_type="RETRIEVAL_DOCUMENT")
+        return _embed_gemini(
+            texts, task_type="RETRIEVAL_DOCUMENT",
+            max_wait_override=max_wait_seconds, on_batch_done=on_batch_done
+        )
 
-    return _embed_voyage(texts, input_type="document")
+    return _embed_voyage(texts, input_type="document", on_batch_done=on_batch_done)
 
 
 def embed_query(text: str) -> np.ndarray:

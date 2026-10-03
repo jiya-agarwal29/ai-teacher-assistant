@@ -19,9 +19,11 @@ def invalidate_cache(user_id: int = None):
 
 
 def user_has_documents(db: Session, user_id: int) -> bool:
+    # Only books that finished processing are searchable -- a "processing"
+    # or "failed" book has no usable (or no) pages yet.
     return db.query(Page.id).join(
         Book, Page.book_id == Book.id
-    ).filter(Book.user_id == user_id).first() is not None
+    ).filter(Book.user_id == user_id, Book.status == "ready").first() is not None
 
 
 def needs_reembedding(db: Session, user_id: int) -> bool:
@@ -39,6 +41,7 @@ def needs_reembedding(db: Session, user_id: int) -> bool:
         Book, Page.book_id == Book.id
     ).filter(
         Book.user_id == user_id,
+        Book.status == "ready",
         Page.embedding_model == embeddings.active_model_name()
     ).first() is not None
 
@@ -56,6 +59,7 @@ def _ensure_cache(db: Session, user_id: int):
         Book, Page.book_id == Book.id
     ).filter(
         Book.user_id == user_id,
+        Book.status == "ready",
         Page.embedding.isnot(None),
         Page.embedding_model == embeddings.active_model_name()
     ).all()

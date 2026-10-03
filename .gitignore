@@ -26,6 +26,10 @@ __pycache__/
 *.db
 *.sqlite3
 
+# Uploaded original documents (backend/jobs.py reprocesses from these; not
+# source code, and may contain users' own study materials)
+backend/uploads/
+
 # Zip files
 *.zip
 

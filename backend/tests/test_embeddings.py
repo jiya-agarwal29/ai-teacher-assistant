@@ -287,7 +287,9 @@ def _make_user_with_book(db_session, username):
     user = User(username=username, password="hashed")
     db_session.add(user)
     db_session.commit()
-    book = Book(name="book.txt", user_id=user.id)
+    # retrieval.py only scores pages belonging to a "ready" book -- these
+    # tests are about embedding-model matching, not processing status.
+    book = Book(name="book.txt", user_id=user.id, status="ready")
     db_session.add(book)
     db_session.commit()
     return user, book

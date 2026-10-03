@@ -1,20 +1,24 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { api, userScopedKey } from '../services/api';
 import { useAuth } from '../hooks/useAuth';
-import { 
-  FileText, 
-  MessageSquare, 
-  Brain, 
-  Plus, 
-  BookOpen, 
-  Upload, 
-  TrendingUp, 
+import DocumentStatusBadge from '../components/DocumentStatusBadge';
+import {
+  FileText,
+  MessageSquare,
+  Brain,
+  Plus,
+  BookOpen,
+  Upload,
+  TrendingUp,
   Sparkles,
   ArrowRight,
   Trash2,
-  Activity
+  Activity,
+  RotateCw
 } from 'lucide-react';
+
+const STATUS_POLL_INTERVAL_MS = 2000;
 
 export default function Home() {
   const { user } = useAuth();
@@ -74,6 +78,33 @@ export default function Home() {
     };
   }, [loadBooks]);
 
+  // Polls GET /books/{id}/status for every book still "processing", every
+  // STATUS_POLL_INTERVAL_MS, until it reaches "ready"/"failed". Runs once
+  // for the life of the component (not re-created on every `books` update)
+  // by reading the latest list through a ref; stops on unmount/navigation.
+  const booksRef = useRef(books);
+  useEffect(() => {
+    booksRef.current = books;
+  }, [books]);
+
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const processing = booksRef.current.filter((b) => b.status === 'processing');
+      if (processing.length === 0) return;
+
+      const results = await Promise.allSettled(processing.map((b) => api.books.status(b.id)));
+
+      setBooks((prev) => prev.map((b) => {
+        const idx = processing.findIndex((p) => p.id === b.id);
+        if (idx === -1) return b;
+        const result = results[idx];
+        return result.status === 'fulfilled' ? { ...b, ...result.value } : b;
+      }));
+    }, STATUS_POLL_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, []);
+
   // Handle direct file upload from dashboard
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -113,6 +144,15 @@ export default function Home() {
       loadBooks();
     } catch (err) {
       alert('Failed to delete book: ' + err.message);
+    }
+  };
+
+  const handleRetryBook = async (bookId) => {
+    try {
+      await api.books.retry(bookId);
+      await loadBooks();
+    } catch (err) {
+      alert('Failed to retry this document: ' + err.message);
     }
   };
 
@@ -345,8 +385,18 @@ export default function Home() {
                         </span>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button 
+                    <div className="flex items-center gap-2 shrink-0">
+                      <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} />
+                      {book.status === 'failed' && (
+                        <button
+                          onClick={() => handleRetryBook(book.id)}
+                          className="p-2 rounded-xl text-slate-400 hover:text-violet-500 hover:bg-violet-500/10 transition-colors"
+                          title="Retry processing"
+                        >
+                          <RotateCw size={14} />
+                        </button>
+                      )}
+                      <button
                         onClick={() => handleDeleteBook(book.id)}
                         className="p-2 rounded-xl text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition-colors"
                         title="Delete Document"

@@ -6,6 +6,10 @@ Shared pytest configuration for the backend test suite.
 - Sets dummy SECRET_KEY / GEMINI_API_KEY before any test module imports
   auth.py or llm.py, so the full suite runs with no real backend/.env file
   and without ever needing a real API key.
+- Sets JOBS_SYNC=true so jobs.submit_processing_job() runs a document's
+  background processing inline instead of on a worker thread -- tests can
+  then assert on the outcome (Book.status) right after the upload/retry
+  call returns, instead of racing a real background thread.
 - Replaces embeddings.embed_documents()/embed_query() with deterministic
   fake vectors for every test file except test_embeddings.py (which tests
   those functions' own real behaviour against lower-level client mocks)
@@ -25,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # load_dotenv() (override=False by default) won't clobber them later.
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only")
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-api-key-for-pytest-only")
+os.environ.setdefault("JOBS_SYNC", "true")
 
 import numpy as np
 import pytest
@@ -43,7 +48,12 @@ _FAKE_EMBED_DIM = 8
 _FAKE_VECTOR_VALUE = float(1.0 / np.sqrt(_FAKE_EMBED_DIM))
 
 
-def _fake_embed_documents(texts):
+def _fake_embed_documents(texts, max_wait_seconds=None, on_batch_done=None):
+    # Matches embeddings.embed_documents()'s real signature (jobs.py passes
+    # max_wait_seconds/on_batch_done) so this fake is a drop-in replacement
+    # for it in the background-processing job, not just a direct call.
+    if on_batch_done:
+        on_batch_done(len(texts))
     return np.full((len(texts), _FAKE_EMBED_DIM), _FAKE_VECTOR_VALUE, dtype=np.float32)
 
 

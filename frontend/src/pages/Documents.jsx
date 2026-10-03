@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../services/api';
+import DocumentStatusBadge from '../components/DocumentStatusBadge';
 import {
   Upload,
   Search,
@@ -8,8 +9,11 @@ import {
   AlertCircle,
   Sparkles,
   CheckCircle2,
-  FolderOpen
+  FolderOpen,
+  RotateCw
 } from 'lucide-react';
+
+const STATUS_POLL_INTERVAL_MS = 2000;
 
 export default function Documents() {
   const [books, setBooks] = useState([]);
@@ -53,10 +57,37 @@ export default function Documents() {
     };
   }, [loadBooks]);
 
+  // Polls GET /books/{id}/status for every book still "processing", every
+  // STATUS_POLL_INTERVAL_MS, until it reaches "ready"/"failed". Runs once
+  // for the life of the component (not re-created on every `books` update)
+  // by reading the latest list through a ref; stops on unmount/navigation.
+  const booksRef = useRef(books);
+  useEffect(() => {
+    booksRef.current = books;
+  }, [books]);
+
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const processing = booksRef.current.filter((b) => b.status === 'processing');
+      if (processing.length === 0) return;
+
+      const results = await Promise.allSettled(processing.map((b) => api.books.status(b.id)));
+
+      setBooks((prev) => prev.map((b) => {
+        const idx = processing.findIndex((p) => p.id === b.id);
+        if (idx === -1) return b;
+        const result = results[idx];
+        return result.status === 'fulfilled' ? { ...b, ...result.value } : b;
+      }));
+    }, STATUS_POLL_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, []);
+
   // Upload book API call
   const handleUploadFile = async (file) => {
     if (!file) return;
-    
+
     const allowedExtensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md'];
     const fileExtension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
     if (!allowedExtensions.includes(fileExtension)) {
@@ -70,21 +101,27 @@ export default function Documents() {
     setUploadSuccess('');
 
     try {
-      const res = await api.books.upload(file, (progress) => {
+      await api.books.upload(file, (progress) => {
         setUploadProgress(progress);
       });
-      const chunkCount = res?.chunks;
-      setUploadSuccess(
-        chunkCount != null
-          ? `"${file.name}" uploaded successfully — ${chunkCount} chunk${chunkCount === 1 ? '' : 's'} indexed.`
-          : `"${file.name}" uploaded and parsed successfully!`
-      );
-      // Refresh list
+      setUploadSuccess(`"${file.name}" is uploaded and now processing — track its progress below.`);
+      // Refresh list so the new "processing" book shows up immediately;
+      // the poller above then follows it to ready/failed.
       await loadBooks();
     } catch (err) {
       setUploadError(err.message || 'Failed to upload document. Check your backend status.');
     } finally {
       setIsUploading(false);
+    }
+  };
+
+  const handleRetry = async (id) => {
+    setUploadError('');
+    try {
+      await api.books.retry(id);
+      await loadBooks();
+    } catch (err) {
+      setUploadError(err.message || 'Failed to retry this document.');
     }
   };
 
@@ -253,32 +290,55 @@ export default function Documents() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {filteredBooks.map((book) => (
-            <div 
+            <div
               key={book.id}
-              className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm hover:scale-[1.02] hover:shadow-md hover:border-violet-500/30 dark:hover:border-violet-500/20 transition-all duration-300 flex flex-col justify-between h-48 group"
+              className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm hover:scale-[1.02] hover:shadow-md hover:border-violet-500/30 dark:hover:border-violet-500/20 transition-all duration-300 flex flex-col h-48 group"
             >
-              <div className="flex items-start gap-4">
-                <div className="w-11 h-11 rounded-2xl bg-gradient-to-tr from-violet-500/10 to-indigo-500/10 text-violet-600 dark:text-violet-400 flex items-center justify-center shrink-0">
-                  <FileText size={20} />
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-4 min-w-0">
+                  <div className="w-11 h-11 rounded-2xl bg-gradient-to-tr from-violet-500/10 to-indigo-500/10 text-violet-600 dark:text-violet-400 flex items-center justify-center shrink-0">
+                    <FileText size={20} />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-xs font-bold text-slate-800 dark:text-white truncate group-hover:text-violet-600 dark:group-hover:text-violet-400 transition-colors">
+                      {book.name}
+                    </h3>
+                    <span className="text-[9px] font-semibold text-slate-400 dark:text-slate-500 block mt-1">
+                      Index Reference: #{book.id}
+                    </span>
+                  </div>
                 </div>
-                <div className="min-w-0">
-                  <h3 className="text-xs font-bold text-slate-800 dark:text-white truncate group-hover:text-violet-600 dark:group-hover:text-violet-400 transition-colors">
-                    {book.name}
-                  </h3>
-                  <span className="text-[9px] font-semibold text-slate-400 dark:text-slate-500 block mt-1">
-                    Index Reference: #{book.id}
-                  </span>
-                </div>
+                <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} />
               </div>
 
-              <div className="pt-4 border-t border-slate-100 dark:border-slate-800/60 flex justify-between items-center text-[10px]">
-                <div className="flex items-center gap-1.5 text-slate-400 dark:text-slate-500">
-                  <Sparkles size={11} className="text-violet-500" />
-                  <span>RAG Context Active</span>
+              {book.status === 'failed' && book.error && (
+                <p className="text-[10px] text-rose-500 dark:text-rose-400 mt-2 line-clamp-2">
+                  {book.error}
+                </p>
+              )}
+
+              <div className="mt-auto pt-4 border-t border-slate-100 dark:border-slate-800/60 flex justify-between items-center text-[10px]">
+                <div className="flex items-center gap-1.5 text-slate-400 dark:text-slate-500 min-w-0">
+                  {book.status === 'ready' ? (
+                    <>
+                      <Sparkles size={11} className="text-violet-500 shrink-0" />
+                      <span>{book.pages_total ? `${book.pages_total} chunks indexed` : 'RAG Context Active'}</span>
+                    </>
+                  ) : book.status === 'failed' ? (
+                    <button
+                      onClick={() => handleRetry(book.id)}
+                      className="flex items-center gap-1 text-violet-600 dark:text-violet-400 font-bold hover:text-violet-500 transition-colors"
+                    >
+                      <RotateCw size={11} />
+                      Retry
+                    </button>
+                  ) : (
+                    <span>Indexing your document…</span>
+                  )}
                 </div>
                 <button
                   onClick={() => handleDelete(book.id, book.name)}
-                  className="p-2 rounded-xl text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition-all"
+                  className="p-2 rounded-xl text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition-all shrink-0"
                   title="Purge Document Data"
                 >
                   <Trash2 size={15} />
