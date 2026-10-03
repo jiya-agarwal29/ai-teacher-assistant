@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -32,7 +32,7 @@ from retrieval import retrieve, invalidate_cache, user_has_documents, needs_reem
 
 import database
 from database import engine, get_db
-from models import Base, Book, Page, User
+from models import Base, Book, DocumentPage, Page, User
 
 from auth import (
     create_access_token,
@@ -646,6 +646,203 @@ def retry_book(
     db.refresh(book)
 
     return {"book_id": book.id, "status": book.status}
+
+
+MAX_PAGE_TEXT_CHARS = 20000
+# review_status values that don't block indexing -- a page needing a human
+# look is "needs_review"; everything else (never needed OCR, or a human
+# already signed off on it) is fine to chunk/embed as-is.
+_APPROVED_REVIEW_STATUSES = ("auto_approved", "approved")
+
+
+class PageTextUpdateRequest(BaseModel):
+    extracted_text: str
+
+
+def _get_document_page_or_404(db: Session, book_id: int, page_number: int) -> DocumentPage:
+    page = db.query(DocumentPage).filter(
+        DocumentPage.book_id == book_id,
+        DocumentPage.page_number == page_number
+    ).first()
+
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    return page
+
+
+def _reopen_book_if_ready(book: Book):
+    """A previously-finished book whose text just changed needs a fresh look before it's trusted again."""
+    if book.status == "ready":
+        book.status = "needs_review"
+
+
+def _finalize_if_fully_approved(db: Session, book: Book) -> dict:
+    """
+    Call after any action that approves a page. If no page is left
+    "needs_review", kicks off the background chunk+embed job (status
+    "processing" -> "ready") -- this both builds the index for the first
+    time and rebuilds it (replacing old Page rows) after a post-ready edit
+    reopened the book for review. Returns the response body for the caller.
+    """
+    remaining = db.query(DocumentPage).filter(
+        DocumentPage.book_id == book.id,
+        DocumentPage.review_status == "needs_review"
+    ).count()
+
+    if remaining == 0:
+        book.status = "processing"
+        book.pages_total = 0
+        book.pages_done = 0
+        db.commit()
+        jobs.submit_indexing_job(book.id)
+        db.refresh(book)
+
+    return {"book_id": book.id, "status": book.status, "pages_remaining": remaining}
+
+
+# -----------------------------
+# OCR REVIEW
+# -----------------------------
+@app.get("/books/{book_id}/pages")
+def get_book_pages(
+    book_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    _get_owned_book_or_404(db, book_id, current_user.id)
+
+    pages = db.query(DocumentPage).filter(
+        DocumentPage.book_id == book_id
+    ).order_by(DocumentPage.page_number).all()
+
+    return [
+        {
+            "page_number": p.page_number,
+            "method": p.method,
+            "review_status": p.review_status,
+            "extracted_text": p.extracted_text,
+            "has_image": bool(p.image_path)
+        }
+        for p in pages
+    ]
+
+
+@app.get("/books/{book_id}/pages/{page_number}/image")
+def get_page_image(
+    book_id: int,
+    page_number: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    _get_owned_book_or_404(db, book_id, current_user.id)
+    page = _get_document_page_or_404(db, book_id, page_number)
+
+    if not page.image_path:
+        raise HTTPException(status_code=404, detail="This page has no saved image.")
+
+    # Defense in depth: only ever serve a file that's actually inside this
+    # book's own upload folder, regardless of what's stored in image_path.
+    book_dir = _book_upload_dir(current_user.id, book_id).resolve()
+    image_path = Path(page.image_path).resolve()
+    try:
+        image_path.relative_to(book_dir)
+    except ValueError:
+        logger.error(
+            "Refusing to serve page image outside its book's upload folder (book_id=%d, page=%d)",
+            book_id, page_number
+        )
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return FileResponse(image_path, media_type="image/jpeg")
+
+
+@app.put("/books/{book_id}/pages/{page_number}")
+def update_page_text(
+    book_id: int,
+    page_number: int,
+    payload: PageTextUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
+    page = _get_document_page_or_404(db, book_id, page_number)
+
+    if len(payload.extracted_text) > MAX_PAGE_TEXT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Text is too long ({len(payload.extracted_text)} characters). Maximum is {MAX_PAGE_TEXT_CHARS} characters."
+        )
+
+    page.extracted_text = payload.extracted_text
+
+    # A page that was already signed off on needs a fresh look since its
+    # text just changed; one still mid-review just keeps its status as is.
+    if page.review_status in _APPROVED_REVIEW_STATUSES:
+        page.review_status = "needs_review"
+        _reopen_book_if_ready(book)
+
+    db.commit()
+
+    return {"page_number": page.page_number, "review_status": page.review_status, "status": book.status}
+
+
+@app.post("/books/{book_id}/pages/{page_number}/approve")
+def approve_page(
+    book_id: int,
+    page_number: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
+    page = _get_document_page_or_404(db, book_id, page_number)
+
+    page.review_status = "approved"
+    db.commit()
+
+    return _finalize_if_fully_approved(db, book)
+
+
+@app.post("/books/{book_id}/approve-all")
+def approve_all_pages(
+    book_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
+
+    db.query(DocumentPage).filter(
+        DocumentPage.book_id == book_id,
+        DocumentPage.review_status == "needs_review"
+    ).update({"review_status": "approved"})
+    db.commit()
+
+    return _finalize_if_fully_approved(db, book)
+
+
+@app.post("/books/{book_id}/pages/{page_number}/reread", status_code=202)
+def reread_page(
+    book_id: int,
+    page_number: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
+    page = _get_document_page_or_404(db, book_id, page_number)
+
+    if not page.image_path:
+        raise HTTPException(status_code=400, detail="This page has no saved image to re-read.")
+
+    page.review_status = "needs_review"
+    _reopen_book_if_ready(book)
+    db.commit()
+
+    jobs.submit_reread_job(book_id, page_number)
+
+    return {"book_id": book_id, "page_number": page_number, "review_status": page.review_status, "status": book.status}
 
 
 # -----------------------------

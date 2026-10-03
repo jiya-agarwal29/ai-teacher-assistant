@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../services/api';
 import DocumentStatusBadge from '../components/DocumentStatusBadge';
 import {
@@ -10,7 +11,8 @@ import {
   Sparkles,
   CheckCircle2,
   FolderOpen,
-  RotateCw
+  RotateCw,
+  ClipboardCheck
 } from 'lucide-react';
 
 const STATUS_POLL_INTERVAL_MS = 2000;
@@ -335,7 +337,7 @@ export default function Documents() {
                     </span>
                   </div>
                 </div>
-                <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} />
+                <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} bookId={book.id} />
               </div>
 
               {book.status === 'failed' && book.error && (
@@ -359,6 +361,14 @@ export default function Documents() {
                       <RotateCw size={11} />
                       Retry
                     </button>
+                  ) : book.status === 'needs_review' ? (
+                    <Link
+                      to={`/documents/${book.id}/review`}
+                      className="flex items-center gap-1 text-amber-600 dark:text-amber-400 font-bold hover:text-amber-500 transition-colors"
+                    >
+                      <ClipboardCheck size={11} />
+                      Review
+                    </Link>
                   ) : (
                     <span>Indexing your document…</span>
                   )}

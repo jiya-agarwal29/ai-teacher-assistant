@@ -13,6 +13,13 @@ Per-page extraction always produces DocumentPage rows first (method="text"
 or "ocr", review_status "auto_approved"/"needs_review") -- Page rows (the
 searchable chunked index) are only ever built from DocumentPage.extracted_text,
 and only once every page for that book is approved.
+
+Two more job types live here for the review flow (main.py's /books/{id}/...
+pages endpoints): submit_indexing_job() does the chunk+embed+save step on
+its own, for when a book's pages only just finished being approved (or
+re-approved after a post-approval edit, in which case it rebuilds -- see
+_chunk_embed_and_save) -- and submit_reread_job() re-runs OCR for a single
+already-saved page image.
 """
 import logging
 import os
@@ -302,6 +309,12 @@ def _run_pipeline(db, book_id: int, kind: str, file_paths: list, filename: str, 
 
 
 def _chunk_embed_and_save(db, book, book_id: int, page_records: list, filename: str):
+    # Idempotent rebuild: a first-time build has nothing to delete here, but
+    # re-indexing after a post-approval edit (see submit_indexing_job) must
+    # replace the old chunks rather than append duplicates alongside them.
+    db.query(Page).filter(Page.book_id == book_id).delete()
+    db.commit()
+
     pages_data = [
         {"page_number": p["page_number"], "content": p["extracted_text"] or ""}
         for p in page_records
@@ -369,3 +382,87 @@ def _chunk_embed_and_save(db, book, book_id: int, page_records: list, filename: 
         return
 
     invalidate_cache(book.user_id)
+
+
+def submit_indexing_job(book_id: int):
+    """
+    Queues the chunk+embed+save step for a book whose pages are all
+    approved -- called once the last "needs_review" page is approved (see
+    main.py's _finalize_if_fully_approved). Also used to rebuild the index
+    after a post-ready edit: _chunk_embed_and_save replaces any existing
+    Page rows rather than appending to them.
+    """
+    if JOBS_SYNC:
+        _run_indexing_job(book_id)
+    else:
+        _executor.submit(_run_indexing_job, book_id)
+
+
+def _run_indexing_job(book_id: int):
+    db = database.SessionLocal()
+    try:
+        book = db.query(Book).filter(Book.id == book_id).first()
+        if not book:
+            logger.error("Indexing job: book_id=%d no longer exists, skipping", book_id)
+            return
+
+        doc_pages = db.query(DocumentPage).filter(
+            DocumentPage.book_id == book_id
+        ).order_by(DocumentPage.page_number).all()
+
+        page_records = [
+            {"page_number": p.page_number, "extracted_text": p.extracted_text or ""}
+            for p in doc_pages
+        ]
+
+        _chunk_embed_and_save(db, book, book_id, page_records, book.name)
+    except Exception:
+        logger.exception("Unhandled error while indexing book_id=%d", book_id)
+        try:
+            _mark_failed(db, book_id, GENERIC_PROCESSING_ERROR)
+        except Exception:
+            logger.exception("Also failed to mark book_id=%d as failed", book_id)
+    finally:
+        db.close()
+
+
+def submit_reread_job(book_id: int, page_number: int):
+    """
+    Queues a single page's OCR to run again against its already-saved
+    (already-prepared) image -- no re-render/re-upload needed. The route
+    sets review_status="needs_review" synchronously before calling this;
+    this job only needs to update the transcription once it's done.
+    """
+    if JOBS_SYNC:
+        _reread_page(book_id, page_number)
+    else:
+        _executor.submit(_reread_page, book_id, page_number)
+
+
+def _reread_page(book_id: int, page_number: int):
+    db = database.SessionLocal()
+    try:
+        page = db.query(DocumentPage).filter(
+            DocumentPage.book_id == book_id,
+            DocumentPage.page_number == page_number
+        ).first()
+        if not page or not page.image_path:
+            logger.error(
+                "Re-read job: no page/image for book_id=%d page=%d, skipping", book_id, page_number
+            )
+            return
+
+        try:
+            with open(page.image_path, "rb") as f:
+                image_bytes = f.read()
+            page.extracted_text = llm.read_image(
+                image_bytes, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
+            )
+            db.commit()
+        except Exception:
+            # Best-effort: the page already sits at review_status="needs_review"
+            # (set by the route before this job ran) with its prior text intact,
+            # so a failed re-read just means "try again" rather than losing anything.
+            logger.exception("Failed to re-read book_id=%d page=%d", book_id, page_number)
+    finally:
+        db.close()

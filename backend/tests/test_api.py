@@ -892,3 +892,220 @@ def test_max_ocr_pages_enforced(client, phase3a_headers, monkeypatch):
     )
     assert res.status_code == 400
     assert "limit is 2" in res.json()["detail"]
+
+
+# -----------------------------
+# PHASE 3C: OCR REVIEW
+# -----------------------------
+def test_review_endpoints_require_ownership(client, phase3a_headers, phase3a_other_headers, monkeypatch):
+    import llm as llm_module
+
+    headers_owner = phase3a_headers
+    headers_other = phase3a_other_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers_owner,
+        files={"files": ("ownership_note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "needs_review"
+
+    assert client.get(f"/books/{book_id}/pages", headers=headers_other).status_code == 404
+    assert client.get(f"/books/{book_id}/pages/1/image", headers=headers_other).status_code == 404
+    assert client.put(
+        f"/books/{book_id}/pages/1", headers=headers_other, json={"extracted_text": "hijacked"}
+    ).status_code == 404
+    assert client.post(f"/books/{book_id}/pages/1/approve", headers=headers_other).status_code == 404
+    assert client.post(f"/books/{book_id}/approve-all", headers=headers_other).status_code == 404
+    assert client.post(f"/books/{book_id}/pages/1/reread", headers=headers_other).status_code == 404
+
+    owner_res = client.get(f"/books/{book_id}/pages", headers=headers_owner)
+    assert owner_res.status_code == 200
+    assert len(owner_res.json()) == 1
+
+    client.delete(f"/books/{book_id}", headers=headers_owner)
+
+
+def test_page_image_path_traversal_is_blocked(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("traversal_note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    book_id = res.json()["book_id"]
+
+    # Simulate a corrupted/malicious image_path pointing outside this book's
+    # own upload folder -- the endpoint must refuse to serve it regardless
+    # of what's stored in the database.
+    db = TestSessionLocal()
+    try:
+        outside_path = os.path.abspath(__file__)  # a real file, just not inside any book's upload folder
+        db.query(DocumentPage).filter(DocumentPage.book_id == book_id).update({"image_path": outside_path})
+        db.commit()
+    finally:
+        db.close()
+
+    res2 = client.get(f"/books/{book_id}/pages/1/image", headers=headers)
+    assert res2.status_code == 404
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_edit_and_approve_page_ends_ready_with_edited_text(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Original OCR text.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("edit_approve_note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "needs_review"
+
+    edit_res = client.put(
+        f"/books/{book_id}/pages/1", headers=headers,
+        json={"extracted_text": "Corrected handwriting text."}
+    )
+    assert edit_res.status_code == 200
+    assert edit_res.json()["review_status"] == "needs_review"  # editing a still-pending page doesn't change its status
+
+    approve_res = client.post(f"/books/{book_id}/pages/1/approve", headers=headers)
+    assert approve_res.status_code == 200
+    data = approve_res.json()
+    assert data["pages_remaining"] == 0
+    assert data["status"] == "ready"  # JOBS_SYNC=true -- the indexing job already ran inline
+
+    pages = _get_pages(book_id)
+    assert len(pages) >= 1
+    assert any("Corrected handwriting text." in p.content for p in pages)
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_approve_all_pages(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    call_count = {"n": 0}
+
+    def fake_read_image(image_bytes, mime_type, max_wait_seconds=None):
+        call_count["n"] += 1
+        return f"Page {call_count['n']} text."
+
+    monkeypatch.setattr(llm_module, "read_image", fake_read_image)
+
+    images = [
+        ("approve_all_p1.png", _make_test_image_bytes(color=(1, 1, 1)), "image/png"),
+        ("approve_all_p2.png", _make_test_image_bytes(color=(2, 2, 2)), "image/png"),
+    ]
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files=[("files", img) for img in images],
+        data={"review_ocr": "true"}
+    )
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "needs_review"
+
+    approve_all_res = client.post(f"/books/{book_id}/approve-all", headers=headers)
+    assert approve_all_res.status_code == 200
+    data = approve_all_res.json()
+    assert data["pages_remaining"] == 0
+    assert data["status"] == "ready"
+
+    doc_pages = _get_document_pages(book_id)
+    assert len(doc_pages) == 2
+    assert all(p["review_status"] == "approved" for p in doc_pages)
+    assert len(_get_pages(book_id)) >= 1
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_reread_page_runs_ocr_again_and_reopens_ready_book(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    responses = {"text": "First OCR pass."}
+    monkeypatch.setattr(
+        llm_module, "read_image",
+        lambda image_bytes, mime_type, max_wait_seconds=None: responses["text"]
+    )
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("reread_note.png", _make_test_image_bytes(), "image/png")},
+        data={"review_ocr": "false"}  # auto-approved straight to ready, to also exercise the reopen-to-needs_review path
+    )
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "ready"
+
+    responses["text"] = "Second OCR pass (re-read)."
+    reread_res = client.post(f"/books/{book_id}/pages/1/reread", headers=headers)
+    assert reread_res.status_code == 202
+    data = reread_res.json()
+    assert data["review_status"] == "needs_review"
+    assert data["status"] == "needs_review"  # the book was "ready" -- reopened by the reread
+
+    pages_res = client.get(f"/books/{book_id}/pages", headers=headers)
+    page1 = next(p for p in pages_res.json() if p["page_number"] == 1)
+    assert page1["review_status"] == "needs_review"
+    assert page1["extracted_text"] == "Second OCR pass (re-read)."  # JOBS_SYNC=true -- the reread job already ran inline
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_editing_ready_book_reindexes_only_that_book(client, phase3a_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase3a_headers
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Initial text about bees.")
+
+    res_a = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("reindex_note.png", _make_test_image_bytes(color=(5, 5, 5)), "image/png")},
+        data={"review_ocr": "false"}
+    )
+    book_a_id = res_a.json()["book_id"]
+    assert res_a.json()["status"] == "ready"
+
+    book_b_id = _upload_bees_doc(client, headers, "reindex_unrelated_bees.txt")
+    pages_b_before_ids = {p.id for p in _get_pages(book_b_id)}
+    assert pages_b_before_ids
+
+    edit_res = client.put(
+        f"/books/{book_a_id}/pages/1", headers=headers,
+        json={"extracted_text": "Updated text about wasps."}
+    )
+    assert edit_res.status_code == 200
+    assert edit_res.json()["review_status"] == "needs_review"
+    assert edit_res.json()["status"] == "needs_review"
+
+    assert client.get(f"/books/{book_a_id}/status", headers=headers).json()["status"] == "needs_review"
+    # Book B is completely untouched by editing book A.
+    assert client.get(f"/books/{book_b_id}/status", headers=headers).json()["status"] == "ready"
+    assert {p.id for p in _get_pages(book_b_id)} == pages_b_before_ids
+
+    approve_res = client.post(f"/books/{book_a_id}/pages/1/approve", headers=headers)
+    assert approve_res.json()["status"] == "ready"
+
+    pages_a_after = _get_pages(book_a_id)
+    assert any("Updated text about wasps." in p.content for p in pages_a_after)
+    assert not any("Initial text about bees." in p.content for p in pages_a_after)  # old Pages replaced, not appended
+
+    client.delete(f"/books/{book_a_id}", headers=headers)
+    client.delete(f"/books/{book_b_id}", headers=headers)

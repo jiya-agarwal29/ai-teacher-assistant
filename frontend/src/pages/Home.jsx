@@ -392,7 +392,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
-                      <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} />
+                      <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} bookId={book.id} />
                       {book.status === 'failed' && (
                         <button
                           onClick={() => handleRetryBook(book.id)}

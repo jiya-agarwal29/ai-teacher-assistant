@@ -272,9 +272,77 @@ export const api = {
         formData.append('review_ocr', reviewOcr ? 'true' : 'false');
         xhr.send(formData);
       });
+    },
+
+    pages: {
+      /**
+       * GET /books/{book_id}/pages
+       */
+      list: (bookId) => request(`/books/${bookId}/pages`),
+
+      /**
+       * GET /books/{book_id}/pages/{page_number}/image -- fetched manually
+       * (not through the request() helper, which assumes a JSON body) since
+       * a plain <img src> can't carry the Authorization header. Returns an
+       * object URL the caller must revoke (URL.revokeObjectURL) once done
+       * with it, e.g. when switching pages or unmounting.
+       */
+      getImageUrl: async (bookId, pageNumber) => {
+        const token = getToken();
+        const headers = token ? { Authorization: `Bearer ${token}` } : {};
+        let response;
+        try {
+          response = await fetch(`${API_BASE_URL}/books/${bookId}/pages/${pageNumber}/image`, { headers });
+        } catch (netError) {
+          throw new Error('Failed to connect to backend server. Please ensure the backend is running.', { cause: netError });
+        }
+        if (!response.ok) {
+          let detail = 'Failed to load page image';
+          try {
+            detail = (await response.json()).detail || detail;
+          } catch {
+            // Response body wasn't JSON — keep the default detail above.
+          }
+          throw new Error(detail);
+        }
+        const blob = await response.blob();
+        return URL.createObjectURL(blob);
+      },
+
+      /**
+       * PUT /books/{book_id}/pages/{page_number} {extracted_text}
+       */
+      updateText: (bookId, pageNumber, extractedText) => request(`/books/${bookId}/pages/${pageNumber}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ extracted_text: extractedText }),
+      }),
+
+      /**
+       * POST /books/{book_id}/pages/{page_number}/approve
+       */
+      approve: (bookId, pageNumber) => request(`/books/${bookId}/pages/${pageNumber}/approve`, {
+        method: 'POST',
+      }),
+
+      /**
+       * POST /books/{book_id}/approve-all
+       */
+      approveAll: (bookId) => request(`/books/${bookId}/approve-all`, {
+        method: 'POST',
+      }),
+
+      /**
+       * POST /books/{book_id}/pages/{page_number}/reread -- re-runs OCR for
+       * just this page in the background; poll list() afterward to see the
+       * updated text land.
+       */
+      reread: (bookId, pageNumber) => request(`/books/${bookId}/pages/${pageNumber}/reread`, {
+        method: 'POST',
+      }),
     }
   },
-  
+
   chat: {
     /**
      * GET /chat?question=...

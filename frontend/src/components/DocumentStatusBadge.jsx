@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom';
 import { Loader2, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react';
 
 const STATUS_CONFIG = {
@@ -34,8 +35,11 @@ const STATUS_CONFIG = {
  * leaves sourceType null until every page's text is extracted -- then
  * "Processing N/M" once chunking/embedding takes over. Falls back to a
  * plain "Processing" label before either count exists yet.
+ *
+ * When status is "needs_review" and bookId is given, the pill links to
+ * that document's OCR review page.
  */
-export default function DocumentStatusBadge({ status, pagesTotal = 0, pagesDone = 0, sourceType = null }) {
+export default function DocumentStatusBadge({ status, pagesTotal = 0, pagesDone = 0, sourceType = null, bookId = null }) {
   const config = STATUS_CONFIG[status] || STATUS_CONFIG.processing;
   const Icon = config.icon;
 
@@ -46,10 +50,21 @@ export default function DocumentStatusBadge({ status, pagesTotal = 0, pagesDone 
       : `Reading page ${pagesDone} of ${pagesTotal}`;
   }
 
-  return (
-    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] font-bold whitespace-nowrap ${config.className}`}>
+  const pillClassName = `inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] font-bold whitespace-nowrap ${config.className}`;
+  const content = (
+    <>
       <Icon size={11} className={config.spin ? 'animate-spin' : ''} />
       {label}
-    </span>
+    </>
   );
+
+  if (status === 'needs_review' && bookId != null) {
+    return (
+      <Link to={`/documents/${bookId}/review`} className={`${pillClassName} hover:scale-[1.04] transition-transform cursor-pointer`}>
+        {content}
+      </Link>
+    );
+  }
+
+  return <span className={pillClassName}>{content}</span>;
 }

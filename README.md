@@ -37,7 +37,7 @@ backend/
   scripts/reembed.py      Re-embeds stored pages after switching EMBEDDING_PROVIDER
   uploads/                Saved original files, one folder per <user_id>/<book_id> (gitignored)
 frontend/
-  src/pages/               Home, Chat, Documents, AITools, Analytics, Login
+  src/pages/               Home, Chat, Documents, DocumentReview, AITools, Analytics, Login
   src/components/          Sidebar, PageLayout, ProtectedRoute, DocumentStatusBadge
   src/hooks/                Auth, active-time tracking, quiz/query history
   src/services/api.js      Backend API client
@@ -166,7 +166,7 @@ Rate limits: both Gemini paths retry transient failures automatically, and a Gem
 
 **Per-page extraction** (`DocumentPage`, one row per page regardless of source) — a PDF page keeps its real `pdfplumber` text when there are at least `OCR_MIN_CHARS` characters of it (`method="text"`); otherwise that page is rendered to an image (`pypdfium2`, ~200 DPI) and OCR'd. Every page of an image upload is always OCR'd. DOCX/PPTX/TXT/MD are unchanged (always `method="text"`). OCR (`llm.read_image`, Gemini vision) transcribes everything verbatim, including handwriting, marking truly unreadable words `[illegible]` — images are normalized first (`ocr.py`: EXIF rotation fixed, converted to RGB, downscaled to at most 2000px on the longest side, light auto-contrast; no OpenCV). `Book.source_type` (`text`/`scanned`/`mixed`) is set from what was actually extracted; an all-OCR document with every page still empty has nothing to index and ends up `failed`, same as before OCR existed.
 
-**Review gate** — an OCR'd page's `review_status` is `"needs_review"` when `review_ocr=true`, otherwise `"auto_approved"`. If **any** page needs review, the whole book stops at `status="needs_review"` and nothing is chunked or embedded yet (no review/approve endpoint exists yet — a later phase adds one). Only once every page is approved does chunking (from `DocumentPage.extracted_text`, keeping each chunk's original page number) + embedding + saving `Page` rows proceed to `status="ready"`.
+**Review gate** — an OCR'd page's `review_status` is `"needs_review"` when `review_ocr=true`, otherwise `"auto_approved"`. If **any** page needs review, the whole book stops at `status="needs_review"` and nothing is chunked or embedded yet. Only once every page is approved does chunking (from `DocumentPage.extracted_text`, keeping each chunk's original page number) + embedding + saving `Page` rows proceed to `status="ready"` — see [OCR review](#ocr-review).
 
 - `GET /books` now also returns each book's `status`, `error`, `source_type`, `pages_total`, `pages_done`, and `created_at`.
 - `GET /books/{id}/status` — poll this while `status == "processing"` for live progress: `pages_done`/`pages_total` count OCR pages while `source_type` is still null, then switch to counting embedding chunks once extraction finishes.
@@ -177,6 +177,18 @@ Rate limits: both Gemini paths retry transient failures automatically, and a Gem
 - `LLM_PROVIDER=local` has no vision model, so an OCR'd page on that provider fails the whole book with `"Reading scanned or handwritten pages needs the Gemini provider."`
 
 The frontend (`Documents.jsx`/`Home.jsx`) shows the new book immediately with a status badge (now including `needs_review`, amber) and polls `GET /books/{id}/status` every 2 seconds until it reaches a stable state, then stops. Documents.jsx's upload also has a "Let me check the text before it's used" checkbox (the `review_ocr` choice), checked by default.
+
+## OCR review
+
+A `needs_review` book's amber badge (and a "Review" button in Documents.jsx) link to `/documents/{id}/review` — a page-by-page editor for the transcribed text before it's trusted enough to index:
+
+- `GET /books/{id}/pages` — every page's `method`, `review_status`, `extracted_text`, and whether it has a saved image.
+- `GET /books/{id}/pages/{n}/image` — the saved page image (the frontend fetches this with the JWT as a `fetch`-to-blob, since a plain `<img src>` can't carry an `Authorization` header); only ever serves a file actually inside that book's own `UPLOAD_DIR` folder.
+- `PUT /books/{id}/pages/{n}` `{extracted_text}` — saves edited text (max 20,000 characters) without otherwise touching `review_status`, **unless** the page was already `approved`/`auto_approved`, in which case editing reopens it to `needs_review` (and reopens the book to `needs_review` too, if it was `ready`).
+- `POST /books/{id}/pages/{n}/approve` and `POST /books/{id}/approve-all` — approve one page or every remaining `needs_review` page. Once none are left, this kicks off the background chunk+embed job (`status` → `processing` → `ready`), replacing any previous `Page` rows rather than appending to them — so re-approving after a post-`ready` edit correctly rebuilds the index from the edited text.
+- `POST /books/{id}/pages/{n}/reread` — re-runs OCR against that page's already-saved image (no re-render/re-upload) in the background, setting `review_status="needs_review"` (and reopening the book the same way an edit does) immediately so the frontend can show that it's in flight.
+
+All five endpoints are owner-only (`404` otherwise) and only ever operate on files inside the book's own upload folder.
 
 ## Migrating an existing database
 
@@ -203,6 +215,8 @@ The whole suite runs with **no internet connection and no real `backend/.env`** 
 
 The OCR tests in the same file mock `llm.read_image()` directly (never a real Gemini vision call) and, for the PDF per-page decision, `document_parsers.parse_pdf()` and `ocr.render_pdf_page_to_png()` -- so a mixed scanned/typed PDF doesn't need a real multi-page PDF fixture, just canned per-page text. They cover: a low-text PDF page gets OCR'd while a text-rich one doesn't (and `source_type` comes out `"mixed"`); several images become one book with pages in submission order; `.heic` is accepted; `review_ocr=true` stops at `status="needs_review"` with no `Page` rows yet, `review_ocr=false` goes straight to `ready`; an `[illegible]` marker survives into the indexed text; `LLM_PROVIDER=local` fails OCR with the documented friendly message; and `MAX_OCR_PAGES` is enforced at upload time.
 
+The OCR review tests cover: every `/books/{id}/pages...` endpoint 404s for a non-owner; a corrupted/malicious `image_path` outside the book's own upload folder is refused rather than served; editing a page's text then approving it ends `status="ready"` with the *edited* text in the indexed `Page` rows (not the original OCR output); `approve-all` clears every remaining `needs_review` page in one call; re-reading a page re-runs OCR and reopens an already-`ready` book to `needs_review`; and editing a `ready` book's page reopens and (once re-approved) re-indexes only that book, leaving an unrelated book's own `Page` rows completely untouched.
+
 ## Production deployment
 
 Start the backend with a single worker — the embedding and answer-generation models are loaded into that worker's memory at startup, so extra workers would each load their own separate copy and none of them would share the in-memory retrieval cache:
@@ -228,7 +242,7 @@ Unexpected server errors (anything not raised deliberately as an `HTTPException`
 ## Known limitations
 
 - **OCR needs the Gemini provider.** `LLM_PROVIDER=local` has no vision model, so a scanned PDF page or any photo upload fails the whole document with a clear error instead of silently producing an empty or garbled page.
-- **No review/approve endpoint yet.** A book with any OCR'd page and `review_ocr=true` stops at `status="needs_review"` with its transcriptions saved (`DocumentPage.extracted_text`) and nothing chunked/embedded — there's no API yet to view/edit/approve that text and move it to `ready`; upload with `review_ocr=false` to skip the gate entirely.
+- **Retry doesn't skip completed OCR.** Only `/books/{id}/retry` (for a `failed` book) re-extracts everything from scratch; the review endpoints (edit/approve/re-read) never discard an already-successful OCR pass.
 - **Retry re-extracts (and re-OCRs) everything.** `/books/{id}/retry` doesn't resume partway through or reuse a previous attempt's already-transcribed pages, so retrying a document that failed late (e.g. during embedding, after OCR already succeeded) re-runs OCR on every low-text/image page again.
 - **`flan-t5-small` answer quality (LLM_PROVIDER=local only).** The default `LLM_PROVIDER=gemini` doesn't have this limitation. The local answer-generation model is intentionally small (so it runs on a CPU with no external API key), which means answers can be shallow, occasionally repetitive, or misphrase a nuance from the source text. For sharper answers on `local`, uploading more specific/well-structured source material tends to help more than rephrasing the question.
 - **Free-tier rate limits.** Gemini's free tier enforces per-minute quotas on both embeddings and generation; a large upload or a burst of chat/quiz/summarize/flashcard requests can hit them. Embedding requests pace themselves and wait out the quota automatically instead of failing (see [AI providers](#ai-providers)); generation requests retry briefly and then return a `503` ("AI service is busy...") if the service is still unavailable — just retry shortly after. Voyage's free tier (no payment method on the account) is similarly capped, at ~10K tokens/minute.
