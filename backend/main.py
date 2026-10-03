@@ -423,6 +423,28 @@ def login(
 
 
 # -----------------------------
+# REFRESH TOKEN
+# -----------------------------
+@app.post("/refresh-token")
+@limiter.limit("10/minute", key_func=_user_rate_limit_key)
+def refresh_token(
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    # get_current_user already rejects a missing/invalid/expired token with
+    # a 401 before this body ever runs -- "Stay logged in" simply can't
+    # extend a session that's already gone.
+    token = create_access_token(
+        data={"sub": current_user.username}
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer"
+    }
+
+
+# -----------------------------
 # DOCUMENT UPLOAD (+ OCR)
 # -----------------------------
 def _validate_document_upload(file: UploadFile) -> str:

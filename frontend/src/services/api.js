@@ -45,9 +45,10 @@ export const userScopedKey = (key) => {
 /**
  * Decodes a JWT's payload with no library: split on '.', base64url-decode
  * the middle segment, parse the JSON. Returns null for a missing/malformed
- * token rather than throwing.
+ * token rather than throwing. Exported so AuthProvider can read `exp` to
+ * schedule the session-expiry warning/logout timers.
  */
-function decodeJwtPayload(token) {
+export function decodeJwtPayload(token) {
   try {
     const base64Url = token.split('.')[1];
     const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
@@ -182,6 +183,20 @@ export const api = {
       // Only the token is cleared — username stays so per-user localStorage
       // keys (analytics, history, saved chats) remain intact for next login.
       setToken(null);
+    },
+
+    /**
+     * POST /refresh-token -- exchanges a still-valid token for a new one
+     * with a fresh expiry ("Stay logged in"). An already-expired or invalid
+     * token gets the usual 401 (surfaced as a thrown Error), same as any
+     * other authenticated endpoint.
+     */
+    refresh: async () => {
+      const data = await request('/refresh-token', { method: 'POST' });
+      if (data.access_token) {
+        setToken(data.access_token);
+      }
+      return data;
     }
   },
   

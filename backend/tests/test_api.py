@@ -1109,3 +1109,44 @@ def test_editing_ready_book_reindexes_only_that_book(client, phase3a_headers, mo
 
     client.delete(f"/books/{book_a_id}", headers=headers)
     client.delete(f"/books/{book_b_id}", headers=headers)
+
+
+# -----------------------------
+# SESSION EXPIRY: /refresh-token
+# -----------------------------
+def test_refresh_token_returns_new_token_with_later_expiry(client, phase3a_headers):
+    import time as time_module
+    from jose import jwt as jose_jwt
+
+    headers = phase3a_headers
+    old_token = headers["Authorization"].split(" ", 1)[1]
+    old_exp = jose_jwt.get_unverified_claims(old_token)["exp"]
+
+    # A real clock tick so the new token's exp (computed from "now" +
+    # ACCESS_TOKEN_EXPIRE_MINUTES) lands strictly later than the old one's,
+    # not just tied to the same second.
+    time_module.sleep(1.1)
+
+    res = client.post("/refresh-token", headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert "access_token" in data
+    assert data["token_type"] == "bearer"
+
+    new_exp = jose_jwt.get_unverified_claims(data["access_token"])["exp"]
+    assert new_exp > old_exp
+
+
+def test_refresh_token_rejects_expired_token(client):
+    import os
+    from datetime import datetime, timedelta, timezone
+    from jose import jwt as jose_jwt
+
+    expired_token = jose_jwt.encode(
+        {"sub": "nonexistent_refresh_test_user", "exp": datetime.now(timezone.utc) - timedelta(minutes=5)},
+        os.environ["SECRET_KEY"],
+        algorithm="HS256"
+    )
+
+    res = client.post("/refresh-token", headers={"Authorization": f"Bearer {expired_token}"})
+    assert res.status_code == 401

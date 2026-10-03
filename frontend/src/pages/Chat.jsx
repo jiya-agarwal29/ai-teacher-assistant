@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { api, userScopedKey } from '../services/api';
 import { recordQuery } from '../hooks/useQueryHistory';
+import { useDraftPersistence } from '../hooks/useDraftPersistence';
 import {
   Send,
   Plus,
@@ -26,9 +27,13 @@ export default function Chat() {
   const [question, setQuestion] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [error, setError] = useState('');
-  
+
   // Citations side panel
   const [selectedCitation, setSelectedCitation] = useState(null);
+
+  // Don't lose an unsent question to a session-expiry (or manual) logout --
+  // saved right before the token is cleared, restored once on the next visit.
+  useDraftPersistence('chat_draft_input', question, setQuestion);
 
   const messagesEndRef = useRef(null);
 

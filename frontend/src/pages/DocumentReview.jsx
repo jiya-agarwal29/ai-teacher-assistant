@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { api } from '../services/api';
+import { useDraftPersistence } from '../hooks/useDraftPersistence';
 import {
   ArrowLeft,
   ZoomIn,
@@ -71,6 +72,21 @@ export default function DocumentReview() {
   const [indexingPhase, setIndexingPhase] = useState(false);
   const [finalOutcome, setFinalOutcome] = useState(null); // null | 'ready' | 'failed'
 
+  // An unsaved edit a session-expiry (or manual) logout would otherwise
+  // silently discard -- saved per-book (the page number travels inside the
+  // value) right before the token is cleared, restored once on return.
+  const [hasPendingRestore, setHasPendingRestore] = useState(false);
+  const restoredDraftRef = useRef(null);
+  useDraftPersistence(
+    `review_draft_${bookId}`,
+    isDirty ? { pageNumber: currentPageNumber, text: textDraft } : null,
+    (restored) => {
+      restoredDraftRef.current = restored;
+      setHasPendingRestore(true);
+    },
+    { serialize: JSON.stringify, deserialize: JSON.parse }
+  );
+
   const pagesRef = useRef(pages);
   useEffect(() => { pagesRef.current = pages; }, [pages]);
 
@@ -111,16 +127,39 @@ export default function DocumentReview() {
     return () => { ignore = true; };
   }, [bookId]);
 
-  // Reset the editable draft only when the selected page itself changes --
-  // not on every background `pages` refresh, so an in-progress edit is
-  // never silently clobbered by, say, a re-read landing for another page.
+  // Once pages have loaded and a draft was restored (see useDraftPersistence
+  // above), jump straight to the page it belongs to instead of whatever the
+  // initial load picked.
+  useEffect(() => {
+    if (!hasPendingRestore) return;
+    const targetPage = restoredDraftRef.current?.pageNumber;
+    if (pages.some((p) => p.page_number === targetPage)) {
+      setCurrentPageNumber(targetPage);
+    }
+  }, [hasPendingRestore, pages]);
+
+  // Reset the editable draft when the selected page changes -- normally to
+  // that page's saved server text, but to the just-restored draft instead
+  // if one is pending for this exact page. Not run on every background
+  // `pages` refresh, so an in-progress edit is never silently clobbered by,
+  // say, a re-read landing for another page.
   useEffect(() => {
     if (currentPageNumber == null) return;
+
+    if (hasPendingRestore && restoredDraftRef.current?.pageNumber === currentPageNumber) {
+      setTextDraft(restoredDraftRef.current.text);
+      setIsDirty(true);
+      setZoomPercent(100);
+      restoredDraftRef.current = null;
+      setHasPendingRestore(false);
+      return;
+    }
+
     const page = pagesRef.current.find((p) => p.page_number === currentPageNumber);
     setTextDraft(page?.extracted_text || '');
     setIsDirty(false);
     setZoomPercent(100);
-  }, [currentPageNumber]);
+  }, [currentPageNumber, hasPendingRestore]);
 
   // Load (and clean up) the current page's image as an object URL -- a
   // plain <img src> can't carry the Authorization header this needs.
@@ -207,6 +246,11 @@ export default function DocumentReview() {
     if (currentIndex >= 0 && currentIndex < sortedPages.length - 1) goToPage(sortedPages[currentIndex + 1].page_number);
   };
 
+  // Pages whose text has ever been hand-edited (vs. untouched OCR output) --
+  // used only to decide whether "Re-read page" needs to warn that it'll
+  // throw that edit away.
+  const editedPageNumbersRef = useRef(new Set());
+
   const handleSave = async () => {
     if (currentPageNumber == null) return;
     setIsSaving(true);
@@ -220,6 +264,7 @@ export default function DocumentReview() {
       )));
       setBookStatus(result.status);
       setIsDirty(false);
+      editedPageNumbersRef.current.add(currentPageNumber);
     } catch (err) {
       setActionError(err.message || 'Failed to save this page.');
     } finally {
@@ -242,6 +287,7 @@ export default function DocumentReview() {
       // Save any pending edit first so approval reflects the latest text.
       if (isDirty) {
         await api.books.pages.updateText(bookId, currentPageNumber, textDraft);
+        editedPageNumbersRef.current.add(currentPageNumber);
       }
       const result = await api.books.pages.approve(bookId, currentPageNumber);
       setPages((prev) => prev.map((p) => (
@@ -278,7 +324,17 @@ export default function DocumentReview() {
 
   const handleReread = async () => {
     if (currentPageNumber == null) return;
+
+    const wasEdited = isDirty || editedPageNumbersRef.current.has(currentPageNumber);
+    if (wasEdited && !window.confirm(
+      'Re-reading will replace your edits on this page with a fresh transcription. Continue?'
+    )) {
+      return;
+    }
+
     const pageNumber = currentPageNumber;
+    setIsDirty(false); // the confirmed re-read is about to overwrite this page's text either way
+    editedPageNumbersRef.current.delete(pageNumber); // starting fresh from the new transcription
     setRereadingPage(pageNumber);
     setActionError('');
     try {
