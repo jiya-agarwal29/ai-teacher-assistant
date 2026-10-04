@@ -14,6 +14,7 @@ import {
   GraduationCap
 } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
+import { confirmNavigationAllowed } from '../utils/navigationGuard';
 
 export default function Sidebar({ darkMode, setDarkMode }) {
   const { user, logout } = useAuth();
@@ -118,7 +119,16 @@ export default function Sidebar({ darkMode, setDarkMode }) {
               <NavLink
                 key={item.name}
                 to={item.path}
-                onClick={() => setMobileOpen(false)}
+                onClick={(e) => {
+                  // Lets the current page (e.g. the OCR review page, mid-edit)
+                  // ask for confirmation before this navigation is allowed to
+                  // proceed -- see utils/navigationGuard.js.
+                  if (!confirmNavigationAllowed()) {
+                    e.preventDefault();
+                    return;
+                  }
+                  setMobileOpen(false);
+                }}
                 className={({ isActive }) => `
                   flex items-center gap-4 px-4 py-3 rounded-lg font-medium text-xs tracking-tight transition-all duration-200 border-l-2
                   ${isActive

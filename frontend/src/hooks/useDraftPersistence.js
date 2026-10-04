@@ -3,10 +3,13 @@ import { userScopedKey } from '../services/api';
 
 /**
  * Keeps unsent/unsaved work from being silently lost across a logout
- * (session expiry or a manual "Log out"): saves `value` to a per-user
- * localStorage slot the instant AuthProvider's `before-logout` event fires
- * (dispatched before the token is cleared, so the slot is still scoped to
- * the right user), and restores + clears it once, on mount.
+ * (session expiry or a manual "Log out") or a page refresh/close: saves
+ * `value` to a per-user localStorage slot the instant AuthProvider's
+ * `before-logout` event fires (dispatched before the token is cleared, so
+ * the slot is still scoped to the right user) -- and the same way on the
+ * browser's own `beforeunload`/`pagehide` (both are listened for since
+ * neither alone fires reliably in every browser/navigation case). Restores
+ * + clears it once, on mount.
  *
  * `value` should be `null`/empty when there's nothing worth persisting --
  * an empty draft clears any previously-saved one instead of writing it.
@@ -49,8 +52,19 @@ export function useDraftPersistence(storageKey, value, onRestore, { serialize, d
         localStorage.setItem(key, toStorage(current));
       }
     };
+    // Deliberately doesn't call preventDefault/set returnValue on
+    // beforeunload -- this listener's only job is the silent save; any
+    // "are you sure you want to leave" prompt is a separate, page-specific
+    // concern (e.g. DocumentReview's own beforeunload handler) and the two
+    // coexist fine as independent listeners on the same event.
     window.addEventListener('before-logout', handler);
-    return () => window.removeEventListener('before-logout', handler);
+    window.addEventListener('beforeunload', handler);
+    window.addEventListener('pagehide', handler);
+    return () => {
+      window.removeEventListener('before-logout', handler);
+      window.removeEventListener('beforeunload', handler);
+      window.removeEventListener('pagehide', handler);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageKey]);
 }

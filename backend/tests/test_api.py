@@ -1288,3 +1288,32 @@ def test_rotate_page_rejects_invalid_direction(client, phase3a_headers, monkeypa
     assert bad_res.status_code == 400
 
     client.delete(f"/books/{book_id}", headers=headers)
+
+
+# -----------------------------
+# UPLOAD SIZE LIMIT (MAX_UPLOAD_MB)
+# -----------------------------
+def test_upload_size_limit_boundary(client, phase3a_headers, monkeypatch):
+    # A tiny monkeypatched limit keeps the test files themselves small --
+    # no need to actually construct a multi-MB upload to prove the 413/202
+    # boundary works.
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 1000)
+    monkeypatch.setattr(main, "MAX_UPLOAD_MB", 1000 / (1024 * 1024))
+
+    headers = phase3a_headers
+
+    over_limit_res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("too_big.txt", b"x" * 1200, "text/plain")}
+    )
+    assert over_limit_res.status_code == 413
+
+    under_limit_res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("just_right.txt", b"x" * 500, "text/plain")}
+    )
+    assert under_limit_res.status_code == 202
+
+    client.delete(f"/books/{under_limit_res.json()['book_id']}", headers=headers)

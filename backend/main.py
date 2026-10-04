@@ -96,6 +96,7 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    logger.info("Upload limit: %g MB, OCR page limit: %d", MAX_UPLOAD_MB, MAX_OCR_PAGES)
     logger.info("Startup complete")
     yield
     logger.info("Shutting down")
@@ -173,7 +174,7 @@ app.add_middleware(
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".pptx", ".doc", ".ppt", ".txt", ".md"}
-MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "60"))
+MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "100"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
 
 # Scanned/photographed pages (jobs.py OCRs these with Gemini vision -- see

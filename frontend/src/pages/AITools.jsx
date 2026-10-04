@@ -250,7 +250,7 @@ export default function AITools() {
   // -----------------------------
   // TOOL 4: FLASHCARDS STATE
   // -----------------------------
-  const [flashcardTopic, setFlashcardTopic] = useState('Transaction Control');
+  const [flashcardTopic, setFlashcardTopic] = useState('');
   const [flashcards, setFlashcards] = useState([
     { id: 1, front: "ACID: Atomicity", back: "All parts of the database transaction must succeed, or the entire transaction is rolled back." },
     { id: 2, front: "ACID: Consistency", back: "A transaction must move the database from one valid state to another valid state, preserving constraints." },
@@ -384,7 +384,7 @@ export default function AITools() {
                 <form onSubmit={handleGenerateQuiz} className="flex gap-3">
                   <input 
                     type="text"
-                    placeholder="e.g. Database Normalization"
+                    placeholder="e.g. Photosynthesis"
                     value={quizTopic}
                     onChange={(e) => setQuizTopic(e.target.value)}
                     className="flex-grow px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
@@ -693,7 +693,7 @@ export default function AITools() {
                 <form onSubmit={handleSemanticSearch} className="flex gap-3">
                   <input 
                     type="text"
-                    placeholder="Enter query (e.g. process control block structure)"
+                    placeholder="Enter a word or phrase to search for"
                     value={semanticQuery}
                     onChange={(e) => setSemanticQuery(e.target.value)}
                     className="flex-grow px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
@@ -765,7 +765,7 @@ export default function AITools() {
                 <form onSubmit={handleSummarize} className="space-y-3">
                   <textarea 
                     rows={6}
-                    placeholder="Paste database chapter notes, operating system slides, or general curriculum text here..."
+                    placeholder="Paste any notes or text here..."
                     value={summarizerText}
                     onChange={(e) => setSummarizerText(e.target.value)}
                     className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all resize-none"
@@ -811,7 +811,7 @@ export default function AITools() {
                 <form onSubmit={handleGenerateFlashcards} className="flex gap-3">
                   <input 
                     type="text"
-                    placeholder="Enter concept (e.g. Process Scheduling)"
+                    placeholder="e.g. CIA Triad"
                     value={flashcardTopic}
                     onChange={(e) => setFlashcardTopic(e.target.value)}
                     className="flex-grow px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
@@ -879,7 +879,7 @@ export default function AITools() {
                 <form onSubmit={handleTutorSubmit} className="space-y-3">
                   <input 
                     type="text"
-                    placeholder="e.g. Explain how virtual memory mapping works in simple terms."
+                    placeholder="e.g. Explain photosynthesis in simple terms."
                     value={tutorPrompt}
                     onChange={(e) => setTutorPrompt(e.target.value)}
                     className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"

@@ -77,7 +77,7 @@ Create `backend/.env` — see `backend/.env.example` for the full list with desc
 | `HF_TOKEN` | unset | Hugging Face token. Reserved for future use; not currently read by any module, only raises Hub rate limits for the one-time model download if you hit them. |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `60` | Minutes before an issued JWT expires. |
 | `CORS_ORIGINS` | the local Vite dev ports | Comma-separated list of allowed frontend origins. **Must** be set in production to your real frontend URL(s) — see [Production deployment](#production-deployment). |
-| `MAX_UPLOAD_MB` | `60` | Maximum accepted size for the single-document `file` upload (phone scans of a multi-page PDF are often 30-60 MB). Per-image uploads (`files`) are separately capped at 15 MB each, regardless of this setting. |
+| `MAX_UPLOAD_MB` | `100` | Maximum accepted size for the single-document `file` upload (phone scans of a multi-page PDF can run large). Per-image uploads (`files`) are separately capped at 15 MB each, regardless of this setting. |
 | `LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`). |
 | `DATABASE_URL` | an absolute `sqlite:///.../backend/teacher_ai.db` path next to `database.py` | SQLAlchemy database URL. Only set this to point at a different file or a different database engine for production. |
 | `UPLOAD_DIR` | an absolute `uploads/` folder next to `main.py` | Where uploaded original files are saved (`<UPLOAD_DIR>/<user_id>/<book_id>/original<ext>`) for background processing and retry. |
@@ -94,7 +94,7 @@ Run it:
 uvicorn main:app --reload
 ```
 
-Serves on `http://127.0.0.1:8000`. AI clients/models are prepared once at startup (FastAPI lifespan) rather than per-request — this fails fast with a clear error if a required API key is missing. Local models (used only when a provider is set to `local`) are downloaded on first use (~100MB total, one-time). Check `GET /health` for `{"status", "models_ready", "database_ready", "llm": {"provider", "model", "configured", "ready"}}`.
+Serves on `http://127.0.0.1:8000`. AI clients/models are prepared once at startup (FastAPI lifespan) rather than per-request — this fails fast with a clear error if a required API key is missing. Local models (used only when a provider is set to `local`) are downloaded on first use (~100MB total, one-time). Startup also logs the active `MAX_UPLOAD_MB`/`MAX_OCR_PAGES` limits, so a stale/misconfigured value is visible without having to go digging — a running server never picks up a changed `.env` value until it's restarted. Check `GET /health` for `{"status", "models_ready", "database_ready", "llm": {"provider", "model", "configured", "ready"}}`.
 
 > **Windows + antivirus HTTPS scanning (e.g. Avast):** if the model download fails with `SSL: CERTIFICATE_VERIFY_FAILED`, your antivirus is intercepting HTTPS and Python doesn't trust its certificate. Fix: `pip install pip-system-certs` inside the venv.
 
@@ -201,7 +201,9 @@ The frontend (`hooks/AuthProvider.jsx`) decodes the token's own `exp` claim to s
 - A warning popup (`components/SessionExpiryModal.jsx`, `VITE_SESSION_WARNING_MINUTES` before expiry, default `5`) with a live countdown, offering **"Stay logged in"** (calls `/refresh-token`) or **"Log out"**. Focus-trapped and accessible (Esc acts as "Stay logged in").
 - A hard logout exactly at expiry if the warning is ignored.
 
-Either path redirects to `/login` with "Your session has expired. Please log in again." and, after re-authenticating, returns the user to the page they were on (`ProtectedRoute`'s saved `location.state.from`). An unsent Chat question or an unsaved edit on the OCR review page is saved to a per-user `localStorage` slot right before any logout (manual or automatic) and restored once on the next visit (`hooks/useDraftPersistence.js`).
+Either path redirects to `/login` with "Your session has expired. Please log in again." and, after re-authenticating, returns the user to the page they were on (`ProtectedRoute`'s saved `location.state.from`). An unsent Chat question or an unsaved edit on the OCR review page is saved to a per-user `localStorage` slot right before any logout (manual, the expiry timer, or a 401 from any request) *and* right before a page refresh/close (`beforeunload`/`pagehide`), then restored once on the next visit (`hooks/useDraftPersistence.js`). On the review page specifically, the restored edit's page number also wins over whatever `?page=` is in the URL, and a plain refresh/close shows the browser's own "leave page?" prompt whenever there's an unsaved edit (never otherwise).
+
+Leaving the review page for another page in the app — the sidebar's nav links or its own Back button — asks the same "discard unsaved changes?" question first if there's an edit in progress; the current page is also kept in the URL as `?page=N` (history is *replaced*, not pushed, so Previous/Next don't pile up back-button entries).
 
 ## Migrating an existing database
 

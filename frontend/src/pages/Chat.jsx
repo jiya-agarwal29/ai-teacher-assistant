@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
 import { recordQuery } from '../hooks/useQueryHistory';
 import { useDraftPersistence } from '../hooks/useDraftPersistence';
@@ -31,6 +32,23 @@ export default function Chat() {
 
   // Citations side panel
   const [selectedCitation, setSelectedCitation] = useState(null);
+
+  // Powers the welcome screen's personalized suggestion chips -- loaded
+  // once; a failure here just means a plainer welcome screen, not a
+  // page-level error, so it's swallowed rather than surfaced.
+  const [books, setBooks] = useState([]);
+  useEffect(() => {
+    let ignore = false;
+    (async () => {
+      try {
+        const data = await api.books.getAll();
+        if (!ignore) setBooks(data || []);
+      } catch {
+        // Ignored -- see comment above.
+      }
+    })();
+    return () => { ignore = true; };
+  }, []);
 
   // Don't lose an unsent question to a session-expiry (or manual) logout --
   // saved right before the token is cleared, restored once on the next visit.
@@ -342,12 +360,21 @@ export default function Chat() {
     });
   };
 
-  const suggestions = [
-    "What is process scheduling?",
-    "Explain Database Joins vs Unions",
-    "List ACID properties of DBMS",
-    "How does virtual memory work?"
-  ];
+  // Personalized welcome-screen suggestions, built from the user's own
+  // ready (searchable) documents -- up to 2 documents x 2 question
+  // templates each, capped at 4 chips total. No hard-coded subject matter.
+  const truncateBookName = (name) => (name.length > 40 ? `${name.slice(0, 39)}…` : name);
+  const readyBooks = books.filter((b) => b.status === 'ready');
+  const pendingBooks = books.filter((b) => b.status === 'processing' || b.status === 'needs_review');
+  const suggestions = readyBooks.slice(0, 2).flatMap((book) => {
+    const name = truncateBookName(book.name);
+    return [
+      `Summarize the key points of ${name}`,
+      `What are the main topics in ${name}?`
+    ];
+  }).slice(0, 4);
+
+  const showWelcome = (activeConv?.messages.length ?? 0) <= 1;
 
   return (
     <div className="flex h-[calc(100vh-80px)] md:h-[calc(100vh-80px)] rounded-[32px] overflow-hidden border border-slate-200 dark:border-slate-800/80 bg-white/40 dark:bg-slate-900/30 backdrop-blur-md relative z-10">
@@ -410,7 +437,7 @@ export default function Chat() {
 
         {/* Chat Bubbles */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
-          {activeConv?.messages.length <= 1 && (
+          {showWelcome ? (
             <div className="flex flex-col items-center justify-center h-full text-center max-w-lg mx-auto py-10 space-y-6">
               <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-500 flex items-center justify-center text-white shadow-lg shadow-violet-500/10">
                 <Sparkles size={22} className="animate-pulse" />
@@ -418,27 +445,40 @@ export default function Chat() {
               <div>
                 <h3 className="text-base font-bold text-slate-800 dark:text-white">RAG-Powered AI Study Partner</h3>
                 <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-2 leading-relaxed">
-                  Ask questions about your uploaded database, networks, or custom documents. The assistant will search matching document chunks semantically and cite its source automatically.
+                  Ask questions about your uploaded notes and documents. Answers come only from your documents, with sources cited.
                 </p>
               </div>
 
-              {/* Suggestion Chips */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full pt-4">
-                {suggestions.map((sug, idx) => (
-                  <button
-                    key={idx}
-                    onClick={() => handleSendMessage(sug)}
-                    className="p-3 text-[10px] font-semibold text-slate-600 dark:text-slate-300 text-left rounded-xl border border-slate-200/60 dark:border-slate-800/60 bg-white/50 dark:bg-slate-900/20 hover:border-violet-500/50 hover:bg-violet-500/5 dark:hover:bg-violet-500/10 transition-all hover:scale-[1.01]"
-                  >
-                    {sug}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
+              {readyBooks.length === 0 ? (
+                <div className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                  Upload a document on the Documents page to start asking questions.{' '}
+                  <Link to="/documents" className="font-bold text-violet-600 dark:text-violet-400 hover:underline">
+                    Go to Documents
+                  </Link>
+                </div>
+              ) : (
+                /* Suggestion Chips */
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full pt-4">
+                  {suggestions.map((sug, idx) => (
+                    <button
+                      key={idx}
+                      onClick={() => handleSendMessage(sug)}
+                      className="p-3 text-[10px] font-semibold text-slate-600 dark:text-slate-300 text-left rounded-xl border border-slate-200/60 dark:border-slate-800/60 bg-white/50 dark:bg-slate-900/20 hover:border-violet-500/50 hover:bg-violet-500/5 dark:hover:bg-violet-500/10 transition-all hover:scale-[1.01]"
+                    >
+                      {sug}
+                    </button>
+                  ))}
+                </div>
+              )}
 
-          {activeConv?.messages.map((msg, index) => (
-            <div 
+              {pendingBooks.length > 0 && (
+                <p className="text-[9px] font-semibold text-amber-600 dark:text-amber-400">
+                  Some documents are still processing or need review.
+                </p>
+              )}
+            </div>
+          ) : activeConv?.messages.map((msg, index) => (
+            <div
               key={index}
               className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}
             >

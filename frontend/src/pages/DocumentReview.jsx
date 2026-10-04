@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { useParams, useNavigate, Link } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom';
 import { api } from '../services/api';
 import { useDraftPersistence } from '../hooks/useDraftPersistence';
+import { setNavigationGuard, clearNavigationGuard } from '../utils/navigationGuard';
 import {
   ArrowLeft,
   ZoomIn,
@@ -48,6 +49,7 @@ function renderHighlightedText(text) {
 export default function DocumentReview() {
   const { id: bookId } = useParams();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [pages, setPages] = useState([]);
   const [bookName, setBookName] = useState('');
@@ -117,8 +119,20 @@ export default function DocumentReview() {
         setBookName(status.name);
         setBookStatus(status.status);
         setPages(pageList);
+
+        // Priority: a restored draft's page (applied by the separate
+        // effect below, once useDraftPersistence's mount-time restore
+        // completes -- it overrides whatever is picked here) > ?page=N
+        // from the URL, if it's a real page of this document > the first
+        // page still needing review > page 1.
+        const pageParamRaw = searchParams.get('page');
+        const pageParam = pageParamRaw !== null ? Number(pageParamRaw) : null;
+        const validFromUrl = pageParam != null && pageList.some((p) => p.page_number === pageParam)
+          ? pageParam
+          : null;
         const firstUnapproved = pageList.find((p) => p.review_status === 'needs_review');
-        setCurrentPageNumber((firstUnapproved || pageList[0])?.page_number ?? null);
+        const initialPage = validFromUrl ?? firstUnapproved?.page_number ?? pageList[0]?.page_number ?? null;
+        setCurrentPageNumber(initialPage);
         setLoadError('');
       } catch (err) {
         if (!ignore) setLoadError(err.message || 'Could not load this document for review.');
@@ -127,7 +141,27 @@ export default function DocumentReview() {
       }
     })();
     return () => { ignore = true; };
+    // searchParams is deliberately read but not a dependency -- this is a
+    // read-once-at-mount initial pick, not a reactive sync with the URL
+    // (the effect below pushes currentPageNumber back into the URL, which
+    // would otherwise make this effect's own writes loop back into itself).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bookId]);
+
+  // Keeps ?page=N in the URL pointing at whatever page is actually open,
+  // with history replaced (not pushed) so Previous/Next/thumbnail clicks
+  // don't pile up browser-back entries one per page.
+  useEffect(() => {
+    if (currentPageNumber == null) return;
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set('page', String(currentPageNumber));
+        return next;
+      },
+      { replace: true }
+    );
+  }, [currentPageNumber, setSearchParams]);
 
   // Once pages have loaded and a draft was restored (see useDraftPersistence
   // above), jump straight to the page it belongs to instead of whatever the
@@ -202,6 +236,20 @@ export default function DocumentReview() {
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
   }, [isDirty]);
+
+  // Lets a Sidebar nav click ask this page first, via a ref so the guard
+  // itself only needs registering once (not re-registered on every isDirty
+  // change) while still always checking the latest value.
+  const isDirtyRef = useRef(isDirty);
+  useEffect(() => { isDirtyRef.current = isDirty; }, [isDirty]);
+
+  useEffect(() => {
+    setNavigationGuard(() => {
+      if (!isDirtyRef.current) return true;
+      return window.confirm('You have unsaved changes on this page. Discard them?');
+    });
+    return () => clearNavigationGuard();
+  }, []);
 
   // Once every page is approved (indexingPhase flips on), poll the book's
   // own status until the background chunk+embed job finishes.

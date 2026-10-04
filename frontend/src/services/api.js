@@ -123,9 +123,16 @@ async function request(endpoint, options = {}) {
       }
       throw new Error(detail);
     }
-    // Clear auth on unauthorized and dispatch event or handle redirect
-    setToken(null);
-    setUsername(null);
+    // Don't clear the token/username here -- just report the 401 and let
+    // AuthProvider's 'auth-expired' listener (performLogout) do it, in the
+    // right order. performLogout dispatches 'before-logout' *before*
+    // clearing anything, so pages with unsaved work can still resolve
+    // userScopedKey() (which reads username from localStorage) to the
+    // right per-user slot. If we cleared the username here first, that
+    // event would fire with no username left to scope the draft key to,
+    // and the save would land in the wrong (unscoped) slot -- never found
+    // again after the next login. Mirrors api.auth.logout(), which also
+    // deliberately leaves the username alone.
     window.dispatchEvent(new Event('auth-expired'));
     throw new Error('Session expired. Please log in again.');
   }
