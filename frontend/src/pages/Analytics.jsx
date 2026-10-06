@@ -10,8 +10,10 @@ import {
 } from 'lucide-react';
 import { api } from '../services/api';
 import { getActiveSecondsInLastNDays, formatDuration } from '../hooks/useActiveTime';
-import { getQuizStats, getTopicBreakdown } from '../hooks/useQuizHistory';
+import { getQuizStats, getTopicBreakdown, getLevelStats } from '../hooks/useQuizHistory';
 import { getTotalQueries, getQueriesByDay } from '../hooks/useQueryHistory';
+import useBloomLevels from '../hooks/useBloomLevels';
+import { getBloomColor } from '../utils/bloomColors';
 
 const DONUT_COLORS = ['#3F7566', '#D97706', '#3D8B37', '#0EA5E9', '#A855F7', '#8CA6A0'];
 
@@ -26,8 +28,10 @@ export default function Analytics() {
   const [studySeconds, setStudySeconds] = useState(() => getActiveSecondsInLastNDays(14));
   const [quizStats, setQuizStats] = useState(() => getQuizStats());
   const [topicBreakdown, setTopicBreakdown] = useState(() => getTopicBreakdown());
+  const [levelStats, setLevelStats] = useState(() => getLevelStats());
   const [totalQueries, setTotalQueries] = useState(() => getTotalQueries());
   const [lineChartData, setLineChartData] = useState(() => getQueriesByDay(7));
+  const { levels: bloomLevels } = useBloomLevels();
 
   // Real uploaded documents, fetched from the backend — the donut chart is
   // built from your actual library, not fixed placeholder subjects.
@@ -40,6 +44,7 @@ export default function Analytics() {
       setStudySeconds(getActiveSecondsInLastNDays(14));
       setQuizStats(getQuizStats());
       setTopicBreakdown(getTopicBreakdown());
+      setLevelStats(getLevelStats());
       setTotalQueries(getTotalQueries());
       setLineChartData(getQueriesByDay(7));
     };
@@ -361,6 +366,42 @@ export default function Analytics() {
           )}
         </div>
 
+      </div>
+
+      {/* Accuracy by Bloom's level -- real per-level quiz results, hand-drawn bars like the rest of this page */}
+      <div className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm space-y-4">
+        <div>
+          <h3 className="text-xs font-bold text-slate-900 dark:text-white">
+            Accuracy by Bloom&apos;s level
+          </h3>
+          <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-1">
+            How you've scored at each level of thinking, across every quiz you've taken.
+          </p>
+        </div>
+
+        <div className="space-y-3">
+          {bloomLevels.map((lvl) => {
+            const stat = levelStats[lvl.key];
+            const colors = getBloomColor(lvl.key);
+            const roundedPct = stat ? Math.round(stat.percentage) : 0;
+            return (
+              <div key={lvl.key} className="space-y-1.5">
+                <div className="flex justify-between items-center text-[10px] font-bold">
+                  <span className="text-slate-600 dark:text-slate-300">{lvl.label}</span>
+                  <span className="text-slate-400 dark:text-slate-500">
+                    {stat ? `${roundedPct}% (${stat.correct}/${stat.total})` : 'No data yet'}
+                  </span>
+                </div>
+                <div className="w-full bg-slate-100 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all duration-500 ${colors.bar}`}
+                    style={{ width: stat ? `${roundedPct}%` : '0%' }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {/* Lower Row: AI Study Advisor Feedback, generated from real quiz history */}

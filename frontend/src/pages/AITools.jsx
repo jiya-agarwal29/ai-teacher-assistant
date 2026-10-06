@@ -1,8 +1,11 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
 import { recordQuizAttempt } from '../hooks/useQuizHistory';
+import useBloomLevels from '../hooks/useBloomLevels';
+import { getBloomColor } from '../utils/bloomColors';
 import MessageWithDocsLink from '../components/MessageWithDocsLink';
+import BloomBadge from '../components/BloomBadge';
 import {
   Brain, 
   Search, 
@@ -29,6 +32,11 @@ const normalizeFillBlankAnswer = (s) => (s || '')
   .toLowerCase()
   .replace(/^(a|an|the)\s+/i, '')
   .replace(/[.,!?;:'"]+$/, '');
+
+// localStorage keys for the quiz builder's remembered Bloom-level/count choice.
+const BLOOM_LEVELS_STORAGE_KEY = 'quiz_bloom_levels';
+const BLOOM_COUNT_STORAGE_KEY = 'quiz_bloom_count';
+const QUESTION_COUNT_OPTIONS = [6, 9, 12];
 
 export default function AITools() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -60,28 +68,94 @@ export default function AITools() {
   const [shortAnswerGrades, setShortAnswerGrades] = useState({}); // { questionId: 'correct' | 'incorrect' }
   const [submittedQuiz, setSubmittedQuiz] = useState(false);
 
+  // Bloom's level picker + question count, remembered per user.
+  const { levels: bloomLevels, byKey: bloomLevelsByKey } = useBloomLevels();
+  const [selectedLevels, setSelectedLevels] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(userScopedKey(BLOOM_LEVELS_STORAGE_KEY)) || 'null');
+      if (Array.isArray(saved) && saved.length > 0) return saved;
+    } catch {
+      // Malformed saved value -- fall through to the "all levels" default below.
+    }
+    return null; // null = not decided yet; defaults to all once bloomLevels loads
+  });
+  const [questionCount, setQuestionCount] = useState(() => {
+    const saved = parseInt(localStorage.getItem(userScopedKey(BLOOM_COUNT_STORAGE_KEY)) || '', 10);
+    return QUESTION_COUNT_OPTIONS.includes(saved) ? saved : 6;
+  });
+
+  // All six levels are on by default -- but the actual key list comes from
+  // the backend (bloomLevels), never hard-coded here. Derived at render
+  // time (no effect needed) so it's correct the instant bloomLevels loads,
+  // whether or not the user has ever saved a preference of their own.
+  const effectiveLevels = selectedLevels !== null ? selectedLevels : bloomLevels.map((lvl) => lvl.key);
+
+  useEffect(() => {
+    if (selectedLevels && selectedLevels.length > 0) {
+      localStorage.setItem(userScopedKey(BLOOM_LEVELS_STORAGE_KEY), JSON.stringify(selectedLevels));
+    }
+  }, [selectedLevels]);
+
+  useEffect(() => {
+    localStorage.setItem(userScopedKey(BLOOM_COUNT_STORAGE_KEY), String(questionCount));
+  }, [questionCount]);
+
+  const toggleLevel = (key) => {
+    setSelectedLevels((prev) => {
+      const current = prev !== null ? prev : bloomLevels.map((lvl) => lvl.key);
+      if (current.includes(key)) {
+        if (current.length === 1) return current; // at least one must stay selected
+        return current.filter((k) => k !== key);
+      }
+      return [...current, key];
+    });
+  };
+
+  const selectAllLevels = () => setSelectedLevels(bloomLevels.map((lvl) => lvl.key));
+  const selectHigherOrderLevels = () => {
+    const higherOrder = bloomLevels.filter((lvl) => lvl.order >= 3).map((lvl) => lvl.key);
+    if (higherOrder.length > 0) setSelectedLevels(higherOrder);
+  };
+
+  // Shared by calculateScore(), the per-question result display, and the
+  // "Score by level" breakdown, so all three always agree on what counts
+  // as correct for a given question type.
+  const isCorrectAnswer = (q) => {
+    if (q.type === 'mcq' || q.type === 'true_false' || !q.type) {
+      return selectedAnswers[q.id] === q.correctAnswer;
+    } else if (q.type === 'fill_blank') {
+      return normalizeFillBlankAnswer(fillBlankAnswers[q.id]) === normalizeFillBlankAnswer(q.correctAnswer);
+    } else if (['short_answer', 'long_answer', 'scenario', 'viva', 'interview'].includes(q.type)) {
+      return shortAnswerGrades[q.id] === 'correct';
+    }
+    return false;
+  };
+
   const calculateScore = () => {
     let correctCount = 0;
-    let totalCount = quizQuestions.length;
-    
+    const totalCount = quizQuestions.length;
+
     quizQuestions.forEach((q) => {
-      if (q.type === 'mcq' || q.type === 'true_false' || !q.type) {
-        if (selectedAnswers[q.id] === q.correctAnswer) {
-          correctCount++;
-        }
-      } else if (q.type === 'fill_blank') {
-        if (normalizeFillBlankAnswer(fillBlankAnswers[q.id]) === normalizeFillBlankAnswer(q.correctAnswer)) {
-          correctCount++;
-        }
-      } else if (['short_answer', 'long_answer', 'scenario', 'viva', 'interview'].includes(q.type)) {
-        if (shortAnswerGrades[q.id] === 'correct') {
-          correctCount++;
-        }
-      }
+      if (isCorrectAnswer(q)) correctCount++;
     });
-    
+
     const percentage = totalCount > 0 ? Math.round((correctCount / totalCount) * 100) : 0;
     return { correctCount, totalCount, percentage };
+  };
+
+  // Per Bloom-level correct/total for the levels actually present in this
+  // quiz (an AI-generated quiz tags every question with bloom_level; a
+  // quiz parsed from raw fallback text has none, so it returns {}).
+  const getScoreByLevel = () => {
+    const byLevel = {};
+    quizQuestions.forEach((q) => {
+      if (!q.bloom_level) return;
+      const existing = byLevel[q.bloom_level] || { correct: 0, total: 0 };
+      existing.total += 1;
+      if (isCorrectAnswer(q)) existing.correct += 1;
+      byLevel[q.bloom_level] = existing;
+    });
+    return byLevel;
   };
 
 
@@ -169,7 +243,7 @@ export default function AITools() {
     setError('');
 
     try {
-      const res = await api.quiz.generate(quizTopic);
+      const res = await api.quiz.generate(quizTopic, { levels: effectiveLevels, count: questionCount });
       setQuizResult(res.quiz);
       
       if (res.questions && res.questions.length > 0) {
@@ -381,20 +455,97 @@ export default function AITools() {
             <div className="space-y-6">
               <div className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm">
                 <h3 className="text-xs font-bold text-slate-900 dark:text-white mb-3">Topic-based Quiz Generation</h3>
-                <form onSubmit={handleGenerateQuiz} className="flex gap-3">
-                  <input 
+                <form onSubmit={handleGenerateQuiz} className="space-y-4">
+                  <input
                     type="text"
                     placeholder="e.g. Photosynthesis"
                     value={quizTopic}
                     onChange={(e) => setQuizTopic(e.target.value)}
-                    className="flex-grow px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
+                    className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
                   />
-                  <button 
-                    type="submit"
-                    className="px-5 py-3 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-500 text-white font-semibold text-xs tracking-tight hover:scale-[1.01] transition-all"
-                  >
-                    Build Test
-                  </button>
+
+                  {/* Bloom's level picker */}
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
+                        Bloom&apos;s levels
+                      </span>
+                      <div className="flex gap-1.5">
+                        <button
+                          type="button"
+                          onClick={selectAllLevels}
+                          className="px-2.5 py-1 rounded-lg text-[9px] font-bold bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                        >
+                          All
+                        </button>
+                        <button
+                          type="button"
+                          onClick={selectHigherOrderLevels}
+                          className="px-2.5 py-1 rounded-lg text-[9px] font-bold bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                        >
+                          Higher-order only
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2">
+                      {bloomLevels.map((lvl) => {
+                        const active = effectiveLevels.includes(lvl.key);
+                        const colors = getBloomColor(lvl.key);
+                        return (
+                          <button
+                            key={lvl.key}
+                            type="button"
+                            title={lvl.description}
+                            onClick={() => toggleLevel(lvl.key)}
+                            className={`px-3 py-1.5 rounded-full text-[10px] font-bold border transition-all ${
+                              active
+                                ? colors.solid
+                                : 'border-slate-200 dark:border-slate-800 text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/30'
+                            }`}
+                          >
+                            {lvl.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <p className="text-[9px] text-slate-400 dark:text-slate-500">
+                      Remember &amp; Understand check memory; Apply to Create check thinking.
+                    </p>
+                  </div>
+
+                  {/* Number of questions */}
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
+                      Number of questions
+                    </span>
+                    <div className="flex gap-1.5">
+                      {QUESTION_COUNT_OPTIONS.map((n) => (
+                        <button
+                          key={n}
+                          type="button"
+                          onClick={() => setQuestionCount(n)}
+                          className={`w-9 py-1 rounded-lg text-[10px] font-bold border transition-all ${
+                            questionCount === n
+                              ? 'bg-violet-600 text-white border-violet-600'
+                              : 'border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/30'
+                          }`}
+                        >
+                          {n}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex justify-end">
+                    <button
+                      type="submit"
+                      className="px-5 py-3 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-500 text-white font-semibold text-xs tracking-tight hover:scale-[1.01] transition-all"
+                    >
+                      Build Test
+                    </button>
+                  </div>
                 </form>
               </div>
 
@@ -408,7 +559,12 @@ export default function AITools() {
                         onClick={() => {
                           const result = calculateScore();
                           if (result.totalCount > 0) {
-                            recordQuizAttempt({ topic: quizTopic, correct: result.correctCount, total: result.totalCount });
+                            recordQuizAttempt({
+                              topic: quizTopic,
+                              correct: result.correctCount,
+                              total: result.totalCount,
+                              byLevel: getScoreByLevel()
+                            });
                           }
                           setSubmittedQuiz(true);
                         }}
@@ -474,16 +630,32 @@ export default function AITools() {
                     </div>
                   )}
 
+                  {/* SCORE BY BLOOM'S LEVEL -- only the levels present in this quiz */}
+                  {submittedQuiz && Object.keys(getScoreByLevel()).length > 0 && (
+                    <div className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm space-y-3 animate-fadeIn">
+                      <h4 className="text-xs font-bold text-slate-900 dark:text-white">Score by level</h4>
+                      <div className="space-y-2">
+                        {bloomLevels
+                          .filter((lvl) => getScoreByLevel()[lvl.key])
+                          .map((lvl) => {
+                            const { correct, total } = getScoreByLevel()[lvl.key];
+                            const pct = total > 0 ? Math.round((correct / total) * 100) : 0;
+                            return (
+                              <div key={lvl.key} className="flex items-center justify-between gap-3">
+                                <BloomBadge levelKey={lvl.key} />
+                                <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400">
+                                  {correct}/{total} ({pct}%)
+                                </span>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="space-y-4">
                     {quizQuestions.map((q) => {
-                      let isCorrect = false;
-                      if (q.type === 'mcq' || q.type === 'true_false' || !q.type) {
-                        isCorrect = selectedAnswers[q.id] === q.correctAnswer;
-                      } else if (q.type === 'fill_blank') {
-                        isCorrect = normalizeFillBlankAnswer(fillBlankAnswers[q.id]) === normalizeFillBlankAnswer(q.correctAnswer);
-                      } else if (['short_answer', 'long_answer', 'scenario', 'viva', 'interview'].includes(q.type)) {
-                        isCorrect = shortAnswerGrades[q.id] === 'correct';
-                      }
+                      const isCorrect = isCorrectAnswer(q);
 
                       return (
                         <div 
@@ -494,19 +666,37 @@ export default function AITools() {
                             <h4 className="text-xs font-bold text-slate-950 dark:text-white">
                               Question {q.id}: {q.question}
                             </h4>
-                            {/* Question Type Badge */}
-                            <span className="px-2.5 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
-                              {q.type === 'mcq' && 'MCQ'}
-                              {q.type === 'true_false' && 'True / False'}
-                              {q.type === 'fill_blank' && 'Fill in the Blank'}
-                              {q.type === 'short_answer' && 'Short Answer'}
-                              {q.type === 'long_answer' && 'Long Answer'}
-                              {q.type === 'scenario' && 'Scenario-based'}
-                              {q.type === 'viva' && 'Viva Question'}
-                              {q.type === 'interview' && 'Interview Question'}
-                              {!q.type && 'MCQ'}
-                            </span>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {q.bloom_level && <BloomBadge levelKey={q.bloom_level} />}
+                              {/* Question Type Badge */}
+                              <span className="px-2.5 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 whitespace-nowrap">
+                                {q.type === 'mcq' && 'MCQ'}
+                                {q.type === 'true_false' && 'True / False'}
+                                {q.type === 'fill_blank' && 'Fill in the Blank'}
+                                {q.type === 'short_answer' && 'Short Answer'}
+                                {q.type === 'long_answer' && 'Long Answer'}
+                                {q.type === 'scenario' && 'Scenario-based'}
+                                {q.type === 'viva' && 'Viva Question'}
+                                {q.type === 'interview' && 'Interview Question'}
+                                {!q.type && 'MCQ'}
+                              </span>
+                            </div>
                           </div>
+
+                          {(q.bloom_check === 'flagged' || q.source) && (
+                            <div className="flex flex-wrap items-center gap-3 -mt-2">
+                              {q.bloom_check === 'flagged' && (
+                                <span className="text-[9px] font-semibold text-amber-600 dark:text-amber-400">
+                                  Level unsure — looks more like {bloomLevelsByKey[q.detected_level]?.label || q.detected_level}
+                                </span>
+                              )}
+                              {q.source && (
+                                <span className="text-[9px] font-semibold text-slate-400 dark:text-slate-500">
+                                  Source: {q.source.book_name}{q.source.page_number != null ? `, p.${q.source.page_number}` : ''}
+                                </span>
+                              )}
+                            </div>
+                          )}
 
                           {/* 1. MCQ and True/False Rendering */}
                           {(q.type === 'mcq' || q.type === 'true_false' || !q.type) && (

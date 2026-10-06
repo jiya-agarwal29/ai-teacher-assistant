@@ -416,12 +416,31 @@ export const api = {
   
   quiz: {
     /**
-     * GET /generate-quiz?topic=...
+     * GET /generate-quiz?topic=...&levels=...&count=...
+     * `levels` (array of level keys, or an already-comma-joined string)
+     * and `count` are both optional -- omitting them keeps the backend's
+     * own defaults (all six levels, count=6), so existing callers that
+     * only pass `topic` keep working unchanged.
      */
-    generate: (topic) => {
+    generate: (topic, { levels, count } = {}) => {
       const queryParams = new URLSearchParams({ topic });
+      if (levels) {
+        queryParams.append('levels', Array.isArray(levels) ? levels.join(',') : levels);
+      }
+      if (count !== undefined && count !== null) {
+        queryParams.append('count', String(count));
+      }
       return request(`/generate-quiz?${queryParams.toString()}`);
     }
+  },
+
+  bloom: {
+    /**
+     * GET /bloom/levels -- the six Bloom's taxonomy levels (key, label,
+     * order, description, question_types), the single source of truth for
+     * the quiz builder's level picker and the BloomBadge component.
+     */
+    levels: () => request('/bloom/levels')
   },
 
   tools: {
