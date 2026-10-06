@@ -102,3 +102,44 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True)
     password = Column(String)
+
+
+class Question(Base):
+    """
+    A single quiz question generated for a user (Phase 4B), tagged with the
+    Bloom's taxonomy level it was written for. book_id/page_id point at the
+    source chunk it was grounded in when known (the AI quiz path); both are
+    null for a question from the local hybrid fallback generator, which
+    doesn't track a single source chunk.
+
+    bloom_check records how that level was arrived at:
+      - "verified": an independent classifier agreed with the intended level.
+      - "flagged": the classifier disagreed, even after one regeneration
+        attempt -- detected_level holds what the classifier thought instead.
+      - "unchecked": no classifier check ran (local hybrid fallback, or the
+        checker was unavailable).
+      - "teacher_set": a teacher edited bloom_level directly via PATCH.
+
+    Deleted explicitly by DELETE /books/{id} (not a cascade relationship)
+    since a book's questions are a separate concern from its pages/chunks.
+    """
+    __tablename__ = "questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    book_id = Column(Integer, ForeignKey("books.id"), index=True, nullable=True)
+    page_id = Column(Integer, ForeignKey("pages.id"), nullable=True)
+
+    topic = Column(String, nullable=False)
+    type = Column(String, nullable=False)
+
+    bloom_level = Column(String, nullable=False)
+    bloom_check = Column(String, default="unchecked", nullable=False)
+    detected_level = Column(String, nullable=True)
+
+    question = Column(Text, nullable=False)
+    options = Column(Text, nullable=True)
+    correct_answer = Column(Text, nullable=False)
+    explanation = Column(Text, nullable=False)
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)

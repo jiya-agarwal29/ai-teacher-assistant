@@ -15,10 +15,10 @@ pages_done/created_at) if missing -- every book that existed before these
 columns did was fully processed synchronously, so it backfills
 status="ready" on those rows (never "processing" or "failed", which only
 apply to the new background pipeline). Also adds the Phase 3B OCR columns
-(books.review_ocr, and the whole document_pages table) if missing. Safe to
-run more than once: every ALTER TABLE / CREATE TABLE / CREATE INDEX is
-skipped once it already exists, and every UPDATE only ever touches rows
-that still need it.
+(books.review_ocr, and the whole document_pages table) if missing. Also
+creates the Phase 4B questions table if missing. Safe to run more than
+once: every ALTER TABLE / CREATE TABLE / CREATE INDEX is skipped once it
+already exists, and every UPDATE only ever touches rows that still need it.
 
 Usage:
     python migrate.py <username>
@@ -28,7 +28,8 @@ import os
 import sqlite3
 import sys
 
-from database import DATABASE_URL
+from database import DATABASE_URL, engine
+from models import Base
 
 DB_PATH = DATABASE_URL.replace("sqlite:///", "", 1)
 
@@ -52,6 +53,11 @@ def column_exists(cursor, table, column):
 def index_exists(cursor, table, index_name):
     cursor.execute(f"PRAGMA index_list({table})")
     return any(row[1] == index_name for row in cursor.fetchall())
+
+
+def table_exists(cursor, table):
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+    return cursor.fetchone() is not None
 
 
 def main():
@@ -154,6 +160,14 @@ def main():
     conn.commit()
     logger.info("Ensured document_pages table and index exist.")
 
+    # Phase 4B: the questions table. create_all() only ever creates tables
+    # that don't exist yet (every other table here is left untouched), so
+    # it's safe even though this file otherwise speaks raw sqlite3 -- but it
+    # needs its own SQLAlchemy engine connection, so check existence here
+    # (on the already-open cursor) and run create_all() after conn.close()
+    # below, rather than holding both connections open at once.
+    questions_table_already_existed = table_exists(cursor, "questions")
+
     cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()
 
@@ -170,6 +184,12 @@ def main():
     cursor.execute("UPDATE books SET user_id = ? WHERE user_id IS NULL", (user_id,))
     conn.commit()
     conn.close()
+
+    if questions_table_already_existed:
+        logger.info("questions table already exists, skipping create_all.")
+    else:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Created questions table.")
 
     logger.info("Assigned %d previously-unowned book(s) to '%s' (user_id=%d).", unowned_count, username, user_id)
 

@@ -1,4 +1,5 @@
 import glob
+import json
 import logging
 import os
 import re
@@ -16,6 +17,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
+import bloom
 import embeddings
 import jobs
 import llm
@@ -33,7 +35,7 @@ from retrieval import retrieve, invalidate_cache, user_has_documents, user_has_a
 
 import database
 from database import engine, get_db
-from models import Base, Book, DocumentPage, Page, User
+from models import Base, Book, DocumentPage, Page, Question, User
 
 from auth import (
     create_access_token,
@@ -288,32 +290,223 @@ QUIZ_SCHEMA = {
                 "properties": {
                     "id": {"type": "integer"},
                     "type": {"type": "string", "enum": QUIZ_QUESTION_TYPES},
+                    "bloom_level": {"type": "string", "enum": bloom.level_keys()},
                     "question": {"type": "string"},
                     "options": {"type": "array", "items": {"type": "string"}},
                     "correctAnswer": {"type": "string"},
                     "explanation": {"type": "string"},
                     "source_index": {"type": "integer"}
                 },
-                "required": ["id", "type", "question", "correctAnswer", "explanation", "source_index"]
+                "required": [
+                    "id", "type", "bloom_level", "question",
+                    "correctAnswer", "explanation", "source_index"
+                ]
             }
         }
     },
     "required": ["questions"]
 }
 
+# The per-type/option-format rules shared by every question regardless of
+# Bloom level; the level-specific breakdown (which levels, how many of each,
+# their prompt_rules) is built separately per call by _bloom_level_prompt_block
+# since it depends on what the caller asked for.
 QUIZ_PROMPT_RULES = (
-    "Use ONLY the provided numbered sources -- never invent facts. Generate exactly "
-    "one question of each type: mcq, true_false, fill_blank, short_answer, "
-    "long_answer, scenario, viva, interview. No question's text may reveal or hint "
-    "at its own correct answer. For type mcq, provide exactly 4 distinct, plausible "
-    "options and set correctAnswer to the letter (A, B, C, or D) of the correct one. "
-    "For type true_false, set options to [\"True\", \"False\"] and correctAnswer to "
-    "\"A\" or \"B\" -- mix true and false answers across the quiz rather than always "
-    "picking the same one. For every other type, correctAnswer is the actual answer "
-    "text (not a letter) and options is omitted. Every question must test a "
-    "different concept from the sources, and every question needs a source_index: "
-    "the number of the source chunk it's grounded in."
+    "Use ONLY the provided numbered sources -- never invent facts. No question's "
+    "text may reveal or hint at its own correct answer. For type mcq, provide "
+    "exactly 4 distinct, plausible options and set correctAnswer to the letter "
+    "(A, B, C, or D) of the correct one. For type true_false, set options to "
+    "[\"True\", \"False\"] and correctAnswer to \"A\" or \"B\" -- mix true and false "
+    "answers across the quiz rather than always picking the same one. For every "
+    "other type, correctAnswer is the actual answer text (not a letter) and "
+    "options is omitted. For long_answer, scenario, viva and interview questions, "
+    "the explanation must list the KEY POINTS a good answer should include (a "
+    "short marking guide), not just a single correct sentence. Every question "
+    "must test a different concept from the sources, every question needs a "
+    "source_index (the number of the source chunk it's grounded in) and a "
+    "bloom_level matching exactly the level it was written for below."
 )
+
+# A question's Bloom level is chosen when it's written (here, by the prompt
+# below) and only ever checked afterward -- never derived from its "type".
+# See bloom.py's module docstring.
+CLASSIFIER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "level": {"type": "string", "enum": bloom.level_keys()}
+                },
+                "required": ["id", "level"]
+            }
+        }
+    },
+    "required": ["items"]
+}
+
+
+def _bloom_level_prompt_block(level_counts: dict) -> str:
+    """One bullet per requested level with a non-zero count: its label,
+    description, prompt_rules, allowed question types and how many to write."""
+    lines = []
+    for key, count in level_counts.items():
+        if count <= 0:
+            continue
+        level = bloom.get_level(key)
+        allowed = ", ".join(level.question_types)
+        lines.append(
+            f"- {level.label} -- write exactly {count} question(s) at this level. "
+            f"{level.description} {level.prompt_rules} Allowed question types: {allowed}."
+        )
+    return "\n".join(lines)
+
+
+def _build_quiz_prompt(topic: str, top_pages, level_counts: dict) -> str:
+    numbered_sources = "\n\n".join(
+        f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
+    )
+    return (
+        f"Create a quiz about '{topic}' based on the numbered sources below.\n\n"
+        f"{QUIZ_PROMPT_RULES}\n\n"
+        f"Bloom's taxonomy levels to write:\n{_bloom_level_prompt_block(level_counts)}\n\n"
+        f"Sources:\n{numbered_sources}"
+    )
+
+
+def _bloom_level_descriptions_block() -> str:
+    return "\n".join(f"- {level.key}: {level.description}" for level in bloom.LEVELS)
+
+
+def _classify_questions_with_gemini(question_texts: list):
+    """
+    Asks Gemini to classify each question's Bloom level independently, from
+    the question text alone -- it is never told which level the question was
+    written for, since this is a check on that choice, not a source of it.
+    Returns a list of levels (or None entries) aligned by position with
+    `question_texts`, or None if the whole response wasn't shaped as
+    expected (treated the same as llm.LLMUnavailableError by the caller:
+    leave the affected questions unchecked rather than fail the quiz).
+    """
+    numbered = "\n".join(f"{i}. {text}" for i, text in enumerate(question_texts, start=1))
+    prompt = (
+        "Classify each numbered question below into exactly one Bloom's "
+        "taxonomy level, based only on what it asks the student to do. "
+        f"The six levels are:\n{_bloom_level_descriptions_block()}\n\n"
+        f"Questions:\n{numbered}"
+    )
+    result = llm.generate_json(prompt, schema=CLASSIFIER_SCHEMA)
+
+    if not isinstance(result, dict):
+        return None
+    raw_items = result.get("items")
+    if not isinstance(raw_items, list):
+        return None
+
+    detected_by_position = {}
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            continue
+        position, level = entry.get("id"), entry.get("level")
+        if isinstance(position, int) and bloom.is_valid_level(level):
+            detected_by_position[position] = level
+
+    return [detected_by_position.get(i) for i in range(1, len(question_texts) + 1)]
+
+
+def _check_and_fix_bloom_levels(questions: list, topic: str, top_pages, levels: list) -> list:
+    """
+    Runs the Bloom level check on `questions` (each already carrying the
+    bloom_level it was generated for) and fixes up any disagreement by
+    regenerating just those slots once. Mutates and returns `questions`
+    with bloom_check/detected_level set on every item. Never raises -- an
+    unavailable or malformed checker call just leaves the affected
+    questions bloom_check="unchecked" instead of failing the whole quiz.
+    """
+    for q in questions:
+        verb_level = bloom.classify_by_verbs(q["question"])["level"]
+        if verb_level and verb_level != q["bloom_level"]:
+            logger.debug(
+                "classify_by_verbs disagrees with intended level (intended=%s, verb=%s): %r",
+                q["bloom_level"], verb_level, q["question"][:80]
+            )
+
+    try:
+        detected_levels = _classify_questions_with_gemini([q["question"] for q in questions])
+    except llm.LLMUnavailableError:
+        detected_levels = None
+
+    if detected_levels is None:
+        for q in questions:
+            q["bloom_check"] = "unchecked"
+            q["detected_level"] = None
+        return questions
+
+    mismatched_indices = []
+    for i, q in enumerate(questions):
+        detected = detected_levels[i]
+        if detected == q["bloom_level"]:
+            q["bloom_check"] = "verified"
+            q["detected_level"] = None
+        else:
+            q["bloom_check"] = "flagged"
+            q["detected_level"] = detected
+            mismatched_indices.append(i)
+
+    if not mismatched_indices:
+        return questions
+
+    regen_counts = {}
+    for i in mismatched_indices:
+        level = questions[i]["bloom_level"]
+        regen_counts[level] = regen_counts.get(level, 0) + 1
+
+    try:
+        result = llm.generate_json(
+            _build_quiz_prompt(topic, top_pages, regen_counts), schema=QUIZ_SCHEMA
+        )
+        raw_regenerated = result.get("questions", []) if isinstance(result, dict) else []
+    except llm.LLMUnavailableError:
+        raw_regenerated = []
+
+    regenerated = _validate_quiz_questions(raw_regenerated, len(top_pages), list(regen_counts.keys()))
+    pool_by_level = {}
+    for q in regenerated:
+        pool_by_level.setdefault(q["bloom_level"], []).append(q)
+
+    replaced_indices = []
+    for i in mismatched_indices:
+        pool = pool_by_level.get(questions[i]["bloom_level"]) or []
+        if pool:
+            replacement = pool.pop(0)
+            replacement["id"] = questions[i]["id"]
+            questions[i] = replacement
+            replaced_indices.append(i)
+        # else: no usable replacement came back -- keep the original, already flagged.
+
+    if replaced_indices:
+        try:
+            recheck = _classify_questions_with_gemini([questions[i]["question"] for i in replaced_indices])
+        except llm.LLMUnavailableError:
+            recheck = None
+
+        for position, i in enumerate(replaced_indices):
+            if recheck is None:
+                questions[i]["bloom_check"] = "unchecked"
+                questions[i]["detected_level"] = None
+                continue
+            detected = recheck[position]
+            if detected == questions[i]["bloom_level"]:
+                questions[i]["bloom_check"] = "verified"
+                questions[i]["detected_level"] = None
+            else:
+                questions[i]["bloom_check"] = "flagged"
+                questions[i]["detected_level"] = detected
+
+    return questions
 
 
 class RegisterRequest(BaseModel):
@@ -940,6 +1133,10 @@ def delete_book(
 
     book = _get_owned_book_or_404(db, book_id, current_user.id)
 
+    # Questions aren't a cascade relationship on Book (a separate concern
+    # from its pages/chunks) -- delete them explicitly.
+    db.query(Question).filter(Question.book_id == book_id).delete()
+
     # Cascades to the book's pages via the Book.pages relationship
     db.delete(book)
     db.commit()
@@ -1285,15 +1482,18 @@ def ai_tutor(
     return _answer_question(payload.question, current_user, db)
 
 
-def _validate_quiz_questions(raw_questions, num_sources: int):
+def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: list):
     """
     Validates and cleans Gemini's raw quiz question list: correct option
     counts, a valid correctAnswer, no question leaking its own answer (for
     types where correctAnswer is real answer text rather than a letter),
-    and no duplicate questions. Invalid questions are dropped rather than
-    failing the whole quiz. Returns cleaned question dicts -- id/type/
-    question/options?/correctAnswer/explanation, matching the existing
-    response shape (source_index is internal-only and stripped here).
+    a bloom_level that's both one of `requested_levels` and a level this
+    question's type is actually allowed at, and no duplicate questions.
+    Invalid questions are dropped rather than failing the whole quiz.
+    Returns cleaned question dicts -- id/type/bloom_level/question/options?/
+    correctAnswer/explanation/source_index, matching the existing response
+    shape plus the two Phase 4B fields the caller needs (bloom_level,
+    source_index) before building the final API response.
     """
     if not isinstance(raw_questions, list):
         return []
@@ -1306,6 +1506,7 @@ def _validate_quiz_questions(raw_questions, num_sources: int):
             continue
 
         q_type = q.get("type")
+        bloom_level = q.get("bloom_level")
         question_text = q.get("question")
         correct_answer = q.get("correctAnswer")
         explanation = q.get("explanation")
@@ -1313,6 +1514,10 @@ def _validate_quiz_questions(raw_questions, num_sources: int):
         options = q.get("options")
 
         if q_type not in QUIZ_QUESTION_TYPES:
+            continue
+        if not bloom.is_valid_level(bloom_level) or bloom_level not in requested_levels:
+            continue
+        if q_type not in bloom.get_level(bloom_level).question_types:
             continue
         if not isinstance(question_text, str) or not question_text.strip():
             continue
@@ -1366,9 +1571,11 @@ def _validate_quiz_questions(raw_questions, num_sources: int):
         cleaned = {
             "id": len(valid) + 1,
             "type": q_type,
+            "bloom_level": bloom_level,
             "question": question_text.strip(),
             "correctAnswer": correct_answer.strip(),
-            "explanation": explanation.strip()
+            "explanation": explanation.strip(),
+            "source_index": source_index
         }
         if cleaned_options is not None:
             cleaned["options"] = cleaned_options
@@ -1377,32 +1584,105 @@ def _validate_quiz_questions(raw_questions, num_sources: int):
     return valid
 
 
-def _generate_quiz_with_gemini(topic: str, top_pages):
+def _generate_quiz_with_gemini(topic: str, top_pages, levels: list, level_counts: dict):
     """
-    Builds the numbered-source prompt, asks Gemini for a full quiz as
-    JSON, and validates/cleans the result. Returns (quiz_text, questions)
-    on success, or None if fewer than 3 valid questions remain even after
-    one retry -- the caller falls back to generate_quiz() (the local
-    hybrid generator) in that case. Raises NotImplementedError for
-    LLM_PROVIDER=local and llm.LLMUnavailableError on a persistently
-    unavailable provider, same as llm.generate_json() itself.
+    Builds the per-Bloom-level prompt, asks Gemini for a full quiz as JSON,
+    and validates/cleans the result. Returns the cleaned question list on
+    success, or None if fewer than 3 valid questions remain even after one
+    retry -- the caller falls back to generate_quiz() (the local hybrid
+    generator) in that case. Raises NotImplementedError for LLM_PROVIDER=local
+    and llm.LLMUnavailableError on a persistently unavailable provider, same
+    as llm.generate_json() itself. Does not run the Bloom level check --
+    that's the caller's job (_check_and_fix_bloom_levels), since it needs
+    the final assembled list, not whatever a single attempt happens to be.
     """
-    numbered_sources = "\n\n".join(
-        f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
-    )
-    prompt = (
-        f"Create a quiz about '{topic}' based on the numbered sources below.\n\n"
-        f"{QUIZ_PROMPT_RULES}\n\nSources:\n{numbered_sources}"
-    )
+    prompt = _build_quiz_prompt(topic, top_pages, level_counts)
 
     for _attempt in range(2):  # one retry if the first pass yields too few valid questions
         result = llm.generate_json(prompt, schema=QUIZ_SCHEMA)
         raw_questions = result.get("questions", []) if isinstance(result, dict) else []
-        questions = _validate_quiz_questions(raw_questions, len(top_pages))
+        questions = _validate_quiz_questions(raw_questions, len(top_pages), levels)
         if len(questions) >= 3:
-            return format_quiz_text(questions), questions
+            return questions
 
     return None
+
+
+QUESTION_CHECK_STATUSES = ("verified", "flagged", "unchecked", "teacher_set")
+MIN_QUIZ_QUESTION_COUNT = 1
+MAX_QUIZ_QUESTION_COUNT = 12
+
+
+def _resolve_question_source(db: Session, top_pages, source_index):
+    """
+    Maps a validated question's source_index back to the actual Page/Book it
+    was grounded in -- never trusting an id the model might have invented,
+    only the position within the same top_pages list the prompt was built
+    from. Returns (source_dict_or_None, book_id_or_None, page_id_or_None).
+    """
+    if not isinstance(source_index, int) or not (1 <= source_index <= len(top_pages)):
+        return None, None, None
+
+    _, page = top_pages[source_index - 1]
+    book = db.query(Book).filter(Book.id == page.book_id).first()
+    if not book:
+        return None, page.book_id, page.id
+
+    return {"book_name": book.name, "page_number": page.page_number}, page.book_id, page.id
+
+
+def _save_generated_questions(db: Session, user_id: int, topic: str, questions: list, top_pages) -> list:
+    """
+    Persists every question in `questions` as its own Question row and
+    returns the API response list for them -- the existing fields plus
+    question_id, bloom_level/bloom_label/bloom_check/detected_level and
+    source. `top_pages` resolves each question's source_index (absent
+    entirely for local hybrid-fallback questions, which get a null source).
+    """
+    pending = []
+    for q in questions:
+        source, book_id, page_id = _resolve_question_source(db, top_pages, q.get("source_index"))
+        db_question = Question(
+            user_id=user_id,
+            book_id=book_id,
+            page_id=page_id,
+            topic=topic,
+            type=q["type"],
+            bloom_level=q["bloom_level"],
+            bloom_check=q["bloom_check"],
+            detected_level=q.get("detected_level"),
+            question=q["question"],
+            options=json.dumps(q["options"]) if q.get("options") else None,
+            correct_answer=q["correctAnswer"],
+            explanation=q["explanation"],
+        )
+        db.add(db_question)
+        pending.append((q, db_question, source))
+
+    db.flush()
+
+    response_questions = []
+    for q, db_question, source in pending:
+        level = bloom.get_level(q["bloom_level"])
+        item = {
+            "id": q["id"],
+            "type": q["type"],
+            "question": q["question"],
+            "correctAnswer": q["correctAnswer"],
+            "explanation": q["explanation"],
+            "question_id": db_question.id,
+            "bloom_level": q["bloom_level"],
+            "bloom_label": level.label,
+            "bloom_check": q["bloom_check"],
+            "detected_level": q.get("detected_level"),
+            "source": source,
+        }
+        if "options" in q:
+            item["options"] = q["options"]
+        response_questions.append(item)
+
+    db.commit()
+    return response_questions
 
 
 @app.get("/generate-quiz")
@@ -1410,22 +1690,38 @@ def _generate_quiz_with_gemini(topic: str, top_pages):
 def generate_ai_quiz(
     request: Request,
     topic: str,
+    levels: str | None = None,
+    count: int = 6,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    try:
+        requested_levels = bloom.parse_levels(levels)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if not (MIN_QUIZ_QUESTION_COUNT <= count <= MAX_QUIZ_QUESTION_COUNT):
+        raise HTTPException(
+            status_code=422,
+            detail=f"count must be between {MIN_QUIZ_QUESTION_COUNT} and {MAX_QUIZ_QUESTION_COUNT}."
+        )
 
     if not user_has_documents(db, current_user.id):
         return {
             "topic": topic,
             "quiz": _pending_documents_message_or_none(db, current_user.id) or "Not enough information found in uploaded documents.",
-            "questions": []
+            "questions": [],
+            "levels": requested_levels,
+            "level_counts": {}
         }
 
     if needs_reembedding(db, current_user.id):
         return {
             "topic": topic,
             "quiz": "Your documents need re-indexing",
-            "questions": []
+            "questions": [],
+            "levels": requested_levels,
+            "level_counts": {}
         }
 
     top_pages = _retrieve_or_503(db, current_user.id, topic, top_k=5, apply_threshold=True)
@@ -1436,26 +1732,228 @@ def generate_ai_quiz(
         return {
             "topic": topic,
             "quiz": "Not enough information found in uploaded documents.",
-            "questions": []
+            "questions": [],
+            "levels": requested_levels,
+            "level_counts": {}
         }
 
+    level_counts = bloom.distribute(count, requested_levels)
+
     try:
-        result = _generate_quiz_with_gemini(topic, top_pages)
+        questions = _generate_quiz_with_gemini(topic, top_pages, requested_levels, level_counts)
     except NotImplementedError:
         # LLM_PROVIDER=local has no structured JSON output -- go straight
         # to the local hybrid quiz generator below.
-        result = None
+        questions = None
     except llm.LLMUnavailableError:
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
-    if result is None:
+    if questions is None:
+        # Fewer than 3 valid AI questions (or LLM_PROVIDER=local): fall back
+        # to the local hybrid generator, which knows nothing about Bloom
+        # levels -- label each question after the fact with the verb
+        # classifier instead (None -> remember, the safest default) and
+        # leave bloom_check "unchecked" since no independent check ran.
         context = "\n\n".join(page.content for _, page in top_pages)
         quiz_text, questions = generate_quiz(context, topic)
+        for q in questions:
+            q["bloom_level"] = bloom.classify_by_verbs(q["question"])["level"] or "remember"
+            q["bloom_check"] = "unchecked"
+            q["detected_level"] = None
     else:
-        quiz_text, questions = result
+        questions = _check_and_fix_bloom_levels(questions, topic, top_pages, requested_levels)
+        quiz_text = format_quiz_text(questions)
+
+    response_questions = _save_generated_questions(db, current_user.id, topic, questions, top_pages)
+
+    actual_level_counts = {}
+    for q in questions:
+        actual_level_counts[q["bloom_level"]] = actual_level_counts.get(q["bloom_level"], 0) + 1
 
     return {
         "topic": topic,
         "quiz": quiz_text,
-        "questions": questions
+        "questions": response_questions,
+        "levels": requested_levels,
+        "level_counts": actual_level_counts
     }
+
+
+# -----------------------------
+# PHASE 4B: BLOOM'S TAXONOMY LEVELS + SAVED QUESTIONS
+# -----------------------------
+@app.get("/bloom/levels")
+def get_bloom_levels(current_user: User = Depends(get_current_user)):
+    return [
+        {
+            "key": level.key,
+            "label": level.label,
+            "order": level.order,
+            "description": level.description,
+            "question_types": list(level.question_types)
+        }
+        for level in bloom.LEVELS
+    ]
+
+
+def _question_source(db: Session, question: Question):
+    if not question.book_id:
+        return None
+
+    book = db.query(Book).filter(Book.id == question.book_id).first()
+    if not book:
+        return None
+
+    page_number = None
+    if question.page_id:
+        page = db.query(Page).filter(Page.id == question.page_id).first()
+        if page:
+            page_number = page.page_number
+
+    return {"book_name": book.name, "page_number": page_number}
+
+
+def _question_summary(db: Session, question: Question) -> dict:
+    level = bloom.get_level(question.bloom_level)
+    return {
+        "question_id": question.id,
+        "topic": question.topic,
+        "type": question.type,
+        "bloom_level": question.bloom_level,
+        "bloom_label": level.label,
+        "bloom_check": question.bloom_check,
+        "detected_level": question.detected_level,
+        "question": question.question,
+        "options": json.loads(question.options) if question.options else None,
+        "correct_answer": question.correct_answer,
+        "explanation": question.explanation,
+        "created_at": question.created_at.isoformat(),
+        "source": _question_source(db, question)
+    }
+
+
+def _get_owned_question_or_404(db: Session, question_id: int, user_id: int) -> Question:
+    question = db.query(Question).filter(
+        Question.id == question_id,
+        Question.user_id == user_id
+    ).first()
+
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    return question
+
+
+@app.get("/questions")
+def list_questions(
+    level: str | None = None,
+    topic: str | None = None,
+    check: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if level is not None and not bloom.is_valid_level(level):
+        raise HTTPException(status_code=422, detail=f"Unknown Bloom's level: '{level}'")
+    if check is not None and check not in QUESTION_CHECK_STATUSES:
+        raise HTTPException(status_code=422, detail=f"Unknown check status: '{check}'")
+    if not (1 <= limit <= 200):
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 200.")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be >= 0.")
+
+    query = db.query(Question).filter(Question.user_id == current_user.id)
+    if level is not None:
+        query = query.filter(Question.bloom_level == level)
+    if check is not None:
+        query = query.filter(Question.bloom_check == check)
+    if topic is not None and topic.strip():
+        query = query.filter(Question.topic.ilike(f"%{_escape_like(topic)}%", escape="\\"))
+
+    total = query.count()
+    rows = query.order_by(Question.created_at.desc()).offset(offset).limit(limit).all()
+
+    return {"total": total, "items": [_question_summary(db, row) for row in rows]}
+
+
+class QuestionUpdateRequest(BaseModel):
+    question: str | None = None
+    options: list | None = None
+    correct_answer: str | None = None
+    explanation: str | None = None
+    bloom_level: str | None = None
+
+
+@app.patch("/questions/{question_id}")
+def update_question(
+    question_id: int,
+    payload: QuestionUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    question = _get_owned_question_or_404(db, question_id, current_user.id)
+
+    new_question_text = payload.question if payload.question is not None else question.question
+    new_options = payload.options if payload.options is not None else (
+        json.loads(question.options) if question.options else None
+    )
+    new_correct_answer = payload.correct_answer if payload.correct_answer is not None else question.correct_answer
+    new_explanation = payload.explanation if payload.explanation is not None else question.explanation
+
+    if not isinstance(new_question_text, str) or not new_question_text.strip():
+        raise HTTPException(status_code=400, detail="question cannot be empty.")
+    if not isinstance(new_correct_answer, str) or not new_correct_answer.strip():
+        raise HTTPException(status_code=400, detail="correct_answer cannot be empty.")
+    if not isinstance(new_explanation, str) or not new_explanation.strip():
+        raise HTTPException(status_code=400, detail="explanation cannot be empty.")
+
+    if question.type == "mcq":
+        option_texts = [str(o).strip() for o in (new_options or []) if str(o).strip()]
+        if len(option_texts) != 4:
+            raise HTTPException(status_code=400, detail="mcq questions need exactly 4 options.")
+        if len({o.lower() for o in option_texts}) != 4:
+            raise HTTPException(status_code=400, detail="mcq options must be 4 distinct values.")
+        if new_correct_answer not in ("A", "B", "C", "D"):
+            raise HTTPException(status_code=400, detail="mcq correct_answer must be A, B, C, or D.")
+        new_options = option_texts
+    elif question.type == "true_false":
+        if [str(o).strip() for o in (new_options or [])] != ["True", "False"]:
+            raise HTTPException(status_code=400, detail='true_false options must be ["True", "False"].')
+        if new_correct_answer not in ("A", "B"):
+            raise HTTPException(status_code=400, detail="true_false correct_answer must be A or B.")
+        new_options = ["True", "False"]
+    else:
+        new_options = None  # other types never carry options
+
+    question.question = new_question_text.strip()
+    question.options = json.dumps(new_options) if new_options is not None else None
+    question.correct_answer = new_correct_answer.strip()
+    question.explanation = new_explanation.strip()
+
+    if payload.bloom_level is not None:
+        if not bloom.is_valid_level(payload.bloom_level):
+            raise HTTPException(status_code=422, detail=f"Unknown Bloom's level: '{payload.bloom_level}'")
+        if question.type not in bloom.get_level(payload.bloom_level).question_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Question type '{question.type}' is not valid for Bloom level '{payload.bloom_level}'."
+            )
+        question.bloom_level = payload.bloom_level
+        question.bloom_check = "teacher_set"
+        question.detected_level = None
+
+    db.commit()
+    return _question_summary(db, question)
+
+
+@app.delete("/questions/{question_id}")
+def delete_question(
+    question_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    question = _get_owned_question_or_404(db, question_id, current_user.id)
+    db.delete(question)
+    db.commit()
+    return {"status": "Question deleted successfully"}

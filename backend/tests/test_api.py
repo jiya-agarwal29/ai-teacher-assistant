@@ -427,38 +427,51 @@ def _upload_water_cycle_doc(client, headers, filename="water_cycle.txt"):
 
 def test_quiz_retries_once_before_falling_back(client, llm_mock_headers, monkeypatch):
     import llm as llm_module
+    import main as main_module
 
     headers = llm_mock_headers
     book_id = _upload_water_cycle_doc(client, headers, "quiz_retry.txt")
 
-    call_count = {"n": 0}
+    quiz_questions = [
+        {
+            "id": 1, "type": "short_answer", "bloom_level": "understand",
+            "question": "What causes water to evaporate?",
+            "correctAnswer": "Heat from the sun.",
+            "explanation": "Explained in source 1.", "source_index": 1
+        },
+        {
+            "id": 2, "type": "long_answer", "bloom_level": "analyze",
+            "question": "Describe condensation.",
+            "correctAnswer": "Water vapor cools into droplets.",
+            "explanation": "Explained in source 1.", "source_index": 1
+        },
+        {
+            "id": 3, "type": "scenario", "bloom_level": "apply",
+            "question": "A hiker sees clouds forming overhead. What process is at work?",
+            "correctAnswer": "Condensation.",
+            "explanation": "Explained in source 1.", "source_index": 1
+        },
+    ]
+
+    quiz_call_count = {"n": 0}
+    classifier_call_count = {"n": 0}
 
     def fake_generate_json(prompt, schema, system=None):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            classifier_call_count["n"] += 1
+            # The checker agrees with every intended level -- no mismatch,
+            # no regeneration, so the retry-count assertion below stays clean.
+            return {
+                "items": [
+                    {"id": i, "level": q["bloom_level"]}
+                    for i, q in enumerate(quiz_questions, start=1)
+                ]
+            }
+
+        quiz_call_count["n"] += 1
+        if quiz_call_count["n"] == 1:
             return {"questions": []}  # first attempt: nothing usable
-        return {
-            "questions": [
-                {
-                    "id": 1, "type": "short_answer",
-                    "question": "What causes water to evaporate?",
-                    "correctAnswer": "Heat from the sun.",
-                    "explanation": "Explained in source 1.", "source_index": 1
-                },
-                {
-                    "id": 2, "type": "long_answer",
-                    "question": "Describe condensation.",
-                    "correctAnswer": "Water vapor cools into droplets.",
-                    "explanation": "Explained in source 1.", "source_index": 1
-                },
-                {
-                    "id": 3, "type": "scenario",
-                    "question": "A hiker sees clouds forming overhead. What process is at work?",
-                    "correctAnswer": "Condensation.",
-                    "explanation": "Explained in source 1.", "source_index": 1
-                },
-            ]
-        }
+        return {"questions": quiz_questions}
 
     monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
 
@@ -466,7 +479,9 @@ def test_quiz_retries_once_before_falling_back(client, llm_mock_headers, monkeyp
     assert res.status_code == 200
     data = res.json()
     assert len(data["questions"]) == 3
-    assert call_count["n"] == 2  # exactly one retry happened
+    assert quiz_call_count["n"] == 2  # exactly one retry happened
+    assert classifier_call_count["n"] == 1
+    assert all(q["bloom_check"] == "verified" for q in data["questions"])
 
     client.delete(f"/books/{book_id}", headers=headers)
 
@@ -1317,3 +1332,373 @@ def test_upload_size_limit_boundary(client, phase3a_headers, monkeypatch):
     assert under_limit_res.status_code == 202
 
     client.delete(f"/books/{under_limit_res.json()['book_id']}", headers=headers)
+
+
+# -----------------------------
+# PHASE 4B: BLOOM-AWARE QUIZ GENERATION + QUESTION TABLE
+# -----------------------------
+@pytest.fixture(scope="session")
+def phase4b_headers(client):
+    # /register is rate-limited per IP (10/minute) across the WHOLE test
+    # session's accounts -- reset first so this registration doesn't fail
+    # just because earlier tests already used up that budget.
+    main.limiter.reset()
+    _register(client, "phase4b_test_user", "phase4bpass1")
+    return _auth_headers(client, "phase4b_test_user", "phase4bpass1")
+
+
+@pytest.fixture(scope="session")
+def phase4b_other_headers(client):
+    """Second account, only for the cross-user question-isolation checks."""
+    main.limiter.reset()
+    _register(client, "phase4b_other_user", "phase4bopass1")
+    return _auth_headers(client, "phase4b_other_user", "phase4bopass1")
+
+
+def test_bloom_levels_endpoint_shape(client, phase4b_headers):
+    res = client.get("/bloom/levels", headers=phase4b_headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert [lvl["key"] for lvl in data] == [
+        "remember", "understand", "apply", "analyze", "evaluate", "create"
+    ]
+    for lvl in data:
+        assert set(lvl.keys()) == {"key", "label", "order", "description", "question_types"}
+        assert isinstance(lvl["question_types"], list) and lvl["question_types"]
+
+
+def test_generate_quiz_rejects_invalid_levels_param(client, phase4b_headers):
+    # /generate-quiz is rate-limited per user (5/minute); phase4b_headers is
+    # shared across several tests below, so each one resets the limiter's
+    # counters first to get its own clean budget rather than exhausting a
+    # budget shared with tests that ran earlier in the same minute.
+    main.limiter.reset()
+    res = client.get(
+        "/generate-quiz", headers=phase4b_headers,
+        params={"topic": "anything", "levels": "apply,bogus"}
+    )
+    assert res.status_code == 422
+    assert "bogus" in res.json()["detail"]
+
+
+def test_generate_quiz_rejects_out_of_range_count(client, phase4b_headers):
+    main.limiter.reset()
+    too_low = client.get("/generate-quiz", headers=phase4b_headers, params={"topic": "x", "count": 0})
+    assert too_low.status_code == 422
+
+    too_high = client.get("/generate-quiz", headers=phase4b_headers, params={"topic": "x", "count": 13})
+    assert too_high.status_code == 422
+
+
+def test_generate_quiz_distributes_requested_levels_into_the_prompt(client, phase4b_headers, monkeypatch):
+    import bloom
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_distribute.txt")
+
+    captured_prompts = []
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": []}
+        captured_prompts.append(prompt)
+        return {"questions": []}  # force the fallback -- only the prompt text matters here
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "apply,analyze", "count": 5}
+    )
+
+    assert len(captured_prompts) == 2  # one retry, same breakdown both times
+    expected_counts = bloom.distribute(5, ["apply", "analyze"])
+    for level_key, count in expected_counts.items():
+        level = bloom.get_level(level_key)
+        for prompt in captured_prompts:
+            assert f"write exactly {count} question(s) at this level" in prompt
+            assert level.label in prompt
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_fallback_path_labels_levels_with_verb_classifier(client, phase4b_headers, monkeypatch):
+    import bloom
+    import llm as llm_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_fallback.txt")
+
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {"questions": []}
+    )
+
+    res = client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) >= 3
+    for q in data["questions"]:
+        assert q["bloom_check"] == "unchecked"
+        assert q["detected_level"] is None
+        assert q["bloom_level"] in bloom.level_keys()
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_checker_unavailable_leaves_questions_unchecked(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_checker_down.txt")
+
+    questions = [
+        {"id": 1, "type": "true_false", "bloom_level": "remember",
+         "question": "True or False: evaporation is caused by heat.",
+         "options": ["True", "False"], "correctAnswer": "A",
+         "explanation": "Explained in source 1.", "source_index": 1},
+        {"id": 2, "type": "short_answer", "bloom_level": "understand",
+         "question": "Explain condensation in your own words.",
+         "correctAnswer": "Water vapor cools into droplets.",
+         "explanation": "Explained in source 1.", "source_index": 1},
+        {"id": 3, "type": "scenario", "bloom_level": "apply",
+         "question": "A hiker sees clouds. Apply the water cycle to explain why.",
+         "correctAnswer": "Condensation is occurring.",
+         "explanation": "Explained in source 1.", "source_index": 1},
+    ]
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            raise llm_module.LLMUnavailableError("checker is down")
+        return {"questions": questions}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3
+    for q in data["questions"]:
+        assert q["bloom_check"] == "unchecked"
+        assert q["detected_level"] is None
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_mismatch_regenerates_once_then_flags_remaining(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_mismatch.txt")
+
+    initial = [
+        {"id": 1, "type": "true_false", "bloom_level": "remember",
+         "question": "True or False: water evaporates due to heat from the sun.",
+         "options": ["True", "False"], "correctAnswer": "A",
+         "explanation": "Explained in source 1.", "source_index": 1},
+        {"id": 2, "type": "short_answer", "bloom_level": "understand",
+         "question": "Explain what causes condensation.",
+         "correctAnswer": "Water vapor cooling into droplets.",
+         "explanation": "Explained in source 1.", "source_index": 1},
+        {"id": 3, "type": "scenario", "bloom_level": "apply",
+         "question": "A hiker notices clouds forming. Apply the water cycle to explain why.",
+         "correctAnswer": "Condensation is occurring.",
+         "explanation": "Explained in source 1.", "source_index": 1},
+    ]
+    regenerated = [
+        {"id": 10, "type": "short_answer", "bloom_level": "understand",
+         "question": "Summarize why condensation happens in your own words.",
+         "correctAnswer": "Water vapor cools into droplets.",
+         "explanation": "Explained in source 1.", "source_index": 1},
+        {"id": 11, "type": "scenario", "bloom_level": "apply",
+         "question": "A farmer wants to use the water cycle to plan irrigation. How would they apply it?",
+         "correctAnswer": "They would track evaporation and precipitation patterns.",
+         "explanation": "Explained in source 1.", "source_index": 1},
+    ]
+
+    quiz_call = {"n": 0}
+    classifier_call = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            classifier_call["n"] += 1
+            if classifier_call["n"] == 1:
+                # Agrees on the "remember" question; disagrees on the other two.
+                return {"items": [
+                    {"id": 1, "level": "remember"},
+                    {"id": 2, "level": "apply"},
+                    {"id": 3, "level": "create"},
+                ]}
+            # Recheck of the two regenerated replacements: agrees on the
+            # first, still disagrees on the second.
+            return {"items": [
+                {"id": 1, "level": "understand"},
+                {"id": 2, "level": "create"},
+            ]}
+
+        quiz_call["n"] += 1
+        if quiz_call["n"] == 1:
+            return {"questions": initial}
+        return {"questions": regenerated}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3
+
+    by_level = {q["bloom_level"]: q for q in data["questions"]}
+    assert by_level["remember"]["bloom_check"] == "verified"
+    assert by_level["remember"]["detected_level"] is None
+
+    assert by_level["understand"]["bloom_check"] == "verified"
+    assert by_level["understand"]["question"] == "Summarize why condensation happens in your own words."
+    assert by_level["understand"]["detected_level"] is None
+
+    assert by_level["apply"]["bloom_check"] == "flagged"
+    assert by_level["apply"]["detected_level"] == "create"
+    assert by_level["apply"]["question"] == (
+        "A farmer wants to use the water cycle to plan irrigation. How would they apply it?"
+    )
+
+    assert quiz_call["n"] == 2  # initial generation + one regeneration
+    assert classifier_call["n"] == 2  # initial check + one recheck
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_saves_questions_and_question_crud_lifecycle(
+    client, phase4b_headers, phase4b_other_headers, monkeypatch
+):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    other_headers = phase4b_other_headers
+    main.limiter.reset()
+    filename = "bloom_crud.txt"
+    book_id = _upload_water_cycle_doc(client, headers, filename)
+
+    questions = [
+        {"id": 1, "type": "true_false", "bloom_level": "remember",
+         "question": "True or False: evaporation is caused by heat from the sun.",
+         "options": ["True", "False"], "correctAnswer": "A",
+         "explanation": "Explained in source 1.", "source_index": 1},
+        {"id": 2, "type": "short_answer", "bloom_level": "understand",
+         "question": "Explain condensation in your own words.",
+         "correctAnswer": "Water vapor cools into droplets.",
+         "explanation": "Explained in source 1.", "source_index": 1},
+        {"id": 3, "type": "scenario", "bloom_level": "apply",
+         "question": "A hiker sees clouds forming overhead. Apply the water cycle to explain why.",
+         "correctAnswer": "Condensation is occurring.",
+         "explanation": "Explained in source 1.", "source_index": 1},
+    ]
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [
+                {"id": i, "level": q["bloom_level"]} for i, q in enumerate(questions, start=1)
+            ]}
+        return {"questions": questions}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3
+    assert all(q["bloom_check"] == "verified" for q in data["questions"])
+    assert all(q["source"]["book_name"] == filename for q in data["questions"])
+
+    question_ids = [q["question_id"] for q in data["questions"]]
+    editable_id = next(q["question_id"] for q in data["questions"] if q["type"] == "short_answer")
+
+    # GET /questions: the owner sees everything just generated.
+    list_res = client.get("/questions", headers=headers, params={"topic": "water cycle"})
+    assert list_res.status_code == 200
+    list_data = list_res.json()
+    listed_ids = {item["question_id"] for item in list_data["items"]}
+    assert set(question_ids) <= listed_ids
+    sample = next(item for item in list_data["items"] if item["question_id"] == editable_id)
+    assert sample["source"]["book_name"] == filename
+    assert sample["bloom_check"] == "verified"
+
+    # Cross-user isolation: another user can't see, edit, or delete them.
+    assert client.get("/questions", headers=other_headers).json()["total"] == 0
+    assert client.patch(
+        f"/questions/{editable_id}", headers=other_headers, json={"explanation": "hijack"}
+    ).status_code == 404
+    assert client.delete(f"/questions/{editable_id}", headers=other_headers).status_code == 404
+
+    # PATCH bloom_level as the owner marks it teacher_set (short_answer is
+    # also a valid type at "apply", so this stays a legal level for it).
+    patch_res = client.patch(
+        f"/questions/{editable_id}", headers=headers, json={"bloom_level": "apply"}
+    )
+    assert patch_res.status_code == 200
+    patched = patch_res.json()
+    assert patched["bloom_level"] == "apply"
+    assert patched["bloom_check"] == "teacher_set"
+    assert patched["detected_level"] is None
+
+    # Deleting the book deletes its questions.
+    assert client.delete(f"/books/{book_id}", headers=headers).status_code == 200
+    after_delete = client.get("/questions", headers=headers, params={"topic": "water cycle"}).json()
+    assert all(item["question_id"] not in question_ids for item in after_delete["items"])
+
+
+def test_patch_question_mcq_validation_rules(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_patch_mcq.txt")
+
+    monkeypatch.setattr(llm_module, "generate_json", lambda prompt, schema, system=None: {"questions": []})
+
+    res = client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+    assert res.status_code == 200
+    mcq_question = next(q for q in res.json()["questions"] if q["type"] == "mcq")
+    question_id = mcq_question["question_id"]
+
+    bad = client.patch(
+        f"/questions/{question_id}", headers=headers,
+        json={"options": ["A", "A", "B", "C"]}
+    )
+    assert bad.status_code == 400
+
+    good = client.patch(
+        f"/questions/{question_id}", headers=headers,
+        json={"options": ["Alpha", "Beta", "Gamma", "Delta"], "correct_answer": "B"}
+    )
+    assert good.status_code == 200
+    assert good.json()["options"] == ["Alpha", "Beta", "Gamma", "Delta"]
+    assert good.json()["correct_answer"] == "B"
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_list_questions_rejects_invalid_filters(client, phase4b_headers):
+    headers = phase4b_headers
+    assert client.get("/questions", headers=headers, params={"level": "bogus"}).status_code == 422
+    assert client.get("/questions", headers=headers, params={"check": "bogus"}).status_code == 422
+    assert client.get("/questions", headers=headers, params={"limit": 0}).status_code == 422
+    assert client.get("/questions", headers=headers, params={"offset": -1}).status_code == 422
