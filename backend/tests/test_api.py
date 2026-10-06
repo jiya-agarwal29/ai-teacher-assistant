@@ -475,7 +475,14 @@ def test_quiz_retries_once_before_falling_back(client, llm_mock_headers, monkeyp
 
     monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
 
-    res = client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+    # Request exactly the 3 levels fake_generate_json fills (one each) --
+    # otherwise the Phase 4B top-up step would (correctly) make an extra
+    # call for the other three default levels, which isn't what this test
+    # is about.
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "understand,apply,analyze", "count": 3}
+    )
     assert res.status_code == 200
     data = res.json()
     assert len(data["questions"]) == 3
@@ -1582,6 +1589,156 @@ def test_generate_quiz_mismatch_regenerates_once_then_flags_remaining(client, ph
     client.delete(f"/books/{book_id}", headers=headers)
 
 
+def _bloom_fix_question(qid, q_type, level, question, answer, options=None):
+    q = {
+        "id": qid, "type": q_type, "bloom_level": level,
+        "question": question, "correctAnswer": answer,
+        "explanation": "Explained in source 1.", "source_index": 1
+    }
+    if q_type == "true_false":
+        q["options"] = ["True", "False"]
+    elif q_type == "mcq":
+        q["options"] = options or ["Alpha", "Beta", "Gamma", "Delta"]
+    return q
+
+
+def test_generate_quiz_top_up_fills_a_missing_level(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_topup_fills.txt")
+
+    # The initial batch covers remember/understand/apply but leaves analyze
+    # completely missing even though it was requested.
+    initial = [
+        _bloom_fix_question(1, "true_false", "remember", "True or False: heat causes evaporation.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Explain condensation in your own words.", "Water vapor cools into droplets."),
+        _bloom_fix_question(3, "scenario", "apply", "A hiker sees clouds. Apply the water cycle to explain why.", "Condensation is occurring."),
+    ]
+    topped_up = [
+        _bloom_fix_question(4, "long_answer", "analyze", "Compare evaporation and condensation as opposing processes.", "They are reverse phase changes of water."),
+    ]
+
+    quiz_call = {"n": 0}
+    classifier_call = {"n": 0}
+    captured_topup_prompt = {"text": None}
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            classifier_call["n"] += 1
+            # Whatever batch gets sent, the checker agrees with it -- this
+            # test is only about the top-up mechanics, not mismatches.
+            if classifier_call["n"] == 1:
+                return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(initial, start=1)]}
+            return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(topped_up, start=1)]}
+
+        quiz_call["n"] += 1
+        if quiz_call["n"] == 1:
+            return {"questions": initial}
+        captured_topup_prompt["text"] = prompt
+        return {"questions": topped_up}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply,analyze", "count": 4}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 4
+    assert data["level_counts"] == {"remember": 1, "understand": 1, "apply": 1, "analyze": 1}
+    assert data["warnings"] == []
+    assert all(q["bloom_check"] == "verified" for q in data["questions"])
+
+    assert quiz_call["n"] == 2  # the main batch + exactly one top-up call
+    assert classifier_call["n"] == 2  # the main check + checking the topped-up question
+    assert "write exactly 1 question(s) at this level" in captured_topup_prompt["text"]
+    assert "Analyze" in captured_topup_prompt["text"]
+    assert "Remember" not in captured_topup_prompt["text"]  # only the missing level was asked for
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_top_up_still_short_adds_a_warning_without_retrying(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_topup_short.txt")
+
+    initial = [
+        _bloom_fix_question(1, "true_false", "remember", "True or False: heat causes evaporation.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Explain condensation in your own words.", "Water vapor cools into droplets."),
+        _bloom_fix_question(3, "scenario", "apply", "A hiker sees clouds. Apply the water cycle to explain why.", "Condensation is occurring."),
+    ]
+
+    quiz_call = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(initial, start=1)]}
+
+        quiz_call["n"] += 1
+        if quiz_call["n"] == 1:
+            return {"questions": initial}
+        return {"questions": []}  # the one top-up attempt also comes up empty
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply,analyze", "count": 4}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3  # still short the "analyze" question
+    assert data["warnings"] == ["Could not create enough Analyze questions -- try again or pick other levels"]
+    assert quiz_call["n"] == 2  # main batch + exactly one top-up attempt, no further retry
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_no_top_up_call_when_nothing_is_missing(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_topup_not_needed.txt")
+
+    full_batch = [
+        _bloom_fix_question(1, "true_false", "remember", "True or False: heat causes evaporation.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Explain condensation in your own words.", "Water vapor cools into droplets."),
+        _bloom_fix_question(3, "scenario", "apply", "A hiker sees clouds. Apply the water cycle to explain why.", "Condensation is occurring."),
+    ]
+
+    quiz_call = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(full_batch, start=1)]}
+        quiz_call["n"] += 1
+        return {"questions": full_batch}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3
+    assert data["warnings"] == []
+    assert quiz_call["n"] == 1  # no top-up call -- every requested level was already filled
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
 def test_generate_quiz_saves_questions_and_question_crud_lifecycle(
     client, phase4b_headers, phase4b_other_headers, monkeypatch
 ):
@@ -1692,6 +1849,52 @@ def test_patch_question_mcq_validation_rules(client, phase4b_headers, monkeypatc
     assert good.status_code == 200
     assert good.json()["options"] == ["Alpha", "Beta", "Gamma", "Delta"]
     assert good.json()["correct_answer"] == "B"
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_logs_drop_reasons_without_leaking_question_text(client, phase4b_headers, monkeypatch, caplog):
+    import logging
+    import llm as llm_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_drop_log.txt")
+
+    secret_marker = "zzz_super_secret_marker_zzz"
+    valid_questions = [
+        _bloom_fix_question(1, "scenario", "analyze", "Compare the processes of evaporation and condensation.", "They are reverse phase changes of water."),
+        _bloom_fix_question(2, "scenario", "analyze", "Examine how temperature differences drive the water cycle.", "Temperature differences drive evaporation and condensation."),
+        _bloom_fix_question(3, "scenario", "analyze", "Analyze why groundwater levels change seasonally.", "Seasonal infiltration and evaporation change groundwater levels."),
+    ]
+    # Dropped for a known reason (true_false isn't an allowed type at
+    # "analyze") -- its question text carries a marker that must never
+    # reach the log, only the drop reason category should.
+    dropped_question = {
+        "id": 4, "type": "true_false", "bloom_level": "analyze",
+        "question": f"True or False: the {secret_marker} affects groundwater.",
+        "options": ["True", "False"], "correctAnswer": "A",
+        "explanation": "Explained in source 1.", "source_index": 1
+    }
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": "analyze"} for i in range(1, 4)]}
+        return {"questions": valid_questions + [dropped_question]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    with caplog.at_level(logging.INFO, logger="main"):
+        res = client.get(
+            "/generate-quiz", headers=headers,
+            params={"topic": "water cycle", "levels": "analyze", "count": 3}
+        )
+    assert res.status_code == 200
+    assert len(res.json()["questions"]) == 3
+
+    drop_logs = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+    assert any("dropped 1: type 'true_false' not allowed for 'analyze'" in msg for msg in drop_logs)
+    assert all(secret_marker not in r.getMessage() for r in caplog.records)
 
     client.delete(f"/books/{book_id}", headers=headers)
 

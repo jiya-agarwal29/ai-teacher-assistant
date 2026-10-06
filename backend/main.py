@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -417,7 +418,9 @@ def _classify_questions_with_gemini(question_texts: list):
     return [detected_by_position.get(i) for i in range(1, len(question_texts) + 1)]
 
 
-def _check_and_fix_bloom_levels(questions: list, topic: str, top_pages, levels: list) -> list:
+def _check_and_fix_bloom_levels(
+    questions: list, topic: str, top_pages, levels: list, drop_log: list = None
+) -> list:
     """
     Runs the Bloom level check on `questions` (each already carrying the
     bloom_level it was generated for) and fixes up any disagreement by
@@ -472,7 +475,7 @@ def _check_and_fix_bloom_levels(questions: list, topic: str, top_pages, levels: 
     except llm.LLMUnavailableError:
         raw_regenerated = []
 
-    regenerated = _validate_quiz_questions(raw_regenerated, len(top_pages), list(regen_counts.keys()))
+    regenerated = _validate_quiz_questions(raw_regenerated, len(top_pages), list(regen_counts.keys()), drop_log)
     pool_by_level = {}
     for q in regenerated:
         pool_by_level.setdefault(q["bloom_level"], []).append(q)
@@ -1482,7 +1485,7 @@ def ai_tutor(
     return _answer_question(payload.question, current_user, db)
 
 
-def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: list):
+def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: list, drop_log: list = None):
     """
     Validates and cleans Gemini's raw quiz question list: correct option
     counts, a valid correctAnswer, no question leaking its own answer (for
@@ -1494,6 +1497,10 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
     correctAnswer/explanation/source_index, matching the existing response
     shape plus the two Phase 4B fields the caller needs (bloom_level,
     source_index) before building the final API response.
+
+    If `drop_log` is given, one short reason string (never the question's
+    own text, or anything from the source documents) is appended to it for
+    every dropped question, for the caller to log in aggregate.
     """
     if not isinstance(raw_questions, list):
         return []
@@ -1501,8 +1508,13 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
     valid = []
     seen_question_text = set()
 
+    def _drop(reason: str):
+        if drop_log is not None:
+            drop_log.append(reason)
+
     for q in raw_questions:
         if not isinstance(q, dict):
+            _drop("entry is not an object")
             continue
 
         q_type = q.get("type")
@@ -1514,24 +1526,32 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
         options = q.get("options")
 
         if q_type not in QUIZ_QUESTION_TYPES:
+            _drop(f"type '{q_type}' is not a recognized question type")
             continue
         if not bloom.is_valid_level(bloom_level) or bloom_level not in requested_levels:
+            _drop(f"bloom_level '{bloom_level}' is not one of the requested levels")
             continue
         if q_type not in bloom.get_level(bloom_level).question_types:
+            _drop(f"type '{q_type}' not allowed for '{bloom_level}'")
             continue
         if not isinstance(question_text, str) or not question_text.strip():
+            _drop("missing or empty question text")
             continue
         if not isinstance(correct_answer, str) or not correct_answer.strip():
+            _drop("missing or empty correct answer")
             continue
         if not isinstance(explanation, str) or not explanation.strip():
+            _drop("missing or empty explanation")
             continue
         if not isinstance(source_index, int) or not (1 <= source_index <= num_sources):
+            _drop("missing or out-of-range source_index")
             continue
 
         cleaned_options = None
 
         if q_type == "mcq":
             if not isinstance(options, list) or len(options) != 4:
+                _drop("mcq does not have exactly 4 options")
                 continue
             # Gemini sometimes prefixes its own option text with a letter
             # (e.g. "A) The atmospheric cycle") even though it also
@@ -1543,17 +1563,22 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
                 for o in options if isinstance(o, str) and o.strip()
             ]
             if len(option_texts) != 4:
+                _drop("mcq options are empty or invalid after cleanup")
                 continue
             if len({o.lower() for o in option_texts}) != 4:
-                continue  # options must be distinct
+                _drop("mcq options are not all distinct")
+                continue
             if correct_answer not in ("A", "B", "C", "D"):
+                _drop("mcq correctAnswer is not A-D")
                 continue
             cleaned_options = option_texts
 
         elif q_type == "true_false":
             if not isinstance(options, list) or [str(o).strip() for o in options] != ["True", "False"]:
+                _drop("true_false options are not ['True', 'False']")
                 continue
             if correct_answer not in ("A", "B"):
+                _drop("true_false correctAnswer is not A/B")
                 continue
             cleaned_options = ["True", "False"]
 
@@ -1561,11 +1586,13 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
             # correctAnswer is real answer text here, not a letter -- the
             # question text must not give it away.
             if correct_answer.strip().lower() in question_text.lower():
+                _drop(f"question text leaks its own answer ({q_type})")
                 continue
 
         normalized = re.sub(r'\s+', ' ', question_text.strip().lower())
         if normalized in seen_question_text:
-            continue  # duplicate question
+            _drop("duplicate question text")
+            continue
         seen_question_text.add(normalized)
 
         cleaned = {
@@ -1584,7 +1611,9 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
     return valid
 
 
-def _generate_quiz_with_gemini(topic: str, top_pages, levels: list, level_counts: dict):
+def _generate_quiz_with_gemini(
+    topic: str, top_pages, levels: list, level_counts: dict, drop_log: list = None
+):
     """
     Builds the per-Bloom-level prompt, asks Gemini for a full quiz as JSON,
     and validates/cleans the result. Returns the cleaned question list on
@@ -1592,20 +1621,73 @@ def _generate_quiz_with_gemini(topic: str, top_pages, levels: list, level_counts
     retry -- the caller falls back to generate_quiz() (the local hybrid
     generator) in that case. Raises NotImplementedError for LLM_PROVIDER=local
     and llm.LLMUnavailableError on a persistently unavailable provider, same
-    as llm.generate_json() itself. Does not run the Bloom level check --
-    that's the caller's job (_check_and_fix_bloom_levels), since it needs
-    the final assembled list, not whatever a single attempt happens to be.
+    as llm.generate_json() itself. Does not run the Bloom level check or the
+    missing-level top-up -- those are the caller's job (_check_and_fix_bloom_levels,
+    _top_up_missing_levels), since they need the final assembled list, not
+    whatever a single attempt happens to be.
     """
     prompt = _build_quiz_prompt(topic, top_pages, level_counts)
 
     for _attempt in range(2):  # one retry if the first pass yields too few valid questions
         result = llm.generate_json(prompt, schema=QUIZ_SCHEMA)
         raw_questions = result.get("questions", []) if isinstance(result, dict) else []
-        questions = _validate_quiz_questions(raw_questions, len(top_pages), levels)
+        questions = _validate_quiz_questions(raw_questions, len(top_pages), levels, drop_log)
         if len(questions) >= 3:
             return questions
 
     return None
+
+
+def _top_up_missing_levels(
+    questions: list, topic: str, top_pages, level_counts: dict, drop_log: list = None
+) -> tuple:
+    """
+    Compares what actually survived validation/checking against what was
+    asked for (bloom.distribute's level_counts) and, for every level that's
+    short, makes ONE extra generate_json call for just those missing slots
+    (reusing the same per-level prompt rules), then validates and
+    Bloom-checks the result exactly like any other batch. A level still
+    short after that is left as-is -- the caller gets a plain-English
+    warning for it instead of a silently smaller quiz. Returns
+    (questions, warnings); never raises (an unavailable top-up call just
+    means that level stays short and gets a warning).
+    """
+    actual_counts = Counter(q["bloom_level"] for q in questions)
+    missing_counts = {
+        level: needed - actual_counts.get(level, 0)
+        for level, needed in level_counts.items()
+        if needed > actual_counts.get(level, 0)
+    }
+
+    if not missing_counts:
+        return questions, []
+
+    try:
+        result = llm.generate_json(
+            _build_quiz_prompt(topic, top_pages, missing_counts), schema=QUIZ_SCHEMA
+        )
+        raw_topped_up = result.get("questions", []) if isinstance(result, dict) else []
+    except llm.LLMUnavailableError:
+        raw_topped_up = []
+
+    topped_up = _validate_quiz_questions(raw_topped_up, len(top_pages), list(missing_counts.keys()), drop_log)
+    topped_up = _check_and_fix_bloom_levels(topped_up, topic, top_pages, list(missing_counts.keys()), drop_log)
+
+    next_id = max((q["id"] for q in questions), default=0) + 1
+    for q in topped_up:
+        q["id"] = next_id
+        next_id += 1
+
+    combined = questions + topped_up
+    final_counts = Counter(q["bloom_level"] for q in combined)
+
+    warnings = []
+    for level, needed in level_counts.items():
+        if final_counts.get(level, 0) < needed:
+            label = bloom.get_level(level).label
+            warnings.append(f"Could not create enough {label} questions -- try again or pick other levels")
+
+    return combined, warnings
 
 
 QUESTION_CHECK_STATUSES = ("verified", "flagged", "unchecked", "teacher_set")
@@ -1712,7 +1794,8 @@ def generate_ai_quiz(
             "quiz": _pending_documents_message_or_none(db, current_user.id) or "Not enough information found in uploaded documents.",
             "questions": [],
             "levels": requested_levels,
-            "level_counts": {}
+            "level_counts": {},
+            "warnings": []
         }
 
     if needs_reembedding(db, current_user.id):
@@ -1721,7 +1804,8 @@ def generate_ai_quiz(
             "quiz": "Your documents need re-indexing",
             "questions": [],
             "levels": requested_levels,
-            "level_counts": {}
+            "level_counts": {},
+            "warnings": []
         }
 
     top_pages = _retrieve_or_503(db, current_user.id, topic, top_k=5, apply_threshold=True)
@@ -1734,13 +1818,16 @@ def generate_ai_quiz(
             "quiz": "Not enough information found in uploaded documents.",
             "questions": [],
             "levels": requested_levels,
-            "level_counts": {}
+            "level_counts": {},
+            "warnings": []
         }
 
     level_counts = bloom.distribute(count, requested_levels)
+    drop_log = []
+    warnings = []
 
     try:
-        questions = _generate_quiz_with_gemini(topic, top_pages, requested_levels, level_counts)
+        questions = _generate_quiz_with_gemini(topic, top_pages, requested_levels, level_counts, drop_log)
     except NotImplementedError:
         # LLM_PROVIDER=local has no structured JSON output -- go straight
         # to the local hybrid quiz generator below.
@@ -1754,6 +1841,8 @@ def generate_ai_quiz(
         # levels -- label each question after the fact with the verb
         # classifier instead (None -> remember, the safest default) and
         # leave bloom_check "unchecked" since no independent check ran.
+        # No top-up here -- the fallback generator ignores levels/count
+        # entirely, so there's nothing level-shaped to compare against.
         context = "\n\n".join(page.content for _, page in top_pages)
         quiz_text, questions = generate_quiz(context, topic)
         for q in questions:
@@ -1761,8 +1850,16 @@ def generate_ai_quiz(
             q["bloom_check"] = "unchecked"
             q["detected_level"] = None
     else:
-        questions = _check_and_fix_bloom_levels(questions, topic, top_pages, requested_levels)
+        questions = _check_and_fix_bloom_levels(questions, topic, top_pages, requested_levels, drop_log)
+        questions, warnings = _top_up_missing_levels(questions, topic, top_pages, level_counts, drop_log)
         quiz_text = format_quiz_text(questions)
+
+    if drop_log:
+        reason_counts = Counter(drop_log)
+        logger.info(
+            "Quiz generation for topic '%s': %s",
+            topic, "; ".join(f"dropped {count}: {reason}" for reason, count in reason_counts.items())
+        )
 
     response_questions = _save_generated_questions(db, current_user.id, topic, questions, top_pages)
 
@@ -1775,7 +1872,8 @@ def generate_ai_quiz(
         "quiz": quiz_text,
         "questions": response_questions,
         "levels": requested_levels,
-        "level_counts": actual_level_counts
+        "level_counts": actual_level_counts,
+        "warnings": warnings
     }
 
 
