@@ -6,6 +6,7 @@ import {
   FileText,
   Brain,
   BarChart3,
+  Database,
   LogOut,
   Sun,
   Moon,
@@ -27,6 +28,7 @@ export default function Sidebar({ darkMode, setDarkMode }) {
     { name: 'AI Chat', path: '/chat', icon: MessageSquare },
     { name: 'Documents', path: '/documents', icon: FileText },
     { name: 'AI Tools', path: '/tools', icon: Brain },
+    { name: 'Question Bank', path: '/question-bank', icon: Database },
     { name: 'Analytics', path: '/analytics', icon: BarChart3 },
   ];
 

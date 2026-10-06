@@ -443,6 +443,58 @@ export const api = {
     levels: () => request('/bloom/levels')
   },
 
+  questions: {
+    /**
+     * GET /questions?level=...&topic=...&check=...&limit=...&offset=...
+     * `level` may be a single key, an array of keys, or an already
+     * comma-joined string (multi-select filtering on the Question Bank
+     * page) -- the backend accepts a comma-separated list for this param.
+     */
+    list: ({ level, topic, check, limit, offset } = {}) => {
+      const params = new URLSearchParams();
+      if (level && (!Array.isArray(level) || level.length > 0)) {
+        params.append('level', Array.isArray(level) ? level.join(',') : level);
+      }
+      if (topic) params.append('topic', topic);
+      if (check) params.append('check', check);
+      if (limit !== undefined && limit !== null) params.append('limit', String(limit));
+      if (offset !== undefined && offset !== null) params.append('offset', String(offset));
+      return request(`/questions?${params.toString()}`);
+    },
+
+    /**
+     * GET /questions/summary -- {total, by_level: {key: n}, flagged}.
+     */
+    summary: () => request('/questions/summary'),
+
+    /**
+     * PATCH /questions/{id} {question?, options?, correct_answer?, explanation?, bloom_level?}
+     */
+    update: (id, payload) => request(`/questions/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+
+    /**
+     * POST /questions/{id}/regenerate {type?} -- writes one new question
+     * for the same topic/level (optionally a different allowed type) and
+     * replaces this row's content in place.
+     */
+    regenerate: (id, type) => request(`/questions/${id}/regenerate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(type ? { type } : {}),
+    }),
+
+    /**
+     * DELETE /questions/{id}
+     */
+    delete: (id) => request(`/questions/${id}`, {
+      method: 'DELETE',
+    }),
+  },
+
   tools: {
     /**
      * POST /tools/summarize {text} — summarizes pasted text only, no retrieval.

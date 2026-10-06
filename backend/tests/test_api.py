@@ -1902,6 +1902,351 @@ def test_generate_quiz_logs_drop_reasons_without_leaking_question_text(client, p
 def test_list_questions_rejects_invalid_filters(client, phase4b_headers):
     headers = phase4b_headers
     assert client.get("/questions", headers=headers, params={"level": "bogus"}).status_code == 422
+    assert client.get("/questions", headers=headers, params={"level": "apply,bogus"}).status_code == 422
     assert client.get("/questions", headers=headers, params={"check": "bogus"}).status_code == 422
     assert client.get("/questions", headers=headers, params={"limit": 0}).status_code == 422
     assert client.get("/questions", headers=headers, params={"offset": -1}).status_code == 422
+
+
+def test_list_questions_filters_by_multiple_levels(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_multilevel_filter.txt")
+
+    seed = [
+        _bloom_fix_question(1, "true_false", "remember", "Multilevel filter remember question.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Multilevel filter understand question.", "Answer."),
+        _bloom_fix_question(3, "scenario", "apply", "Multilevel filter apply question.", "Answer."),
+    ]
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(seed, start=1)]}
+        return {"questions": seed}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "multilevel filter topic", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+
+    list_res = client.get(
+        "/questions", headers=headers,
+        params={"topic": "multilevel filter topic", "level": "remember,apply"}
+    )
+    assert list_res.status_code == 200
+    items = list_res.json()["items"]
+    levels_seen = {item["bloom_level"] for item in items}
+    assert levels_seen == {"remember", "apply"}
+    assert all(item["bloom_level"] != "understand" for item in items)
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+# -----------------------------
+# PHASE 4B EXTRA: VARIETY -- RECENT QUESTIONS STAY USER-SCOPED
+# -----------------------------
+def test_generate_quiz_recent_questions_appear_in_prompt_and_stay_user_scoped(
+    client, phase4b_headers, phase4b_other_headers, monkeypatch
+):
+    import llm as llm_module
+    import main as main_module
+
+    headers_a = phase4b_headers
+    headers_b = phase4b_other_headers
+    main.limiter.reset()
+
+    book_a = _upload_water_cycle_doc(client, headers_a, "bloom_recent_a.txt")
+
+    marker = "zzz_recent_marker_zzz"
+    seed_questions = [
+        _bloom_fix_question(1, "scenario", "apply", f"Apply the water cycle to explain {marker} in a city.", "Because of evaporation and condensation."),
+        _bloom_fix_question(2, "scenario", "apply", f"A farmer asks about {marker} and irrigation timing.", "Irrigation should follow the water cycle stages."),
+        _bloom_fix_question(3, "scenario", "apply", f"Explain {marker} for a coastal town's water supply.", "Coastal towns rely on evaporation-driven rainfall."),
+    ]
+    captured_prompts_a = []
+
+    def fake_generate_json_seed(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": "apply"} for i in range(1, 4)]}
+        captured_prompts_a.append(prompt)
+        return {"questions": seed_questions}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json_seed)
+
+    # First quiz seeds the Question table with the marker-bearing texts.
+    res1 = client.get(
+        "/generate-quiz", headers=headers_a,
+        params={"topic": "water cycle", "levels": "apply", "count": 3}
+    )
+    assert res1.status_code == 200
+
+    # Second quiz, same topic: this prompt must list those seeded
+    # questions as "do not repeat".
+    main.limiter.reset()
+    second_batch = [
+        _bloom_fix_question(10, "scenario", "apply", "A brand new distinct question about the water cycle.", "A fresh distinct answer."),
+        _bloom_fix_question(11, "scenario", "apply", "Another brand new distinct question about clouds.", "Another fresh distinct answer."),
+        _bloom_fix_question(12, "scenario", "apply", "A third brand new distinct question about rainfall.", "A third fresh distinct answer."),
+    ]
+
+    def fake_generate_json_second(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": "apply"} for i in range(1, 4)]}
+        captured_prompts_a.append(prompt)
+        return {"questions": second_batch}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json_second)
+
+    res2 = client.get(
+        "/generate-quiz", headers=headers_a,
+        params={"topic": "water cycle", "levels": "apply", "count": 3}
+    )
+    assert res2.status_code == 200
+
+    last_prompt_a = captured_prompts_a[-1]
+    assert marker in last_prompt_a
+    assert "Do not repeat or closely paraphrase" in last_prompt_a
+
+    # A second user, same topic string, must never see user A's questions
+    # (nor even the "do not repeat" block at all, since they have no
+    # history of their own yet).
+    main.limiter.reset()
+    book_b = _upload_water_cycle_doc(client, headers_b, "bloom_recent_b.txt")
+    captured_prompts_b = []
+
+    def fake_generate_json_b(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": "apply"} for i in range(1, 4)]}
+        captured_prompts_b.append(prompt)
+        return {"questions": [
+            _bloom_fix_question(1, "scenario", "apply", "User B's own distinct water cycle question.", "User B's own answer."),
+            _bloom_fix_question(2, "scenario", "apply", "User B's second distinct question.", "User B's second answer."),
+            _bloom_fix_question(3, "scenario", "apply", "User B's third distinct question.", "User B's third answer."),
+        ]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json_b)
+
+    res3 = client.get(
+        "/generate-quiz", headers=headers_b,
+        params={"topic": "water cycle", "levels": "apply", "count": 3}
+    )
+    assert res3.status_code == 200
+    assert marker not in captured_prompts_b[0]
+    assert "Do not repeat" not in captured_prompts_b[0]
+
+    client.delete(f"/books/{book_a}", headers=headers_a)
+    client.delete(f"/books/{book_b}", headers=headers_b)
+
+
+# -----------------------------
+# PHASE 4D: SINGLE-QUESTION REGENERATE + QUESTION BANK SUMMARY
+# -----------------------------
+@pytest.fixture(scope="session")
+def phase4d_headers(client):
+    main.limiter.reset()
+    _register(client, "phase4d_test_user", "phase4dpass1")
+    return _auth_headers(client, "phase4d_test_user", "phase4dpass1")
+
+
+@pytest.fixture(scope="session")
+def phase4d_other_headers(client):
+    main.limiter.reset()
+    _register(client, "phase4d_other_user", "phase4dopass1")
+    return _auth_headers(client, "phase4d_other_user", "phase4dopass1")
+
+
+def _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, filename, topic="water cycle"):
+    """
+    Generates a 3-question quiz (remember/understand/apply, all agreed by
+    the mocked checker) via the real /generate-quiz route, and returns
+    (book_id, the_apply_question) -- the question dict the regenerate
+    tests below act on.
+    """
+    import llm as llm_module
+    import main as main_module
+
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, filename)
+
+    seed = [
+        _bloom_fix_question(1, "true_false", "remember", "Original remember question text.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Original understand question text.", "Original understand answer."),
+        _bloom_fix_question(3, "scenario", "apply", "Original apply question text.", "Original apply answer."),
+    ]
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(seed, start=1)]}
+        return {"questions": seed}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": topic, "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200, res.text
+    target = next(q for q in res.json()["questions"] if q["bloom_level"] == "apply")
+    return book_id, target
+
+
+def test_regenerate_question_keeps_id_and_level_updates_text(client, phase4d_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4d_headers
+    book_id, target = _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, "regen_basic.txt")
+    question_id = target["question_id"]
+
+    main.limiter.reset()
+    replacement = _bloom_fix_question(1, "scenario", "apply", "A brand new distinct apply-level question.", "A brand new answer.")
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": 1, "level": "apply"}]}
+        return {"questions": [replacement]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post(f"/questions/{question_id}/regenerate", headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["question_id"] == question_id
+    assert data["bloom_level"] == "apply"
+    assert data["bloom_check"] == "verified"
+    assert data["question"] == "A brand new distinct apply-level question."
+    assert data["question"] != target["question"]
+
+    # Confirm it's the SAME row, updated in place.
+    list_res = client.get("/questions", headers=headers, params={"topic": "water cycle"})
+    matching = [item for item in list_res.json()["items"] if item["question_id"] == question_id]
+    assert len(matching) == 1
+    assert matching[0]["question"] == "A brand new distinct apply-level question."
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_regenerate_question_with_different_allowed_type(client, phase4d_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4d_headers
+    book_id, target = _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, "regen_type.txt")
+    question_id = target["question_id"]
+    assert target["type"] == "scenario"
+
+    main.limiter.reset()
+    replacement = _bloom_fix_question(1, "short_answer", "apply", "A short-answer apply-level replacement.", "A replacement answer.")
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": 1, "level": "apply"}]}
+        return {"questions": [replacement]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post(f"/questions/{question_id}/regenerate", headers=headers, json={"type": "short_answer"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["type"] == "short_answer"
+    assert data["bloom_level"] == "apply"
+    assert data["question"] == "A short-answer apply-level replacement."
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_regenerate_question_rejects_type_not_allowed_for_level(client, phase4d_headers, monkeypatch):
+    headers = phase4d_headers
+    book_id, target = _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, "regen_badtype.txt")
+    question_id = target["question_id"]
+
+    main.limiter.reset()
+    # "interview" is not one of apply's allowed types (mcq/scenario/short_answer).
+    res = client.post(f"/questions/{question_id}/regenerate", headers=headers, json={"type": "interview"})
+    assert res.status_code == 400
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_regenerate_question_other_user_gets_404(client, phase4d_headers, phase4d_other_headers, monkeypatch):
+    headers = phase4d_headers
+    other_headers = phase4d_other_headers
+    book_id, target = _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, "regen_404.txt")
+    question_id = target["question_id"]
+
+    main.limiter.reset()
+    res = client.post(f"/questions/{question_id}/regenerate", headers=other_headers)
+    assert res.status_code == 404
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_regenerate_question_returns_503_on_llm_unavailable(client, phase4d_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase4d_headers
+    book_id, target = _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, "regen_503.txt")
+    question_id = target["question_id"]
+
+    main.limiter.reset()
+
+    def raise_unavailable(*a, **kw):
+        raise llm_module.LLMUnavailableError("boom")
+
+    monkeypatch.setattr(llm_module, "generate_json", raise_unavailable)
+
+    res = client.post(f"/questions/{question_id}/regenerate", headers=headers)
+    assert res.status_code == 503
+    assert res.json()["detail"] == main.AI_BUSY_DETAIL
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_questions_summary_counts(client, phase4d_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4d_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "regen_summary.txt")
+
+    seed = [
+        _bloom_fix_question(1, "true_false", "remember", "Summary remember question.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Summary understand question.", "Summary understand answer."),
+        _bloom_fix_question(3, "scenario", "apply", "Summary apply question.", "Summary apply answer."),
+    ]
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            # Disagrees on the "apply" one -- after the regen-on-mismatch
+            # attempt (which gets the same fixed seed back) it stays flagged.
+            return {"items": [
+                {"id": 1, "level": "remember"},
+                {"id": 2, "level": "understand"},
+                {"id": 3, "level": "create"},
+            ]}
+        return {"questions": seed}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "summary counts topic", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+    questions = res.json()["questions"]
+    flagged_count = sum(1 for q in questions if q["bloom_check"] == "flagged")
+    assert flagged_count >= 1
+
+    summary = client.get("/questions/summary", headers=headers).json()
+    assert summary["total"] >= 3
+    assert summary["flagged"] >= flagged_count
+    assert sum(summary["by_level"].values()) == summary["total"]
+
+    client.delete(f"/books/{book_id}", headers=headers)

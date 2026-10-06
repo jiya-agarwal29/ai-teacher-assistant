@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 import bloom
@@ -323,9 +324,12 @@ QUIZ_PROMPT_RULES = (
     "options is omitted. For long_answer, scenario, viva and interview questions, "
     "the explanation must list the KEY POINTS a good answer should include (a "
     "short marking guide), not just a single correct sentence. Every question "
-    "must test a different concept from the sources, every question needs a "
-    "source_index (the number of the source chunk it's grounded in) and a "
-    "bloom_level matching exactly the level it was written for below."
+    "must test a different idea, concept, or scenario from every other question "
+    "in this quiz and from the sources -- no two questions may share the same "
+    "underlying concept or scenario setup, even if worded differently. Every "
+    "question needs a source_index (the number of the source chunk it's "
+    "grounded in) and a bloom_level matching exactly the level it was written "
+    "for below."
 )
 
 # A question's Bloom level is chosen when it's written (here, by the prompt
@@ -366,14 +370,28 @@ def _bloom_level_prompt_block(level_counts: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_quiz_prompt(topic: str, top_pages, level_counts: dict) -> str:
+def _build_quiz_prompt(topic: str, top_pages, level_counts: dict, recent_questions: list = None) -> str:
+    """
+    `recent_questions` (up to 15 of the user's own previously-saved question
+    *texts* for this topic, newest first -- never another user's, and never
+    answers/explanations) is handed to the model as extra context on what
+    not to repeat; omitted entirely when there's no history yet.
+    """
     numbered_sources = "\n\n".join(
         f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
     )
+    recent_block = ""
+    if recent_questions:
+        recent_list = "\n".join(f"- {text}" for text in recent_questions)
+        recent_block = (
+            "\n\nDo not repeat or closely paraphrase any of these questions already "
+            f"asked on this topic:\n{recent_list}"
+        )
     return (
         f"Create a quiz about '{topic}' based on the numbered sources below.\n\n"
         f"{QUIZ_PROMPT_RULES}\n\n"
-        f"Bloom's taxonomy levels to write:\n{_bloom_level_prompt_block(level_counts)}\n\n"
+        f"Bloom's taxonomy levels to write:\n{_bloom_level_prompt_block(level_counts)}"
+        f"{recent_block}\n\n"
         f"Sources:\n{numbered_sources}"
     )
 
@@ -418,8 +436,29 @@ def _classify_questions_with_gemini(question_texts: list):
     return [detected_by_position.get(i) for i in range(1, len(question_texts) + 1)]
 
 
+def _generate_and_validate_questions(
+    topic: str, top_pages, level_counts: dict, drop_log: list = None, recent_questions: list = None
+) -> list:
+    """
+    ONE generate_json call for exactly the levels/counts in `level_counts`
+    (the same per-level prompt rules and anti-repeat context as a full
+    quiz), validated and cleaned via _validate_quiz_questions. No retry
+    loop and no minimum-count threshold -- those belong to "generate a
+    whole quiz" (_generate_quiz_with_gemini) alone. Every other caller --
+    the mismatch-regeneration and missing-level top-up below, and the
+    single-question regenerate endpoint -- wants exactly one shot at
+    exactly the slots it asked for, so they all share this instead of
+    duplicating the prompt-build-validate sequence. Propagates
+    llm.LLMUnavailableError; callers decide how to handle it.
+    """
+    prompt = _build_quiz_prompt(topic, top_pages, level_counts, recent_questions)
+    result = llm.generate_json(prompt, schema=QUIZ_SCHEMA)
+    raw_questions = result.get("questions", []) if isinstance(result, dict) else []
+    return _validate_quiz_questions(raw_questions, len(top_pages), list(level_counts.keys()), drop_log)
+
+
 def _check_and_fix_bloom_levels(
-    questions: list, topic: str, top_pages, levels: list, drop_log: list = None
+    questions: list, topic: str, top_pages, drop_log: list = None, recent_questions: list = None
 ) -> list:
     """
     Runs the Bloom level check on `questions` (each already carrying the
@@ -468,14 +507,10 @@ def _check_and_fix_bloom_levels(
         regen_counts[level] = regen_counts.get(level, 0) + 1
 
     try:
-        result = llm.generate_json(
-            _build_quiz_prompt(topic, top_pages, regen_counts), schema=QUIZ_SCHEMA
-        )
-        raw_regenerated = result.get("questions", []) if isinstance(result, dict) else []
+        regenerated = _generate_and_validate_questions(topic, top_pages, regen_counts, drop_log, recent_questions)
     except llm.LLMUnavailableError:
-        raw_regenerated = []
+        regenerated = []
 
-    regenerated = _validate_quiz_questions(raw_regenerated, len(top_pages), list(regen_counts.keys()), drop_log)
     pool_by_level = {}
     for q in regenerated:
         pool_by_level.setdefault(q["bloom_level"], []).append(q)
@@ -1612,26 +1647,22 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
 
 
 def _generate_quiz_with_gemini(
-    topic: str, top_pages, levels: list, level_counts: dict, drop_log: list = None
+    topic: str, top_pages, level_counts: dict, drop_log: list = None, recent_questions: list = None
 ):
     """
-    Builds the per-Bloom-level prompt, asks Gemini for a full quiz as JSON,
-    and validates/cleans the result. Returns the cleaned question list on
-    success, or None if fewer than 3 valid questions remain even after one
-    retry -- the caller falls back to generate_quiz() (the local hybrid
-    generator) in that case. Raises NotImplementedError for LLM_PROVIDER=local
-    and llm.LLMUnavailableError on a persistently unavailable provider, same
-    as llm.generate_json() itself. Does not run the Bloom level check or the
-    missing-level top-up -- those are the caller's job (_check_and_fix_bloom_levels,
+    Asks Gemini for a full quiz as JSON (via _generate_and_validate_questions)
+    and returns the cleaned question list on success, or None if fewer than
+    3 valid questions remain even after one retry -- the caller falls back
+    to generate_quiz() (the local hybrid generator) in that case. Raises
+    NotImplementedError for LLM_PROVIDER=local and llm.LLMUnavailableError
+    on a persistently unavailable provider, same as llm.generate_json()
+    itself. Does not run the Bloom level check or the missing-level top-up
+    -- those are the caller's job (_check_and_fix_bloom_levels,
     _top_up_missing_levels), since they need the final assembled list, not
     whatever a single attempt happens to be.
     """
-    prompt = _build_quiz_prompt(topic, top_pages, level_counts)
-
     for _attempt in range(2):  # one retry if the first pass yields too few valid questions
-        result = llm.generate_json(prompt, schema=QUIZ_SCHEMA)
-        raw_questions = result.get("questions", []) if isinstance(result, dict) else []
-        questions = _validate_quiz_questions(raw_questions, len(top_pages), levels, drop_log)
+        questions = _generate_and_validate_questions(topic, top_pages, level_counts, drop_log, recent_questions)
         if len(questions) >= 3:
             return questions
 
@@ -1639,7 +1670,7 @@ def _generate_quiz_with_gemini(
 
 
 def _top_up_missing_levels(
-    questions: list, topic: str, top_pages, level_counts: dict, drop_log: list = None
+    questions: list, topic: str, top_pages, level_counts: dict, drop_log: list = None, recent_questions: list = None
 ) -> tuple:
     """
     Compares what actually survived validation/checking against what was
@@ -1663,15 +1694,11 @@ def _top_up_missing_levels(
         return questions, []
 
     try:
-        result = llm.generate_json(
-            _build_quiz_prompt(topic, top_pages, missing_counts), schema=QUIZ_SCHEMA
-        )
-        raw_topped_up = result.get("questions", []) if isinstance(result, dict) else []
+        topped_up = _generate_and_validate_questions(topic, top_pages, missing_counts, drop_log, recent_questions)
     except llm.LLMUnavailableError:
-        raw_topped_up = []
+        topped_up = []
 
-    topped_up = _validate_quiz_questions(raw_topped_up, len(top_pages), list(missing_counts.keys()), drop_log)
-    topped_up = _check_and_fix_bloom_levels(topped_up, topic, top_pages, list(missing_counts.keys()), drop_log)
+    topped_up = _check_and_fix_bloom_levels(topped_up, topic, top_pages, drop_log, recent_questions)
 
     next_id = max((q["id"] for q in questions), default=0) + 1
     for q in topped_up:
@@ -1693,6 +1720,25 @@ def _top_up_missing_levels(
 QUESTION_CHECK_STATUSES = ("verified", "flagged", "unchecked", "teacher_set")
 MIN_QUIZ_QUESTION_COUNT = 1
 MAX_QUIZ_QUESTION_COUNT = 12
+RECENT_QUESTIONS_LIMIT = 15
+
+
+def _recent_question_texts(db: Session, user_id: int, topic: str, limit: int = RECENT_QUESTIONS_LIMIT) -> list:
+    """
+    This user's own up-to-`limit` most recently saved question *texts* for
+    `topic` (case-insensitive match), newest first -- handed to the
+    generation prompt as "don't repeat these". Scoped to user_id, so
+    another user's questions for the same topic never appear here. Only
+    the question text is read, never the answer/explanation.
+    """
+    rows = (
+        db.query(Question.question)
+        .filter(Question.user_id == user_id, Question.topic.ilike(_escape_like(topic), escape="\\"))
+        .order_by(Question.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [row[0] for row in rows]
 
 
 def _resolve_question_source(db: Session, top_pages, source_index):
@@ -1825,9 +1871,10 @@ def generate_ai_quiz(
     level_counts = bloom.distribute(count, requested_levels)
     drop_log = []
     warnings = []
+    recent_questions = _recent_question_texts(db, current_user.id, topic)
 
     try:
-        questions = _generate_quiz_with_gemini(topic, top_pages, requested_levels, level_counts, drop_log)
+        questions = _generate_quiz_with_gemini(topic, top_pages, level_counts, drop_log, recent_questions)
     except NotImplementedError:
         # LLM_PROVIDER=local has no structured JSON output -- go straight
         # to the local hybrid quiz generator below.
@@ -1850,8 +1897,10 @@ def generate_ai_quiz(
             q["bloom_check"] = "unchecked"
             q["detected_level"] = None
     else:
-        questions = _check_and_fix_bloom_levels(questions, topic, top_pages, requested_levels, drop_log)
-        questions, warnings = _top_up_missing_levels(questions, topic, top_pages, level_counts, drop_log)
+        questions = _check_and_fix_bloom_levels(questions, topic, top_pages, drop_log, recent_questions)
+        questions, warnings = _top_up_missing_levels(
+            questions, topic, top_pages, level_counts, drop_log, recent_questions
+        )
         quiz_text = format_quiz_text(questions)
 
     if drop_log:
@@ -1952,8 +2001,12 @@ def list_questions(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if level is not None and not bloom.is_valid_level(level):
-        raise HTTPException(status_code=422, detail=f"Unknown Bloom's level: '{level}'")
+    level_keys = None
+    if level is not None and level.strip():
+        level_keys = [key.strip() for key in level.split(",") if key.strip()]
+        for key in level_keys:
+            if not bloom.is_valid_level(key):
+                raise HTTPException(status_code=422, detail=f"Unknown Bloom's level: '{key}'")
     if check is not None and check not in QUESTION_CHECK_STATUSES:
         raise HTTPException(status_code=422, detail=f"Unknown check status: '{check}'")
     if not (1 <= limit <= 200):
@@ -1962,8 +2015,8 @@ def list_questions(
         raise HTTPException(status_code=422, detail="offset must be >= 0.")
 
     query = db.query(Question).filter(Question.user_id == current_user.id)
-    if level is not None:
-        query = query.filter(Question.bloom_level == level)
+    if level_keys:
+        query = query.filter(Question.bloom_level.in_(level_keys))
     if check is not None:
         query = query.filter(Question.bloom_check == check)
     if topic is not None and topic.strip():
@@ -1973,6 +2026,27 @@ def list_questions(
     rows = query.order_by(Question.created_at.desc()).offset(offset).limit(limit).all()
 
     return {"total": total, "items": [_question_summary(db, row) for row in rows]}
+
+
+@app.get("/questions/summary")
+def get_questions_summary(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    base_query = db.query(Question).filter(Question.user_id == current_user.id)
+
+    total = base_query.count()
+    flagged = base_query.filter(Question.bloom_check == "flagged").count()
+
+    by_level = {
+        level_key: count
+        for level_key, count in db.query(Question.bloom_level, func.count(Question.id))
+        .filter(Question.user_id == current_user.id)
+        .group_by(Question.bloom_level)
+        .all()
+    }
+
+    return {"total": total, "by_level": by_level, "flagged": flagged}
 
 
 class QuestionUpdateRequest(BaseModel):
@@ -2055,3 +2129,92 @@ def delete_question(
     db.delete(question)
     db.commit()
     return {"status": "Question deleted successfully"}
+
+
+class RegenerateQuestionRequest(BaseModel):
+    type: str | None = None
+
+
+@app.post("/questions/{question_id}/regenerate")
+@limiter.limit("10/minute", key_func=_user_rate_limit_key)
+def regenerate_question(
+    request: Request,
+    question_id: int,
+    payload: RegenerateQuestionRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Writes ONE new question for the same topic and the same bloom_level as
+    `question_id` (optionally a different type, still allowed at that
+    level), reusing the exact same sources-based generation and Bloom
+    level check as /generate-quiz (Phase 4B), and replaces the row's
+    content in place -- same id, same topic, same bloom_level.
+    """
+    question = _get_owned_question_or_404(db, question_id, current_user.id)
+    level = bloom.get_level(question.bloom_level)
+
+    new_type = payload.type if payload and payload.type else question.type
+    if new_type not in level.question_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Question type '{new_type}' is not valid for Bloom level '{question.bloom_level}'."
+        )
+
+    top_pages = _retrieve_or_503(db, current_user.id, question.topic, top_k=5, apply_threshold=True)
+    if not top_pages:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough information found in uploaded documents to regenerate this question."
+        )
+
+    recent_questions = _recent_question_texts(db, current_user.id, question.topic)
+    drop_log = []
+    level_counts = {question.bloom_level: 1}
+
+    try:
+        candidates = []
+        for _attempt in range(2):  # one retry, same as a full quiz generation
+            batch = _generate_and_validate_questions(
+                question.topic, top_pages, level_counts, drop_log, recent_questions
+            )
+            # A level can allow several types; keep only the one asked for.
+            candidates = [q for q in batch if q["type"] == new_type]
+            if candidates:
+                break
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+    if drop_log:
+        reason_counts = Counter(drop_log)
+        logger.info(
+            "Question regeneration for topic '%s': %s",
+            question.topic, "; ".join(f"dropped {count}: {reason}" for reason, count in reason_counts.items())
+        )
+
+    if not candidates:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not generate a replacement question right now. Please try again."
+        )
+
+    new_question = candidates[0]
+    new_question["id"] = 1
+    [new_question] = _check_and_fix_bloom_levels(
+        [new_question], question.topic, top_pages, drop_log, recent_questions
+    )
+
+    _, book_id, page_id = _resolve_question_source(db, top_pages, new_question.get("source_index"))
+
+    question.type = new_question["type"]
+    question.bloom_check = new_question["bloom_check"]
+    question.detected_level = new_question.get("detected_level")
+    question.question = new_question["question"]
+    question.options = json.dumps(new_question["options"]) if new_question.get("options") else None
+    question.correct_answer = new_question["correctAnswer"]
+    question.explanation = new_question["explanation"]
+    question.book_id = book_id
+    question.page_id = page_id
+
+    db.commit()
+    return _question_summary(db, question)

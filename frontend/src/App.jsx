@@ -12,6 +12,7 @@ import Chat from './pages/Chat';
 import Documents from './pages/Documents';
 import DocumentReview from './pages/DocumentReview';
 import AITools from './pages/AITools';
+import QuestionBank from './pages/QuestionBank';
 import Analytics from './pages/Analytics';
 
 export default function App() {
@@ -55,6 +56,7 @@ export default function App() {
               <Route path="/documents" element={<Documents />} />
               <Route path="/documents/:id/review" element={<DocumentReview />} />
               <Route path="/tools" element={<AITools />} />
+              <Route path="/question-bank" element={<QuestionBank />} />
               <Route path="/analytics" element={<Analytics />} />
             </Route>
 

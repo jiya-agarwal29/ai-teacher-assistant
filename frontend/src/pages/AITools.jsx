@@ -46,6 +46,7 @@ export default function AITools() {
     setSearchParams({ tab: tabName });
     setQuizResult(null);
     setQuizQuestions([]);
+    setQuizWarnings([]);
     setSemanticResult(null);
     setSummarizerResult(null);
     setFlashcardMessage('');
@@ -62,6 +63,7 @@ export default function AITools() {
   const [quizTopic, setQuizTopic] = useState('');
   const [quizResult, setQuizResult] = useState(null);
   const [quizQuestions, setQuizQuestions] = useState([]);
+  const [quizWarnings, setQuizWarnings] = useState([]); // e.g. "Could not create enough Analyze questions..."
   const [selectedAnswers, setSelectedAnswers] = useState({}); // { questionId: selectedOptionLetter }
   const [fillBlankAnswers, setFillBlankAnswers] = useState({}); // { questionId: string }
   const [shortAnswers, setShortAnswers] = useState({}); // { questionId: string }
@@ -235,6 +237,7 @@ export default function AITools() {
     setIsLoading(true);
     setQuizResult(null);
     setQuizQuestions([]);
+    setQuizWarnings([]);
     setSelectedAnswers({});
     setFillBlankAnswers({});
     setShortAnswers({});
@@ -245,7 +248,8 @@ export default function AITools() {
     try {
       const res = await api.quiz.generate(quizTopic, { levels: effectiveLevels, count: questionCount });
       setQuizResult(res.quiz);
-      
+      setQuizWarnings(res.warnings || []);
+
       if (res.questions && res.questions.length > 0) {
         setQuizQuestions(res.questions);
       } else {
@@ -548,6 +552,21 @@ export default function AITools() {
                   </div>
                 </form>
               </div>
+
+              {/* Generation warnings, e.g. a requested level came up short */}
+              {quizWarnings.length > 0 && (
+                <div className="space-y-2 animate-fadeIn">
+                  {quizWarnings.map((warning, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-start gap-3 p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 text-[11px] font-medium"
+                    >
+                      <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                      <span>{warning}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {/* Quiz interactive display */}
               {quizQuestions.length > 0 ? (
