@@ -14,6 +14,7 @@ Gemini (`GEMINI_API_KEY`, free tier) is the main AI provider for both answer gen
 - **Quiz Builder** — generates MCQ / true-false / fill-in-the-blank / short & long answer / scenario / viva / interview questions from your material, with grading
 - **Notes Summarizer** and **AI Tutor** — bullet-point summaries and free-form Q&A
 - **Analytics** — real usage stats (active study time, quiz performance, question activity, document library breakdown), computed from what you've actually done, not placeholder numbers
+- **Bloom's taxonomy & Question Bank** — every quiz question is tagged with a Bloom's cognitive level, independently checked (not just self-assigned), and saved to a browsable, editable, regenerate-one-at-a-time Question Bank (see [Bloom's taxonomy](#blooms-taxonomy))
 - **Session-expiry warning** — a "your session is about to expire" popup with a live countdown and a one-click "Stay logged in", so a lesson-prep session isn't cut off mid-work without warning (see [Session expiry](#session-expiry))
 
 ## Tech stack
@@ -30,7 +31,8 @@ backend/
   auth.py                JWT auth, password hashing
   jobs.py                 Background document-processing worker (ThreadPoolExecutor), incl. OCR orchestration
   ocr.py                   PDF-page rendering (pypdfium2) + image preparation (Pillow) for OCR
-  models.py               SQLAlchemy models (User, Book, Page, DocumentPage)
+  models.py               SQLAlchemy models (User, Book, Page, DocumentPage, Question)
+  bloom.py                 Bloom's taxonomy: the six levels, verbs, prompt rules, verb classifier (pure Python, no imports from the rest of the app)
   database.py            SQLite engine/session setup
   document_parsers.py    PDF/DOCX/PPTX parsing + chunking
   embeddings.py           Swappable embeddings (Gemini / Voyage / local MiniLM)
@@ -39,9 +41,10 @@ backend/
   scripts/reembed.py      Re-embeds stored pages after switching EMBEDDING_PROVIDER
   uploads/                Saved original files, one folder per <user_id>/<book_id> (gitignored)
 frontend/
-  src/pages/               Home, Chat, Documents, DocumentReview, AITools, Analytics, Login
-  src/components/          Sidebar, PageLayout, ProtectedRoute, DocumentStatusBadge
-  src/hooks/                Auth, active-time tracking, quiz/query history
+  src/pages/               Home, Chat, Documents, DocumentReview, AITools, QuestionBank, Analytics, Login
+  src/components/          Sidebar, PageLayout, ProtectedRoute, DocumentStatusBadge, BloomBadge
+  src/hooks/                Auth, active-time tracking, quiz/query history, useBloomLevels
+  src/utils/bloomColors.js  The six levels' colours (cool → warm), shared by BloomBadge/the quiz builder/Analytics
   src/services/api.js      Backend API client
 ```
 
@@ -192,6 +195,41 @@ A `needs_review` book's amber badge (and a "Review" button in Documents.jsx) lin
 
 All five endpoints are owner-only (`404` otherwise) and only ever operate on files inside the book's own upload folder.
 
+## Bloom's taxonomy
+
+Every quiz question — AI-generated or the local hybrid fallback — is tagged with one of Bloom's six cognitive levels, defined once in `backend/bloom.py` (deliberately pure Python, no imports from the rest of the app) as the single source of truth for each level's label, description, prompt rules, and which quiz question types suit it:
+
+| Level | Checks |
+|---|---|
+| **Remember** | Recall facts, terms, or basic ideas exactly as learned. |
+| **Understand** | Explain ideas or concepts in your own words. |
+| **Apply** | Use what was learned in a new situation. |
+| **Analyze** | Break information into parts and see how they relate. |
+| **Evaluate** | Make a judgement about something and justify it. |
+| **Create** | Design, propose, or build something new using the ideas. |
+
+**How a level is chosen, and checked** — a level is *chosen* when a question is written and only ever *checked* afterward; it's never derived from the question's type (`mcq`/`scenario`/etc. are a separate axis, the answer format). `GET /generate-quiz?topic=&levels=&count=` (`levels` a comma-separated subset, default all six; `count` 1–12, default 6) uses `bloom.distribute()` to spread `count` questions across the requested levels (lower levels get any remainder first) and asks Gemini for exactly that many per level in one call, each one self-labelled with the `bloom_level` it was written for. That self-label then goes through two independent checks before it's trusted:
+
+1. **`bloom.classify_by_verbs()`** — a free, instant, keyword/phrase match (no API call) against each level's common verbs. Used only to log a disagreement at `DEBUG`, never to override anything — it's a sanity check, not a judge.
+2. **A second Gemini call** classifies every question's level from its text alone — it is never told which level each one was *written* for, so it can't just agree by default.
+3. A question the checker disagrees with is regenerated **once** for that specific slot and rechecked. Still wrong afterward, it's kept but marked `bloom_check="flagged"` with `detected_level` set to what the checker thinks it actually is instead.
+4. Separately, if a level ends up short after validation (a disallowed type, a leaked answer, a duplicate, etc. — all silently dropped and logged in aggregate at `INFO`, e.g. `"dropped 1: type 'true_false' not allowed for 'analyze'"`, never with the question's own text), **one** extra call tops up just the missing slots. Still short after that, the response's top-level `warnings` array gets one plain-English line for it (`"Could not create enough Analyze questions -- try again or pick other levels"`) instead of silently shipping fewer questions than asked.
+5. Every write (initial generation, the mismatch retry, and the top-up) also gets a reminder that every question must test a different idea/concept/scenario from the others, plus up to 15 of the user's own most recent saved question texts on that exact topic (never another user's, and never the answers) as "don't repeat these."
+
+Every saved question ends up with a `bloom_check` of `"verified"` (the checker agreed), `"flagged"` (it disagreed, even after the retry), `"unchecked"` (the checker was unavailable, or the local hybrid fallback was used — it has no concept of Bloom levels at all, so its questions are labelled after the fact by the verb classifier alone, defaulting to `"remember"` on no match), or `"teacher_set"` (a teacher changed the level by hand).
+
+**The Question Bank** (`/question-bank`, `src/pages/QuestionBank.jsx`) — every question ever generated is saved (the `Question` table) and browsable from here: a summary strip (total, flagged, a bar per level), level-chip (multi-select) and "flagged only" filters, a debounced topic search, 50-at-a-time pagination, and per-question **Edit** (inline, including the Bloom level — restricted to levels valid for that question's type — with backend validation errors shown inline), **Regenerate** (confirm first; one new question for the same topic/level, replacing it in place), and **Delete** (confirm first).
+
+**Endpoints** (all owner-only, `404` for another user's question):
+
+- `GET /bloom/levels` — the six levels (`key`, `label`, `order`, `description`, `question_types`); the frontend (`useBloomLevels` hook) fetches this once and never hard-codes a label or description.
+- `GET /generate-quiz?topic=&levels=&count=` — the existing response shape plus, per question, `question_id`/`bloom_level`/`bloom_label`/`bloom_check`/`detected_level`/`source`, and top-level `levels`/`level_counts`/`warnings`.
+- `GET /questions?level=&topic=&check=&limit=&offset=` — `{total, items}`, newest first. `level` accepts one key or a comma-separated list; `topic` is a case-insensitive contains match; `check` is one of `verified`/`flagged`/`unchecked`/`teacher_set`; `limit`/`offset` default `50`/`0`.
+- `GET /questions/summary` — `{total, by_level: {key: n}, flagged}`, backing the Question Bank's summary strip.
+- `PATCH /questions/{id}` `{question?, options?, correct_answer?, explanation?, bloom_level?}` — changing `bloom_level` sets `bloom_check="teacher_set"`; validated the same way generation is (e.g. an `mcq` needs exactly 4 distinct options).
+- `POST /questions/{id}/regenerate` `{type?}` (10/minute per user) — writes one new question for the same topic and `bloom_level` (optionally a different type still valid for that level), reusing the exact same generation-and-check machinery as `/generate-quiz`. `503` if the AI is unavailable.
+- `DELETE /questions/{id}`, and `DELETE /books/{id}` also deletes that book's questions.
+
 ## Session expiry
 
 `POST /refresh-token` (requires a still-valid token; an expired or invalid one gets the usual `401`) exchanges it for a new one with a fresh `ACCESS_TOKEN_EXPIRE_MINUTES` expiry, same response shape as `/login`. Rate-limited to 10/minute per user, same as the other authenticated routes.
@@ -214,7 +252,7 @@ cd backend
 python migrate.py <username>
 ```
 
-This adds the `books.user_id` column if it's missing and assigns every currently-unowned book to `<username>` (which must already be a registered account), adds `pages.embedding_model` if missing, backfilling it to `"local:all-MiniLM-L6-v2"` on existing rows (all pages embedded before this column existed used local MiniLM), adds the Phase 3A processing columns (`books.status`/`error`/`source_type`/`pages_total`/`pages_done`/`created_at`) if missing, backfilling `status="ready"` on existing rows (they were fully processed synchronously before the background pipeline existed), and adds the Phase 3B OCR columns (`books.review_ocr`, and the `document_pages` table) if missing. Safe to run more than once — every column/table is only added once, and every backfill only ever touches rows that still need it.
+This adds the `books.user_id` column if it's missing and assigns every currently-unowned book to `<username>` (which must already be a registered account), adds `pages.embedding_model` if missing, backfilling it to `"local:all-MiniLM-L6-v2"` on existing rows (all pages embedded before this column existed used local MiniLM), adds the Phase 3A processing columns (`books.status`/`error`/`source_type`/`pages_total`/`pages_done`/`created_at`) if missing, backfilling `status="ready"` on existing rows (they were fully processed synchronously before the background pipeline existed), adds the Phase 3B OCR columns (`books.review_ocr`, and the `document_pages` table) if missing, and creates the `questions` table (see [Bloom's taxonomy](#blooms-taxonomy)) if missing. Safe to run more than once — every column/table is only added once, and every backfill only ever touches rows that still need it.
 
 ## Running tests
 
@@ -266,6 +304,8 @@ Unexpected server errors (anything not raised deliberately as an `HTTPException`
 - **`flan-t5-small` answer quality (LLM_PROVIDER=local only).** The default `LLM_PROVIDER=gemini` doesn't have this limitation. The local answer-generation model is intentionally small (so it runs on a CPU with no external API key), which means answers can be shallow, occasionally repetitive, or misphrase a nuance from the source text. For sharper answers on `local`, uploading more specific/well-structured source material tends to help more than rephrasing the question.
 - **Single SQLite file, single worker.** Fine for individual or small-team use; not built for high-concurrency or multi-instance deployment (see the `--workers 1` note above).
 - **English-oriented.** The embedding and generation models (Gemini, Voyage, and the local fallbacks) are primarily English-trained; other languages will work less reliably for retrieval and generation.
+- **Bloom's level checking is AI-based and can be wrong.** The question writer and the independent checker are both the same kind of model making a judgment call — they can agree with each other on a label a human teacher would dispute (e.g. a question that mostly restates an already-stated fact can pass as "Analyze" when it's really closer to "Understand"). A `bloom_check="verified"` means two automated passes agreed, not that the level is pedagogically correct — spot-check real output; don't take it as ground truth.
+- **Each quiz costs several Gemini calls, not one.** Writing N levels in one quiz costs at least one call to generate it and one to check it, plus up to two more if any level needs the mismatch-retry or the missing-level top-up (see [Bloom's taxonomy](#blooms-taxonomy)) — on a free-tier quota, a handful of quizzes in quick succession can exhaust the per-minute budget and return a `503`, on top of the OCR/embedding calls already noted above.
 
 ## Notes
 
