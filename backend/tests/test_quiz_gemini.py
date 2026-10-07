@@ -193,3 +193,42 @@ def test_type_allowed_for_its_bloom_level_passes():
     q = _short_answer(bloom_level="apply")  # short_answer is allowed at apply
     result = main._validate_quiz_questions([q], 1, ALL_LEVELS)
     assert len(result) == 1
+
+
+# -----------------------------
+# Phase 4 fixes: checker-prompt rule for directly-stated answers
+# -----------------------------
+def test_classifier_prompt_contains_direct_answer_rule(monkeypatch):
+    import llm as llm_module
+
+    captured = {}
+
+    def fake_generate_json(prompt, schema, system=None):
+        captured["prompt"] = prompt
+        return {"items": [{"id": 1, "level": "remember"}]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    class FakePage:
+        content = "Some source text."
+
+    main._classify_questions_with_gemini(["Some question?"], top_pages=[(1.0, FakePage())])
+
+    assert "stated directly" in captured["prompt"]
+    assert "at most Understand" in captured["prompt"]
+
+
+def test_classifier_prompt_omits_rule_without_sources(monkeypatch):
+    import llm as llm_module
+
+    captured = {}
+
+    def fake_generate_json(prompt, schema, system=None):
+        captured["prompt"] = prompt
+        return {"items": [{"id": 1, "level": "remember"}]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    main._classify_questions_with_gemini(["Some question?"])
+
+    assert "stated directly" not in captured["prompt"]

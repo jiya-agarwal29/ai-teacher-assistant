@@ -2208,6 +2208,108 @@ def test_regenerate_question_returns_503_on_llm_unavailable(client, phase4d_head
     client.delete(f"/books/{book_id}", headers=headers)
 
 
+def test_regenerate_question_retries_with_a_different_type_when_first_fails(client, phase4d_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4d_headers
+    book_id, target = _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, "regen_retry_type.txt")
+    question_id = target["question_id"]
+    assert target["type"] == "scenario"
+
+    main.limiter.reset()
+
+    quiz_call = {"n": 0}
+    mcq_replacement = _bloom_fix_question(
+        1, "mcq", "apply", "A brand new mcq apply-level question.", "A",
+        options=["Alpha", "Beta", "Gamma", "Delta"]
+    )
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": 1, "level": "apply"}]}
+        quiz_call["n"] += 1
+        if quiz_call["n"] == 1:
+            return {"questions": []}  # first attempt (type=scenario): nothing usable
+        return {"questions": [mcq_replacement]}  # second attempt (a different allowed type): succeeds
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post(f"/questions/{question_id}/regenerate", headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["type"] == "mcq"
+    assert data["bloom_level"] == "apply"
+    assert quiz_call["n"] == 2
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_regenerate_question_both_attempts_fail_returns_422(client, phase4d_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4d_headers
+    book_id, target = _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, "regen_both_fail.txt")
+    question_id = target["question_id"]
+
+    main.limiter.reset()
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": 1, "level": "apply"}]}
+        return {"questions": []}  # every attempt comes back empty
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post(f"/questions/{question_id}/regenerate", headers=headers)
+    assert res.status_code == 422
+    assert res.json()["detail"] == (
+        "Couldn't write a different question on this topic. Try another question type, or edit this one yourself."
+    )
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_regenerate_question_logs_drop_reasons_without_leaking_text(client, phase4d_headers, monkeypatch, caplog):
+    import logging
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4d_headers
+    book_id, target = _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, "regen_drop_log.txt")
+    question_id = target["question_id"]
+
+    main.limiter.reset()
+
+    secret_marker = "zzz_regen_secret_zzz"
+    # true_false isn't an allowed type at "apply" -- dropped for that reason
+    # on every attempt, regardless of which type was being tried.
+    bad_question = {
+        "id": 1, "type": "true_false", "bloom_level": "apply",
+        "question": f"True or False: {secret_marker} is real.",
+        "options": ["True", "False"], "correctAnswer": "A",
+        "explanation": "Explained in source 1.", "source_index": 1
+    }
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": 1, "level": "apply"}]}
+        return {"questions": [bad_question]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    with caplog.at_level(logging.INFO, logger="main"):
+        res = client.post(f"/questions/{question_id}/regenerate", headers=headers)
+    assert res.status_code == 422
+
+    drop_logs = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+    assert any("not allowed for 'apply'" in msg for msg in drop_logs)
+    assert all(secret_marker not in r.getMessage() for r in caplog.records)
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
 def test_questions_summary_counts(client, phase4d_headers, monkeypatch):
     import llm as llm_module
     import main as main_module
@@ -2248,5 +2350,76 @@ def test_questions_summary_counts(client, phase4d_headers, monkeypatch):
     assert summary["total"] >= 3
     assert summary["flagged"] >= flagged_count
     assert sum(summary["by_level"].values()) == summary["total"]
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+# -----------------------------
+# PHASE 4 FIXES: NEAR-DUPLICATE QUESTIONS GET DROPPED + TOPPED UP
+# -----------------------------
+def test_generate_quiz_drops_near_duplicate_and_tops_up(client, phase4b_headers, monkeypatch, caplog):
+    import logging
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bloom_near_dup.txt")
+
+    # Q2 and Q3 are near-identical rewordings of the same "understand"
+    # question ("rivers" vs "lakes" is the only real difference) -- high
+    # enough word overlap to trip the Jaccard near-duplicate check.
+    initial = [
+        _bloom_fix_question(1, "true_false", "remember", "True or False: heat causes evaporation.", "A"),
+        _bloom_fix_question(
+            2, "short_answer", "understand",
+            "Explain why water evaporates from oceans and rivers due to heat from the sun.",
+            "Heat from the sun causes evaporation."
+        ),
+        _bloom_fix_question(
+            3, "short_answer", "understand",
+            "Explain why water evaporates from oceans and lakes due to heat from the sun.",
+            "Heat from the sun causes evaporation."
+        ),
+    ]
+    topped_up_question = _bloom_fix_question(
+        4, "scenario", "apply", "A hiker sees clouds forming overhead. Apply the water cycle to explain why.",
+        "Condensation is occurring."
+    )
+
+    quiz_call = {"n": 0}
+    classifier_call = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            classifier_call["n"] += 1
+            if classifier_call["n"] == 1:
+                return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(initial, start=1)]}
+            return {"items": [{"id": 1, "level": "apply"}]}  # recheck of the topped-up question
+
+        quiz_call["n"] += 1
+        if quiz_call["n"] == 1:
+            return {"questions": initial}
+        return {"questions": [topped_up_question]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    with caplog.at_level(logging.INFO, logger="main"):
+        res = client.get(
+            "/generate-quiz", headers=headers,
+            params={"topic": "water cycle", "levels": "remember,understand,apply", "count": 3}
+        )
+    assert res.status_code == 200
+    data = res.json()
+    questions = data["questions"]
+    assert len(questions) == 3
+
+    levels_present = [q["bloom_level"] for q in questions]
+    assert levels_present.count("understand") == 1  # the near-duplicate was dropped
+    assert "apply" in levels_present  # backfilled by the existing top-up mechanism
+    assert quiz_call["n"] == 2  # initial generation + exactly one top-up call
+
+    drop_logs = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+    assert any("too similar to another question in this quiz" in msg for msg in drop_logs)
 
     client.delete(f"/books/{book_id}", headers=headers)

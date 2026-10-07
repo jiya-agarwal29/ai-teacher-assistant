@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
 import { recordQuizAttempt } from '../hooks/useQuizHistory';
@@ -38,6 +38,28 @@ const BLOOM_LEVELS_STORAGE_KEY = 'quiz_bloom_levels';
 const BLOOM_COUNT_STORAGE_KEY = 'quiz_bloom_count';
 const QUESTION_COUNT_OPTIONS = [6, 9, 12];
 
+// sessionStorage key for the in-progress quiz itself (topic, questions,
+// answers, submitted state) -- survives a refresh but not a tab close,
+// and is cleared on logout/"New Quiz"/generating a different quiz.
+const QUIZ_SESSION_STORAGE_KEY = 'ai_tools_quiz_state';
+
+function readPersistedQuizState() {
+  try {
+    const raw = sessionStorage.getItem(userScopedKey(QUIZ_SESSION_STORAGE_KEY));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPersistedQuizState() {
+  try {
+    sessionStorage.removeItem(userScopedKey(QUIZ_SESSION_STORAGE_KEY));
+  } catch {
+    // sessionStorage unavailable (private mode quota, etc.) -- not fatal.
+  }
+}
+
 export default function AITools() {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = searchParams.get('tab') || 'quiz';
@@ -60,15 +82,71 @@ export default function AITools() {
   // -----------------------------
   // TOOL 1: QUIZ GENERATOR STATE
   // -----------------------------
-  const [quizTopic, setQuizTopic] = useState('');
-  const [quizResult, setQuizResult] = useState(null);
-  const [quizQuestions, setQuizQuestions] = useState([]);
-  const [quizWarnings, setQuizWarnings] = useState([]); // e.g. "Could not create enough Analyze questions..."
-  const [selectedAnswers, setSelectedAnswers] = useState({}); // { questionId: selectedOptionLetter }
-  const [fillBlankAnswers, setFillBlankAnswers] = useState({}); // { questionId: string }
-  const [shortAnswers, setShortAnswers] = useState({}); // { questionId: string }
-  const [shortAnswerGrades, setShortAnswerGrades] = useState({}); // { questionId: 'correct' | 'incorrect' }
-  const [submittedQuiz, setSubmittedQuiz] = useState(false);
+  // Read once, at mount, so a page refresh restores the quiz in progress
+  // (topic, questions, answers, submitted state) instead of losing it.
+  const [restoredQuiz] = useState(() => readPersistedQuizState());
+
+  const [quizTopic, setQuizTopic] = useState(restoredQuiz?.topic || '');
+  const [topicError, setTopicError] = useState('');
+  const topicInputRef = useRef(null);
+  const [quizResult, setQuizResult] = useState(restoredQuiz?.quizResult ?? null);
+  const [quizQuestions, setQuizQuestions] = useState(restoredQuiz?.quizQuestions || []);
+  const [quizWarnings, setQuizWarnings] = useState(restoredQuiz?.quizWarnings || []); // e.g. "Could not create enough Analyze questions..."
+  const [selectedAnswers, setSelectedAnswers] = useState(restoredQuiz?.selectedAnswers || {}); // { questionId: selectedOptionLetter }
+  const [fillBlankAnswers, setFillBlankAnswers] = useState(restoredQuiz?.fillBlankAnswers || {}); // { questionId: string }
+  const [shortAnswers, setShortAnswers] = useState(restoredQuiz?.shortAnswers || {}); // { questionId: string }
+  const [shortAnswerGrades, setShortAnswerGrades] = useState(restoredQuiz?.shortAnswerGrades || {}); // { questionId: 'correct' | 'incorrect' }
+  const [submittedQuiz, setSubmittedQuiz] = useState(restoredQuiz?.submittedQuiz || false);
+
+  // Persist the quiz-in-progress on every change, and clear it once there's
+  // nothing worth restoring (no topic typed, no quiz generated).
+  useEffect(() => {
+    if (!quizTopic.trim() && quizQuestions.length === 0) {
+      clearPersistedQuizState();
+      return;
+    }
+    try {
+      sessionStorage.setItem(
+        userScopedKey(QUIZ_SESSION_STORAGE_KEY),
+        JSON.stringify({
+          topic: quizTopic,
+          quizResult,
+          quizQuestions,
+          quizWarnings,
+          selectedAnswers,
+          fillBlankAnswers,
+          shortAnswers,
+          shortAnswerGrades,
+          submittedQuiz
+        })
+      );
+    } catch {
+      // sessionStorage unavailable -- nothing to do about it here.
+    }
+  }, [quizTopic, quizResult, quizQuestions, quizWarnings, selectedAnswers, fillBlankAnswers, shortAnswers, shortAnswerGrades, submittedQuiz]);
+
+  // Logout clears the in-progress quiz too -- 'before-logout' fires while
+  // the current username (and so the right sessionStorage key) still
+  // resolves, same contract useDraftPersistence.js relies on.
+  useEffect(() => {
+    const handleBeforeLogout = () => clearPersistedQuizState();
+    window.addEventListener('before-logout', handleBeforeLogout);
+    return () => window.removeEventListener('before-logout', handleBeforeLogout);
+  }, []);
+
+  const handleNewQuiz = () => {
+    setQuizTopic('');
+    setTopicError('');
+    setQuizResult(null);
+    setQuizQuestions([]);
+    setQuizWarnings([]);
+    setSelectedAnswers({});
+    setFillBlankAnswers({});
+    setShortAnswers({});
+    setShortAnswerGrades({});
+    setSubmittedQuiz(false);
+    clearPersistedQuizState();
+  };
 
   // Bloom's level picker + question count, remembered per user.
   const { levels: bloomLevels, byKey: bloomLevelsByKey } = useBloomLevels();
@@ -232,7 +310,12 @@ export default function AITools() {
 
   const handleGenerateQuiz = async (e) => {
     e.preventDefault();
-    if (!quizTopic.trim()) return;
+    if (!quizTopic.trim()) {
+      setTopicError('Please enter a topic first');
+      topicInputRef.current?.focus();
+      return;
+    }
+    setTopicError('');
 
     setIsLoading(true);
     setQuizResult(null);
@@ -460,13 +543,26 @@ export default function AITools() {
               <div className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm">
                 <h3 className="text-xs font-bold text-slate-900 dark:text-white mb-3">Topic-based Quiz Generation</h3>
                 <form onSubmit={handleGenerateQuiz} className="space-y-4">
-                  <input
-                    type="text"
-                    placeholder="e.g. Photosynthesis"
-                    value={quizTopic}
-                    onChange={(e) => setQuizTopic(e.target.value)}
-                    className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
-                  />
+                  <div>
+                    <input
+                      ref={topicInputRef}
+                      type="text"
+                      placeholder="e.g. Photosynthesis"
+                      value={quizTopic}
+                      onChange={(e) => {
+                        setQuizTopic(e.target.value);
+                        if (topicError) setTopicError('');
+                      }}
+                      className={`w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 transition-all ${
+                        topicError
+                          ? 'border-rose-400 dark:border-rose-500 focus:border-rose-500'
+                          : 'border-slate-200 dark:border-slate-800 focus:border-violet-500'
+                      }`}
+                    />
+                    {topicError && (
+                      <p className="text-[10px] font-semibold text-rose-500 mt-1.5">{topicError}</p>
+                    )}
+                  </div>
 
                   {/* Bloom's level picker */}
                   <div className="space-y-2">
@@ -573,38 +669,46 @@ export default function AITools() {
                 <div className="space-y-6 animate-fadeIn">
                   <div className="flex justify-between items-center bg-slate-100 dark:bg-slate-800/40 p-4 rounded-2xl">
                     <span className="text-xs font-bold">Generated Quiz for: "{quizTopic}"</span>
-                    {!submittedQuiz ? (
+                    <div className="flex items-center gap-2">
+                      {!submittedQuiz ? (
+                        <button
+                          onClick={() => {
+                            const result = calculateScore();
+                            if (result.totalCount > 0) {
+                              recordQuizAttempt({
+                                topic: quizTopic,
+                                correct: result.correctCount,
+                                total: result.totalCount,
+                                byLevel: getScoreByLevel()
+                              });
+                            }
+                            setSubmittedQuiz(true);
+                          }}
+                          className="px-4 py-2 bg-violet-600 hover:bg-violet-500 text-white rounded-xl text-xs font-bold hover:scale-[1.01] transition-all"
+                        >
+                          Submit Answers
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            setSubmittedQuiz(false);
+                            setSelectedAnswers({});
+                            setFillBlankAnswers({});
+                            setShortAnswers({});
+                            setShortAnswerGrades({});
+                          }}
+                          className="px-4 py-2 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-bold transition-colors"
+                        >
+                          Retry / Reset
+                        </button>
+                      )}
                       <button
-                        onClick={() => {
-                          const result = calculateScore();
-                          if (result.totalCount > 0) {
-                            recordQuizAttempt({
-                              topic: quizTopic,
-                              correct: result.correctCount,
-                              total: result.totalCount,
-                              byLevel: getScoreByLevel()
-                            });
-                          }
-                          setSubmittedQuiz(true);
-                        }}
-                        className="px-4 py-2 bg-violet-600 hover:bg-violet-500 text-white rounded-xl text-xs font-bold hover:scale-[1.01] transition-all"
+                        onClick={handleNewQuiz}
+                        className="px-4 py-2 border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 rounded-xl text-xs font-bold hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors"
                       >
-                        Submit Answers
+                        New Quiz
                       </button>
-                    ) : (
-                      <button
-                        onClick={() => {
-                          setSubmittedQuiz(false);
-                          setSelectedAnswers({});
-                          setFillBlankAnswers({});
-                          setShortAnswers({});
-                          setShortAnswerGrades({});
-                        }}
-                        className="px-4 py-2 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-bold transition-colors"
-                      >
-                        Retry / Reset
-                      </button>
-                    )}
+                    </div>
                   </div>
 
                   {/* PREMIUM SCORE TRACKING CARD */}

@@ -39,6 +39,7 @@ function QuestionRow({ item, bloomLevels, onUpdated, onDeleted }) {
   const [regenerating, setRegenerating] = useState(false);
   const [regenerateError, setRegenerateError] = useState('');
   const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
 
   const [draftQuestion, setDraftQuestion] = useState(item.question);
   const [draftOptions, setDraftOptions] = useState(item.options || []);
@@ -101,11 +102,12 @@ function QuestionRow({ item, bloomLevels, onUpdated, onDeleted }) {
   const handleDelete = async () => {
     if (!window.confirm('Delete this question? This cannot be undone.')) return;
     setDeleting(true);
+    setDeleteError('');
     try {
       await api.questions.delete(item.question_id);
       onDeleted(item.question_id);
     } catch (err) {
-      setRegenerateError(err.message || 'Could not delete this question.');
+      setDeleteError(err.message || 'Could not delete this question.');
       setDeleting(false);
     }
   };
@@ -161,6 +163,9 @@ function QuestionRow({ item, bloomLevels, onUpdated, onDeleted }) {
 
           {regenerateError && (
             <p className="text-[10px] font-semibold text-rose-500">{regenerateError}</p>
+          )}
+          {deleteError && (
+            <p className="text-[10px] font-semibold text-rose-500">{deleteError}</p>
           )}
 
           <div className="flex items-center gap-2">

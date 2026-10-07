@@ -34,6 +34,16 @@ SHARED_SOURCE_CONSTRAINT = (
     "The concepts must come from the sources; only the situation may be new."
 )
 
+# Apply and every level above it add this -- a question testing real
+# application/analysis/evaluation/creation is too easy (and really just
+# Remember/Understand in disguise) if the sources already spell out the
+# answer almost word for word. See also the matching checker-side rule in
+# main.py's _bloom_level_descriptions_block.
+NO_DIRECT_ANSWER_CONSTRAINT = (
+    "The answer must NOT be stated directly (or almost word for word) in the "
+    "sources -- the student has to work it out, not find and copy it."
+)
+
 
 @dataclass(frozen=True)
 class BloomLevel:
@@ -97,6 +107,7 @@ LEVELS = (
         prompt_rules=(
             "Put the concept into a NEW situation not described in the sources; "
             "the student must use the idea, not repeat it. " + SHARED_SOURCE_CONSTRAINT
+            + " " + NO_DIRECT_ANSWER_CONSTRAINT
         ),
     ),
     BloomLevel(
@@ -114,6 +125,7 @@ LEVELS = (
         prompt_rules=(
             "Ask about relationships, causes, differences or how parts fit "
             "together. " + SHARED_SOURCE_CONSTRAINT
+            + " " + NO_DIRECT_ANSWER_CONSTRAINT
         ),
     ),
     BloomLevel(
@@ -130,6 +142,7 @@ LEVELS = (
         prompt_rules=(
             "Ask for a judgement or decision AND its justification against "
             "clear criteria. " + SHARED_SOURCE_CONSTRAINT
+            + " " + NO_DIRECT_ANSWER_CONSTRAINT
         ),
     ),
     BloomLevel(
@@ -146,6 +159,7 @@ LEVELS = (
         prompt_rules=(
             "Ask the student to design, propose or plan something new using "
             "the concepts. " + SHARED_SOURCE_CONSTRAINT
+            + " " + NO_DIRECT_ANSWER_CONSTRAINT
         ),
     ),
 )

@@ -44,7 +44,8 @@ from auth import (
     verify_password,
     hash_password,
     get_current_user,
-    verify_token
+    verify_token,
+    ACCESS_TOKEN_EXPIRE_MINUTES
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -101,6 +102,7 @@ async def lifespan(app: FastAPI):
         db.close()
 
     logger.info("Upload limit: %g MB, OCR page limit: %d", MAX_UPLOAD_MB, MAX_OCR_PAGES)
+    logger.info("Session length: %d minutes", ACCESS_TOKEN_EXPIRE_MINUTES)
     logger.info("Startup complete")
     yield
     logger.info("Shutting down")
@@ -400,21 +402,41 @@ def _bloom_level_descriptions_block() -> str:
     return "\n".join(f"- {level.key}: {level.description}" for level in bloom.LEVELS)
 
 
-def _classify_questions_with_gemini(question_texts: list):
+# Mirrors bloom.py's NO_DIRECT_ANSWER_CONSTRAINT (asked of the writer for
+# Apply and above) from the checker's side: even a question phrased with an
+# "Apply"/"Analyze"/etc. verb is really no harder than Understand if the
+# sources just hand over the answer.
+CHECKER_DIRECT_ANSWER_RULE = (
+    "If the answer is stated directly (or almost word for word) in the "
+    "sources, the question is at most Understand, whatever verbs it uses."
+)
+
+
+def _classify_questions_with_gemini(question_texts: list, top_pages=None):
     """
     Asks Gemini to classify each question's Bloom level independently, from
     the question text alone -- it is never told which level the question was
     written for, since this is a check on that choice, not a source of it.
-    Returns a list of levels (or None entries) aligned by position with
-    `question_texts`, or None if the whole response wasn't shaped as
-    expected (treated the same as llm.LLMUnavailableError by the caller:
-    leave the affected questions unchecked rather than fail the quiz).
+    `top_pages` (the same numbered sources the questions were generated
+    from) lets the checker apply CHECKER_DIRECT_ANSWER_RULE; omitted, the
+    rule is simply skipped for that call. Returns a list of levels (or None
+    entries) aligned by position with `question_texts`, or None if the
+    whole response wasn't shaped as expected (treated the same as
+    llm.LLMUnavailableError by the caller: leave the affected questions
+    unchecked rather than fail the quiz).
     """
     numbered = "\n".join(f"{i}. {text}" for i, text in enumerate(question_texts, start=1))
+    sources_block = ""
+    if top_pages:
+        numbered_sources = "\n\n".join(
+            f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
+        )
+        sources_block = f"\n\n{CHECKER_DIRECT_ANSWER_RULE}\n\nSources:\n{numbered_sources}"
     prompt = (
         "Classify each numbered question below into exactly one Bloom's "
         "taxonomy level, based only on what it asks the student to do. "
-        f"The six levels are:\n{_bloom_level_descriptions_block()}\n\n"
+        f"The six levels are:\n{_bloom_level_descriptions_block()}"
+        f"{sources_block}\n\n"
         f"Questions:\n{numbered}"
     )
     result = llm.generate_json(prompt, schema=CLASSIFIER_SCHEMA)
@@ -477,7 +499,7 @@ def _check_and_fix_bloom_levels(
             )
 
     try:
-        detected_levels = _classify_questions_with_gemini([q["question"] for q in questions])
+        detected_levels = _classify_questions_with_gemini([q["question"] for q in questions], top_pages)
     except llm.LLMUnavailableError:
         detected_levels = None
 
@@ -527,7 +549,9 @@ def _check_and_fix_bloom_levels(
 
     if replaced_indices:
         try:
-            recheck = _classify_questions_with_gemini([questions[i]["question"] for i in replaced_indices])
+            recheck = _classify_questions_with_gemini(
+                [questions[i]["question"] for i in replaced_indices], top_pages
+            )
         except llm.LLMUnavailableError:
             recheck = None
 
@@ -545,6 +569,47 @@ def _check_and_fix_bloom_levels(
                 questions[i]["detected_level"] = detected
 
     return questions
+
+
+NEAR_DUPLICATE_JACCARD_THRESHOLD = 0.5
+_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+
+
+def _normalized_words(text: str) -> set:
+    return set(_WORD_PATTERN.findall(text.lower()))
+
+
+def _jaccard_similarity(text_a: str, text_b: str) -> float:
+    words_a = _normalized_words(text_a)
+    words_b = _normalized_words(text_b)
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / len(words_a | words_b)
+
+
+def _drop_near_duplicates(questions: list, drop_log: list = None) -> list:
+    """
+    _validate_quiz_questions already drops *exact*-text duplicates; this
+    catches near-identical rewordings it wouldn't, by comparing every pair
+    of questions' word-overlap (Jaccard similarity on normalized text).
+    For any pair at or above NEAR_DUPLICATE_JACCARD_THRESHOLD, drops the
+    LATER one -- the caller's existing top-up mechanism (_top_up_missing_levels)
+    naturally refills whichever level that leaves short.
+    """
+    dropped_indices = set()
+    for i in range(len(questions)):
+        if i in dropped_indices:
+            continue
+        for j in range(i + 1, len(questions)):
+            if j in dropped_indices:
+                continue
+            similarity = _jaccard_similarity(questions[i]["question"], questions[j]["question"])
+            if similarity >= NEAR_DUPLICATE_JACCARD_THRESHOLD:
+                dropped_indices.add(j)
+                if drop_log is not None:
+                    drop_log.append("too similar to another question in this quiz")
+
+    return [q for idx, q in enumerate(questions) if idx not in dropped_indices]
 
 
 class RegisterRequest(BaseModel):
@@ -1898,6 +1963,7 @@ def generate_ai_quiz(
             q["detected_level"] = None
     else:
         questions = _check_and_fix_bloom_levels(questions, topic, top_pages, drop_log, recent_questions)
+        questions = _drop_near_duplicates(questions, drop_log)
         questions, warnings = _top_up_missing_levels(
             questions, topic, top_pages, level_counts, drop_log, recent_questions
         )
@@ -2172,15 +2238,21 @@ def regenerate_question(
     drop_log = []
     level_counts = {question.bloom_level: 1}
 
+    # First attempt asks for `new_type`; if that comes up empty, one retry
+    # tries a *different* allowed type for this level (if the level has
+    # one) rather than just asking the same question again and hoping.
+    fallback_types = [t for t in level.question_types if t != new_type]
+    types_to_try = [new_type] + fallback_types[:1]
+
     try:
         candidates = []
-        for _attempt in range(2):  # one retry, same as a full quiz generation
+        for candidate_type in types_to_try:
             batch = _generate_and_validate_questions(
                 question.topic, top_pages, level_counts, drop_log, recent_questions
             )
-            # A level can allow several types; keep only the one asked for.
-            candidates = [q for q in batch if q["type"] == new_type]
+            candidates = [q for q in batch if q["type"] == candidate_type]
             if candidates:
+                new_type = candidate_type
                 break
     except llm.LLMUnavailableError:
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
@@ -2194,8 +2266,8 @@ def regenerate_question(
 
     if not candidates:
         raise HTTPException(
-            status_code=503,
-            detail="Could not generate a replacement question right now. Please try again."
+            status_code=422,
+            detail="Couldn't write a different question on this topic. Try another question type, or edit this one yourself."
         )
 
     new_question = candidates[0]

@@ -1,3 +1,5 @@
+import { recordActivity } from '../utils/activity';
+
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
 /**
@@ -88,6 +90,12 @@ export const isTokenExpired = (token) => {
  * - Session expiration (401)
  */
 async function request(endpoint, options = {}) {
+  // Any API call counts as user activity for AuthProvider's idle-aware
+  // session handling (see utils/activity.js) -- a logged-in user making
+  // real requests shouldn't get the "session ending" popup just because
+  // their mouse happened to be still.
+  recordActivity();
+
   const token = getToken();
   
   // Build headers
