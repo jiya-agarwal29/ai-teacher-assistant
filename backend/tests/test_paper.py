@@ -189,6 +189,23 @@ def test_plan_mid_sem_50_balanced_every_slot_has_level_and_types():
         assert entry["bloom_level"] in paper.levels_allowed_for_marks(entry["marks"])
 
 
+def test_plan_mid_sem_50_balanced_all_six_levels_covered():
+    # Phase 5A fix: every targeted level must get at least one slot if any
+    # slot allows it, even at the cost of overshooting its target -- for
+    # mid_sem_50 + balanced that means all six levels show up, including
+    # Create (which can only ever land on a 10-mark either_or question).
+    pattern = paper.PRESET_PATTERNS["mid_sem_50"]
+    result = paper.plan_paper(pattern, paper.BLOOM_PRESETS["balanced"], UNITS_3)
+    planned = result["blueprint_planned"]["by_level"]
+    for level in bloom.level_keys():
+        assert planned[level] > 0, f"{level} got zero marks"
+
+    create_slots = [e for e in result["plan"] if e["bloom_level"] == "create"]
+    assert create_slots
+    assert all(e["marks"] == 10 for e in create_slots)
+    assert result["warnings"] == []  # nothing is actually unreachable here
+
+
 def test_plan_mid_sem_50_balanced_levels_close_to_target_where_possible():
     pattern = paper.PRESET_PATTERNS["mid_sem_50"]
     result = paper.plan_paper(pattern, paper.BLOOM_PRESETS["balanced"], UNITS_3)
@@ -213,6 +230,42 @@ def test_plan_mid_sem_50_balanced_every_unit_used():
     by_unit = result["blueprint_planned"]["by_unit"]
     for unit in UNITS_3:
         assert by_unit[unit["id"]] > 0, f"unit {unit['id']} was never used"
+
+
+def test_plan_mid_sem_50_balanced_sections_a_and_b_use_at_least_two_units():
+    # Phase 5A fix: with 2+ units, no section with 2+ questions may come
+    # from a single unit. Section A (5 questions) and Section B (5
+    # questions) both qualify; Section C is all either_or pairs, which
+    # already guarantee 2+ units per pair on their own.
+    pattern = paper.PRESET_PATTERNS["mid_sem_50"]
+    result = paper.plan_paper(pattern, paper.BLOOM_PRESETS["balanced"], UNITS_3)
+    units_by_section = {}
+    for entry in result["plan"]:
+        units_by_section.setdefault(entry["section"], set()).add(entry["unit_id"])
+
+    assert len(units_by_section["A"]) >= 2
+    assert len(units_by_section["B"]) >= 2
+
+
+def test_plan_mid_sem_50_balanced_unit_totals_equal_marks_on_paper():
+    # Phase 5A fix: units are counted the same way as levels (either_or's
+    # option (a) only), so by_unit sums to marks_on_paper, not more.
+    pattern = paper.PRESET_PATTERNS["mid_sem_50"]
+    result = paper.plan_paper(pattern, paper.BLOOM_PRESETS["balanced"], UNITS_3)
+    by_unit = result["blueprint_planned"]["by_unit"]
+    assert sum(by_unit.values()) == paper.marks_on_paper(pattern) == 55
+
+
+def test_plan_mid_sem_50_balanced_units_including_alternatives_counts_both_options():
+    pattern = paper.PRESET_PATTERNS["mid_sem_50"]
+    result = paper.plan_paper(pattern, paper.BLOOM_PRESETS["balanced"], UNITS_3)
+    by_unit = result["blueprint_planned"]["by_unit"]
+    with_alt = result["blueprint_planned"]["units_including_alternatives"]
+    # Section C contributes an extra marks_each per either_or pair (the
+    # "(b)" option) once both options are counted.
+    assert sum(with_alt.values()) == sum(by_unit.values()) + 20
+    for uid in by_unit:
+        assert with_alt[uid] >= by_unit[uid]
 
 
 def test_plan_mid_sem_50_balanced_either_or_options_share_level_and_marks_differ_in_unit():

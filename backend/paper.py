@@ -319,6 +319,50 @@ def _pick_level(eligible_levels: list, assigned: dict, targets: dict) -> str:
     return max(eligible_levels, key=lambda level: (gap(level), bloom.get_level(level).order))
 
 
+def _assign_coverage(groups: list, group_eligibility: list, bloom_targets: dict) -> tuple:
+    """
+    Phase 0, run before any marks-balancing: every level with a target > 0
+    that has at least one eligible slot ANYWHERE on the paper must get
+    assigned to one of them, even if that overshoots its target -- a level
+    only skips this if NO slot allows it at all (that's a real
+    impossibility, reported separately). Processes the scarcest levels
+    first (fewest eligible slots) so a level that can only ever use one
+    kind of slot (e.g. Create, high-marks-only) claims one before a level
+    with many alternatives (e.g. Understand) crowds it out; among a
+    level's eligible slots, picks the smallest-marks one first so a big
+    slot isn't burned on coverage when a small one would do.
+
+    Returns (level_by_group_index, levels_with_no_eligible_slot_at_all).
+    """
+    needs_coverage = [lvl for lvl in bloom.level_keys() if bloom_targets.get(lvl, 0) > 0]
+
+    eligible_indices = {
+        lvl: [i for i, elig in enumerate(group_eligibility) if lvl in elig]
+        for lvl in needs_coverage
+    }
+    impossible = [lvl for lvl in needs_coverage if not eligible_indices[lvl]]
+    coverable = [lvl for lvl in needs_coverage if eligible_indices[lvl]]
+
+    # Scarcest first; ties broken by canonical level order for determinism.
+    coverable.sort(key=lambda lvl: (len(eligible_indices[lvl]), bloom.get_level(lvl).order))
+
+    level_by_group = [None] * len(groups)
+    used_groups = set()
+    for lvl in coverable:
+        candidates = [i for i in eligible_indices[lvl] if i not in used_groups]
+        if not candidates:
+            # Every eligible slot was already claimed by a scarcer level's
+            # coverage pick -- this level may still pick up marks during
+            # the balancing pass if it shares eligibility with a slot that
+            # ends up unclaimed, but has no slot reserved just for it.
+            continue
+        chosen = min(candidates, key=lambda i: (_group_marks(groups[i]), i))
+        level_by_group[chosen] = lvl
+        used_groups.add(chosen)
+
+    return level_by_group, impossible
+
+
 def _impossibility_reason(level_key: str, paper_kind: str) -> str:
     bands = [
         band_label for band_label, sample_marks in (("1-2 mark", 2), ("3-6 mark", 5), ("7+ mark", 8))
@@ -334,6 +378,131 @@ def _impossibility_reason(level_key: str, paper_kind: str) -> str:
 def _pick_unit(unit_ids: list, assigned: dict, targets: dict, exclude=None) -> str:
     candidates = [uid for uid in unit_ids if uid != exclude] or list(unit_ids)
     return max(candidates, key=lambda uid: targets.get(uid, 0) - assigned.get(uid, 0))
+
+
+def _assign_units(groups: list, pattern: Pattern, units: list) -> dict:
+    """
+    Assigns a unit to every slot. Driven by ONE running balance
+    (`assigned_full`, every printed slot counted once each -- both
+    either_or options included, since that's what's really spread across
+    the page) against `targets_full` (the same convention). Two things
+    layered on top of that single greedy pick:
+
+    - Either_or pairs always get two DIFFERENT units for their two options
+      (when 2+ units exist).
+    - A repair pass afterward: no section with 2+ questions may end up
+      using only one unit when 2+ units exist overall -- if the greedy
+      picks left a section monotone, its last question is moved to the
+      next-best alternative unit.
+
+    Returns {
+      "unit_by_slot_index": {...},
+      "by_unit": {...}          -- marks_on_paper convention (either_or's
+                                    option (a) only), so sums to marks_on_paper
+      "units_including_alternatives": {...}  -- every slot counted, both
+                                    either_or options included
+      "unit_ids": [...], "targets_main": {...}  -- for the warning check
+    }
+    """
+    unit_ids = [u["id"] for u in units]
+    if not unit_ids:
+        return {
+            "unit_by_slot_index": {},
+            "by_unit": {},
+            "units_including_alternatives": {},
+            "unit_ids": [],
+            "targets_main": {},
+        }
+
+    weights = {u["id"]: (u.get("weight") or 1) for u in units}
+    total_weight = sum(weights.values()) or 1
+
+    all_slots = [slot for group in groups for slot in group]
+    full_total = sum(slot["marks"] for slot in all_slots)
+    targets_full = {uid: (weights[uid] / total_weight) * full_total for uid in unit_ids}
+    assigned_full = {uid: 0 for uid in unit_ids}
+
+    section_of_group = []
+    for section in pattern.sections:
+        section_of_group.extend([section.key] * section.num_questions)
+
+    unit_by_group = [None] * len(groups)       # "none"/"any_n": a single unit
+    unit_pair_by_group = [None] * len(groups)  # "either_or": (unit_a, unit_b)
+
+    for gi, group in enumerate(groups):
+        if len(group) == 2:
+            u1 = _pick_unit(unit_ids, assigned_full, targets_full)
+            assigned_full[u1] += group[0]["marks"]
+            exclude = u1 if len(unit_ids) >= 2 else None
+            u2 = _pick_unit(unit_ids, assigned_full, targets_full, exclude=exclude)
+            assigned_full[u2] += group[1]["marks"]
+            unit_pair_by_group[gi] = (u1, u2)
+        else:
+            u = _pick_unit(unit_ids, assigned_full, targets_full)
+            assigned_full[u] += group[0]["marks"]
+            unit_by_group[gi] = u
+
+    # Repair pass: no 2+-question section may be monotone when 2+ units exist.
+    if len(unit_ids) >= 2:
+        section_group_indices = {}
+        for gi, key in enumerate(section_of_group):
+            section_group_indices.setdefault(key, []).append(gi)
+
+        for group_indices in section_group_indices.values():
+            if len(group_indices) < 2:
+                continue  # exempt -- the section has only 1 question
+
+            units_in_section = set()
+            for gi in group_indices:
+                if unit_pair_by_group[gi] is not None:
+                    units_in_section.update(unit_pair_by_group[gi])
+                else:
+                    units_in_section.add(unit_by_group[gi])
+
+            if len(units_in_section) > 1:
+                continue  # already spread -- nothing to repair
+
+            # Monotone (either_or pairs already guarantee 2+ units on
+            # their own, so only a run of "none"/"any_n" slots can land
+            # here) -- move the section's last slot to the next-best unit.
+            only_unit = next(iter(units_in_section))
+            last_gi = group_indices[-1]
+            last_group = groups[last_gi]
+            assigned_full[only_unit] -= last_group[0]["marks"]
+            new_unit = _pick_unit(unit_ids, assigned_full, targets_full, exclude=only_unit)
+            assigned_full[new_unit] += last_group[0]["marks"]
+            unit_by_group[last_gi] = new_unit
+
+    # --- Flatten into per-slot-index maps, and the two reporting totals ---
+    unit_by_slot_index = {}
+    by_unit = {uid: 0 for uid in unit_ids}                    # marks_on_paper convention
+    units_including_alternatives = {uid: 0 for uid in unit_ids}
+
+    slot_index = 0
+    for gi, group in enumerate(groups):
+        if unit_pair_by_group[gi] is not None:
+            u1, u2 = unit_pair_by_group[gi]
+            unit_by_slot_index[slot_index] = u1
+            unit_by_slot_index[slot_index + 1] = u2
+            by_unit[u1] += group[0]["marks"]  # option (a) only -- matches marks_on_paper
+            units_including_alternatives[u1] += group[0]["marks"]
+            units_including_alternatives[u2] += group[1]["marks"]
+        else:
+            u = unit_by_group[gi]
+            unit_by_slot_index[slot_index] = u
+            by_unit[u] += group[0]["marks"]
+            units_including_alternatives[u] += group[0]["marks"]
+        slot_index += len(group)
+
+    targets_main = {uid: (weights[uid] / total_weight) * marks_on_paper(pattern) for uid in unit_ids}
+
+    return {
+        "unit_by_slot_index": unit_by_slot_index,
+        "by_unit": by_unit,
+        "units_including_alternatives": units_including_alternatives,
+        "unit_ids": unit_ids,
+        "targets_main": targets_main,
+    }
 
 
 def plan_paper(pattern: Pattern, bloom_targets: dict, units: list) -> dict:
@@ -357,80 +526,50 @@ def plan_paper(pattern: Pattern, bloom_targets: dict, units: list) -> dict:
 
     group_eligibility = [_eligible_levels_for_group(group, pattern.paper_kind) for group in groups]
 
-    # Biggest slots first (stable sort keeps paper order among ties, so
-    # the result is deterministic for a given pattern/targets/units).
-    order = sorted(range(len(groups)), key=lambda i: -_group_marks(groups[i]))
-
-    assigned_marks = {level: 0 for level in bloom.level_keys()}
-    level_by_group = [None] * len(groups)
-
-    for i in order:
-        eligible = group_eligibility[i]
-        if not eligible:
-            slot0 = groups[i][0]
+    for i, group in enumerate(groups):
+        if not group_eligibility[i]:
+            slot0 = group[0]
             warnings.append(
                 f"Section '{slot0['section']}' question {slot0['number']}: no Bloom level fits "
-                f"{_group_marks(groups[i])} mark(s) on a {pattern.paper_kind} paper."
+                f"{_group_marks(group)} mark(s) on a {pattern.paper_kind} paper."
             )
-            continue
-        level = _pick_level(eligible, assigned_marks, targets_marks)
+
+    # Phase 0: every targeted level that has ANY eligible slot gets one,
+    # even if that overshoots -- before marks-balancing runs at all.
+    level_by_group, impossible_levels = _assign_coverage(groups, group_eligibility, bloom_targets)
+
+    assigned_marks = {level: 0 for level in bloom.level_keys()}
+    for i, level in enumerate(level_by_group):
+        if level:
+            assigned_marks[level] += _group_marks(groups[i])
+
+    # Phase 1: balance the remaining (uncovered) slots, biggest first
+    # (stable sort keeps paper order among ties, so the result is
+    # deterministic for a given pattern/targets/units).
+    remaining = [i for i, level in enumerate(level_by_group) if level is None and group_eligibility[i]]
+    remaining.sort(key=lambda i: -_group_marks(groups[i]))
+
+    for i in remaining:
+        level = _pick_level(group_eligibility[i], assigned_marks, targets_marks)
         level_by_group[i] = level
         assigned_marks[level] += _group_marks(groups[i])
 
-    for level in bloom.level_keys():
+    for level in impossible_levels:
         target_pct = bloom_targets.get(level, 0)
-        if target_pct <= 0:
-            continue
-        ever_eligible = any(level in elig for elig in group_eligibility)
-        if not ever_eligible:
-            reason = _impossibility_reason(level, pattern.paper_kind)
-            warnings.append(f"{bloom.get_level(level).label} target {target_pct:g}% can't be met: {reason}")
-        elif assigned_marks[level] == 0:
-            warnings.append(
-                f"{bloom.get_level(level).label} target {target_pct:g}% could not be scheduled -- "
-                "its eligible slots all went to other levels competing for the same marks."
-            )
+        reason = _impossibility_reason(level, pattern.paper_kind)
+        warnings.append(f"{bloom.get_level(level).label} target {target_pct:g}% can't be met: {reason}")
 
     # --- Units ---
-    all_slots = [slot for group in groups for slot in group]
-    unit_ids = [u["id"] for u in units]
-    unit_by_slot_index = {}
-    assigned_by_unit = {uid: 0 for uid in unit_ids}
+    unit_plan = _assign_units(groups, pattern, units)
+    unit_by_slot_index = unit_plan["unit_by_slot_index"]
 
-    if units:
-        weights = {u["id"]: (u.get("weight") or 1) for u in units}
-        total_weight = sum(weights.values()) or 1
-        # Every printed slot counts once here (both either_or options
-        # included) -- a deliberately different convention from
-        # marks_on_paper()'s "one option" rule, since unit *coverage* on
-        # the page is what this is balancing, not gradable Bloom-level value.
-        printed_total = sum(slot["marks"] for slot in all_slots)
-        targets_by_unit = {uid: (w / total_weight) * printed_total for uid, w in weights.items()}
-
-        slot_index = 0
-        for group in groups:
-            if len(group) == 2:
-                first_unit = _pick_unit(unit_ids, assigned_by_unit, targets_by_unit)
-                assigned_by_unit[first_unit] += group[0]["marks"]
-                unit_by_slot_index[slot_index] = first_unit
-
-                exclude = first_unit if len(unit_ids) >= 2 else None
-                second_unit = _pick_unit(unit_ids, assigned_by_unit, targets_by_unit, exclude=exclude)
-                assigned_by_unit[second_unit] += group[1]["marks"]
-                unit_by_slot_index[slot_index + 1] = second_unit
-            else:
-                picked = _pick_unit(unit_ids, assigned_by_unit, targets_by_unit)
-                assigned_by_unit[picked] += group[0]["marks"]
-                unit_by_slot_index[slot_index] = picked
-            slot_index += len(group)
-
-        paper_face_value = total_marks(pattern)
+    if unit_plan["unit_ids"]:
         unit_names = {u["id"]: u.get("name", u["id"]) for u in units}
-        for uid in unit_ids:
-            fair_share = targets_by_unit[uid]
-            if fair_share > 0 and assigned_by_unit[uid] < fair_share * 0.5:
+        for uid in unit_plan["unit_ids"]:
+            fair_share = unit_plan["targets_main"][uid]
+            if fair_share > 0 and unit_plan["by_unit"][uid] < fair_share * 0.5:
                 warnings.append(
-                    f"Unit '{unit_names[uid]}' gets only {assigned_by_unit[uid]:g} of {paper_face_value} marks"
+                    f"Unit '{unit_names[uid]}' gets only {unit_plan['by_unit'][uid]:g} of {paper_total} marks"
                 )
 
     # --- Assemble the plan ---
@@ -457,7 +596,15 @@ def plan_paper(pattern: Pattern, bloom_targets: dict, units: list) -> dict:
         "blueprint_target": {level: round(targets_marks[level], 2) for level in bloom.level_keys()},
         "blueprint_planned": {
             "by_level": dict(assigned_marks),
-            "by_unit": dict(assigned_by_unit),
+            # marks_on_paper convention (either_or's option (a) only) --
+            # counted the same way as Bloom levels, so this sums to
+            # marks_on_paper(pattern).
+            "by_unit": dict(unit_plan["by_unit"]),
+            # Every printed slot, both either_or options included -- how
+            # much of each unit's content actually appears on the page,
+            # regardless of which option gets answered. Sums to more than
+            # marks_on_paper(pattern) whenever any either_or section exists.
+            "units_including_alternatives": dict(unit_plan["units_including_alternatives"]),
         },
         "warnings": warnings,
     }
