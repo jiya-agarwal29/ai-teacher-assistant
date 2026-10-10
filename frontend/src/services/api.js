@@ -503,6 +503,92 @@ export const api = {
     }),
   },
 
+  papers: {
+    /**
+     * GET /paper-patterns -- preset patterns + Bloom presets for the
+     * "New paper" builder.
+     */
+    patterns: () => request('/paper-patterns'),
+
+    /**
+     * GET /papers -- {id, title, status, total_marks, created_at} per paper.
+     */
+    list: () => request('/papers'),
+
+    /**
+     * GET /papers/{id} -- full detail: settings, plan, slots (each with
+     * its question, if filled), blueprint target/planned/actual, warnings.
+     */
+    get: (id) => request(`/papers/${id}`),
+
+    /**
+     * GET /papers/{id}/status -- lightweight poll target while generating:
+     * {id, status, error, waiting_for_ai, progress_done, progress_total}.
+     */
+    status: (id) => request(`/papers/${id}/status`),
+
+    /**
+     * POST /papers {title, subject?, pattern_key|pattern, bloom_preset|
+     * bloom_targets, book_ids, duration_minutes?, unit_weighting?,
+     * unit_weights?} -- plans the paper (no AI call yet); returns the same
+     * shape as get(id), status "draft".
+     */
+    create: (body) => request('/papers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
+    /**
+     * PATCH /papers/{id} {title?, subject?, duration_minutes?}
+     */
+    update: (id, body) => request(`/papers/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
+    /**
+     * DELETE /papers/{id} -- keeps the underlying bank questions.
+     */
+    remove: (id) => request(`/papers/${id}`, {
+      method: 'DELETE',
+    }),
+
+    /**
+     * POST /papers/{id}/generate -- 202, runs in the background; only
+     * fills slots still empty (safe to call again after a "failed" or a
+     * partially-filled paper). Rate-limited 3/minute.
+     */
+    generate: (id) => request(`/papers/${id}/generate`, {
+      method: 'POST',
+    }),
+
+    /**
+     * PATCH /papers/{id}/slots/{slotId} {question_id} -- swaps in a bank
+     * question (same marks, an allowed level for the slot).
+     */
+    swapSlot: (id, slotId, questionId) => request(`/papers/${id}/slots/${slotId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question_id: questionId }),
+    }),
+
+    /**
+     * POST /papers/{id}/slots/{slotId}/regenerate -- writes a new question
+     * for just this slot. Rate-limited 10/minute.
+     */
+    regenerateSlot: (id, slotId) => request(`/papers/${id}/slots/${slotId}/regenerate`, {
+      method: 'POST',
+    }),
+
+    /**
+     * GET /papers/{id}/slots/{slotId}/candidates -- up to 20 bank
+     * questions that fit this slot (same book first).
+     */
+    candidates: (id, slotId) => request(`/papers/${id}/slots/${slotId}/candidates`),
+  },
+
   tools: {
     /**
      * POST /tools/summarize {text} — summarizes pasted text only, no retrieval.

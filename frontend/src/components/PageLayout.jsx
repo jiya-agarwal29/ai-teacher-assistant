@@ -13,15 +13,19 @@ export default function PageLayout({ darkMode, setDarkMode }) {
   const { showSessionWarning, sessionExpiresAt, refreshSession, logout } = useAuth();
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-cyan-100 dark:bg-slate-950 text-slate-700 dark:text-slate-300 theme-transition">
-      {/* Animated Glowing background */}
-      <AnimatedBackground />
+    <div className="flex h-screen w-screen overflow-hidden bg-cyan-100 dark:bg-slate-950 text-slate-700 dark:text-slate-300 theme-transition print:h-auto print:w-auto print:overflow-visible print:bg-white">
+      {/* Animated Glowing background -- never printed */}
+      <div className="print:hidden">
+        <AnimatedBackground />
+      </div>
 
-      {/* Collapsible/Responsive Left Sidebar */}
-      <Sidebar darkMode={darkMode} setDarkMode={setDarkMode} />
+      {/* Collapsible/Responsive Left Sidebar -- never printed */}
+      <div className="print:hidden">
+        <Sidebar darkMode={darkMode} setDarkMode={setDarkMode} />
+      </div>
 
       {/* Main Screen Content Scrollbox */}
-      <div className="flex-1 flex flex-col h-full overflow-y-auto relative z-10 px-4 py-6 md:p-10 no-scrollbar">
+      <div className="flex-1 flex flex-col h-full overflow-y-auto relative z-10 px-4 py-6 md:p-10 no-scrollbar print:h-auto print:overflow-visible print:p-0 print:block">
         <Outlet />
       </div>
 

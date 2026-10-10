@@ -139,6 +139,20 @@ body {
   background: rgba(148, 163, 184, 0.5);
 }
 
+/* Printed exam paper: plain margins, black text, no backgrounds/shadows.
+   Sidebar/toolbar/teacher-only controls hide via the print:hidden utility
+   directly in the markup (PageLayout, PaperView) -- this just covers what
+   Tailwind's print: variant can't reach (page margins, forced colours). */
+@media print {
+  @page {
+    margin: 1.5cm;
+  }
+
+  body {
+    background: #fff !important;
+  }
+}
+
 /* 3D Flashcard flip utility classes */
 .perspective-1000 {
   perspective: 1000px;

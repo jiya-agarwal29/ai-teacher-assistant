@@ -3119,6 +3119,61 @@ def _make_patient_caller(db: Session, paper_row: Paper):
     return call_patiently
 
 
+def _clear_slot_warnings(warnings: list, slot: PaperQuestion) -> list:
+    """Drops any existing warning for `slot` -- its label prefix is stable regardless of content."""
+    prefix = f"{_slot_label(slot)}:"
+    return [w for w in warnings if not w.startswith(prefix)]
+
+
+def _sync_slot_warning(warnings: list, slot: PaperQuestion, q: dict, intended_level: str) -> list:
+    """
+    The one place a slot's warning is kept in sync with its current
+    question: drops any stale warning this slot already had (a previous
+    "couldn't generate"/"classified as X"/"swapped in a Y question"), then
+    adds a fresh "classified as X, not Y" warning if `q` came back
+    flagged. Shared by generate_paper's bulk pass and the slot-level
+    regenerate/swap routes so a warning never outlives the problem it
+    described, and a newly-introduced one is reported the same way
+    everywhere (Phase 5C EXTRA B).
+    """
+    warnings = _clear_slot_warnings(warnings, slot)
+    if q.get("bloom_check") == "flagged":
+        detected = q.get("detected_level")
+        detected_label = bloom.get_level(detected).label if detected else "a different level"
+        warnings.append(
+            f"{_slot_label(slot)}: classified as {detected_label}, "
+            f"not the intended {bloom.get_level(intended_level).label}."
+        )
+    return warnings
+
+
+def _generate_one_question_for_slot(
+    topic: str, slot: PaperQuestion, window: "_SourceWindow", pattern: paper.Pattern,
+    recent_questions: list, drop_log: list
+):
+    """
+    Writes ONE question for `slot`, grounded in `window` alone -- shared
+    by generate_paper's widened-window retry pass (Phase 5C EXTRA A) and
+    POST /papers/{id}/slots/{id}/regenerate, so both go through the exact
+    same generate -> check -> ground pipeline instead of duplicating it.
+    Returns the cleaned question dict, or None if nothing usable survived
+    (dropped reasons land in `drop_log` either way). Propagates
+    llm.LLMUnavailableError; callers decide how to handle it.
+    """
+    top_pages = [(1.0, window)]
+    level_counts = {slot.bloom_level: 1}
+    marks_by_level = {slot.bloom_level: slot.marks}
+
+    questions = _generate_and_validate_questions(
+        topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+    )
+    questions = _check_and_fix_bloom_levels(
+        questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+    )
+    questions = _filter_grounded(questions, [(slot, window)], drop_log)
+    return questions[0] if questions else None
+
+
 def generate_paper(db: Session, paper_row: Paper) -> None:
     """
     Fills every still-empty slot of `paper_row` (status is already
@@ -3225,6 +3280,7 @@ def generate_paper(db: Session, paper_row: Paper) -> None:
             if q is None and leftovers:
                 q = leftovers.pop(0)
             if q is None:
+                warnings = _clear_slot_warnings(warnings, slot)
                 warnings.append(f"{_slot_label(slot)}: couldn't generate a question for this slot.")
                 continue
 
@@ -3247,14 +3303,61 @@ def generate_paper(db: Session, paper_row: Paper) -> None:
             db.add(db_question)
             db.flush()
             slot.question_id = db_question.id
+            warnings = _sync_slot_warning(warnings, slot, q, level)
 
-            if q["bloom_check"] == "flagged":
-                detected = q.get("detected_level")
-                detected_label = bloom.get_level(detected).label if detected else "a different level"
-                warnings.append(
-                    f"{_slot_label(slot)}: classified as {detected_label}, "
-                    f"not the intended {bloom.get_level(level).label}."
-                )
+        paper_row.progress_done = sum(1 for s in slots if s.question_id is not None)
+        paper_row.warnings = json.dumps(warnings)
+        db.commit()
+
+    # EXTRA (Phase 5C review): any slot still empty after the main pass
+    # gets ONE more attempt with a wider source window (5 chunks instead
+    # of the usual <=3) from the SAME document before it's given up on --
+    # a bigger window sometimes lands on content that's actually
+    # answerable/grounded when the original narrower one wasn't.
+    still_empty = [s for s in slots if s.question_id is None and s.bloom_level and s.book_id]
+    for slot in still_empty:
+        windows = _assign_source_windows(db, slot.book_id, 1, window_size=5)
+        if not windows:
+            continue
+        window = windows[0]
+        drop_log = []
+        recent_questions = _recent_question_texts(db, paper_row.user_id, topic)
+
+        q = call_patiently(lambda: _generate_one_question_for_slot(
+            topic, slot, window, pattern, recent_questions, drop_log
+        ))
+
+        if drop_log:
+            reason_counts = Counter(drop_log)
+            logger.info(
+                "Paper %d widened-window retry for %s: %s",
+                paper_row.id, _slot_label(slot),
+                "; ".join(f"dropped {c}: {r}" for r, c in reason_counts.items())
+            )
+
+        if q is None:
+            continue
+
+        db_question = Question(
+            user_id=paper_row.user_id,
+            book_id=window.book_id,
+            page_id=window.id,
+            topic=topic,
+            type=q["type"],
+            bloom_level=q["bloom_level"],
+            bloom_check=q["bloom_check"],
+            detected_level=q.get("detected_level"),
+            question=q["question"],
+            options=json.dumps(q["options"]) if q.get("options") else None,
+            correct_answer=q["correctAnswer"],
+            explanation=q["explanation"],
+            marks=q["marks"],
+            marking_scheme=json.dumps(q["marking_scheme"]),
+        )
+        db.add(db_question)
+        db.flush()
+        slot.question_id = db_question.id
+        warnings = _sync_slot_warning(warnings, slot, q, slot.bloom_level)
 
         paper_row.progress_done = sum(1 for s in slots if s.question_id is not None)
         paper_row.warnings = json.dumps(warnings)
@@ -3302,13 +3405,17 @@ def swap_paper_slot(
 
     slot.question_id = question.id
 
+    warnings = json.loads(paper_row.warnings) if paper_row.warnings else []
+    warnings = _sync_slot_warning(
+        warnings, slot, {"bloom_check": question.bloom_check, "detected_level": question.detected_level},
+        question.bloom_level
+    )
     if question.bloom_level != slot.bloom_level:
-        warnings = json.loads(paper_row.warnings) if paper_row.warnings else []
         warnings.append(
             f"{_slot_label(slot)}: swapped in a {bloom.get_level(question.bloom_level).label} question "
             f"(planned {bloom.get_level(slot.bloom_level).label if slot.bloom_level else 'none'})."
         )
-        paper_row.warnings = json.dumps(warnings)
+    paper_row.warnings = json.dumps(warnings)
 
     db.commit()
     return _paper_detail(db, paper_row)
@@ -3338,28 +3445,17 @@ def regenerate_paper_slot(
     window = windows[0]
 
     topic = paper_row.subject or paper_row.title
-    top_pages = [(1.0, window)]
-    level_counts = {slot.bloom_level: 1}
-    marks_by_level = {slot.bloom_level: slot.marks}
     drop_log = []
     recent_questions = _recent_question_texts(db, current_user.id, topic)
 
     try:
-        questions = _generate_and_validate_questions(
-            topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
-        )
-        questions = _check_and_fix_bloom_levels(
-            questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
-        )
+        q = _generate_one_question_for_slot(topic, slot, window, pattern, recent_questions, drop_log)
     except llm.LLMUnavailableError:
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
-    questions = _filter_grounded(questions, [(slot, window)], drop_log)
-
-    if not questions:
+    if q is None:
         raise HTTPException(status_code=422, detail="Couldn't write a question for this slot. Try again.")
 
-    q = questions[0]
     db_question = Question(
         user_id=current_user.id,
         book_id=window.book_id,
@@ -3379,6 +3475,11 @@ def regenerate_paper_slot(
     db.add(db_question)
     db.flush()
     slot.question_id = db_question.id
+
+    warnings = json.loads(paper_row.warnings) if paper_row.warnings else []
+    warnings = _sync_slot_warning(warnings, slot, q, slot.bloom_level)
+    paper_row.warnings = json.dumps(warnings)
+
     db.commit()
 
     return _paper_detail(db, paper_row)

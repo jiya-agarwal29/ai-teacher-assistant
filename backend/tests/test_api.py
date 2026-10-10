@@ -3195,6 +3195,214 @@ def test_slot_candidates_filters_by_marks_and_level_and_is_owner_only(
     assert res_other.status_code == 404
 
 
+# -----------------------------
+# PHASE 5C EXTRA: widened-window retry, warning sync on regenerate/swap
+# -----------------------------
+def _make_single_question_fake(slot, classifier_level, question_suffix=""):
+    """
+    A generate_json fake for slot-level (regenerate) tests: returns
+    exactly ONE question for `slot`'s own level/marks, grounded via a
+    snippet of the real source text, with the classifier reporting
+    `classifier_level` for it -- lets a test force either a flagged
+    (classifier_level != slot's level) or verified result.
+    """
+    import paper as paper_module
+
+    def fake(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": 1, "level": classifier_level}]}
+        sources_text = prompt.split("Sources:\n", 1)[1] if "Sources:\n" in prompt else ""
+        snippet = " ".join(sources_text.split()[:10])
+        allowed_types = paper_module.allowed_types_for_slot(
+            slot["bloom_level"], slot["marks"], "written"
+        ) or ["short_answer"]
+        chosen_type = allowed_types[0]
+        q = {
+            "id": 1, "type": chosen_type, "bloom_level": slot["bloom_level"],
+            "question": f"Explain {snippet}{question_suffix}",
+            "explanation": "Explanation.", "source_index": 1,
+            "marks": slot["marks"], "marking_scheme": [{"point": "x", "marks": slot["marks"]}],
+        }
+        if chosen_type == "mcq":
+            q["options"] = ["Option A", "Option B", "Option C", "Option D"]
+            q["correctAnswer"] = "A"
+        elif chosen_type == "true_false":
+            q["options"] = ["True", "False"]
+            q["correctAnswer"] = "A"
+        else:
+            q["correctAnswer"] = "An answer."
+        return {"questions": [q]}
+
+    return fake
+
+
+def test_generate_retries_still_empty_slot_with_wider_window(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "widened_retry.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Widened Retry Paper")
+
+    db = TestSessionLocal()
+    try:
+        narrow = main._assign_source_windows(db, book_id, 1, window_size=3)[0]
+        wide = main._assign_source_windows(db, book_id, 1, window_size=5)[0]
+    finally:
+        db.close()
+    assert len(wide.content) > len(narrow.content)
+    threshold = (len(narrow.content) + len(wide.content)) // 2
+
+    label_to_level = _paper_label_to_level_map()
+    level_by_text = {}
+
+    def fake(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            items = []
+            tail = prompt.split("Questions:\n", 1)[1] if "Questions:\n" in prompt else ""
+            for line in tail.strip().split("\n"):
+                m = re.match(r"(\d+)\.\s*(.*)", line.strip())
+                if m:
+                    items.append({"id": int(m.group(1)), "level": level_by_text.get(m.group(2).strip(), "remember")})
+            return {"items": items}
+
+        sources_text = prompt.split("Sources:\n", 1)[1] if "Sources:\n" in prompt else ""
+        words = sources_text.split()
+        questions = []
+        source_index = 0
+        for m in re.finditer(
+            r"- ([A-Za-z]+) -- write exactly (\d+) question\(s\) at this level"
+            r"(?:, each worth EXACTLY (\d+) marks)?",
+            prompt
+        ):
+            label, count, marks = m.group(1), int(m.group(2)), m.group(3)
+            level_key = label_to_level[label]
+            marks_int = int(marks) if marks is not None else 2
+            allowed_types = main.paper.allowed_types_for_slot(level_key, marks_int, "written") or ["short_answer"]
+            chosen_type = allowed_types[0]
+            # Only the widened (5-chunk) window is long enough to clear this
+            # threshold -- the narrow (<=3-chunk) window always gets a
+            # deliberately unrelated, ungrounded question instead, so every
+            # slot can ONLY be filled by the widened-window retry pass.
+            grounded = len(sources_text) > threshold
+            for _ in range(count):
+                source_index += 1
+                if grounded:
+                    # Two DIFFERENT word spans of the real source -- both
+                    # share source terms (grounded), but the answer is
+                    # never a literal substring of the question (which
+                    # would otherwise trip the "leaks its own answer" check).
+                    text = f"Explain {' '.join(words[:10])}"
+                    answer = ' '.join(words[10:20]) or ' '.join(words[:10])
+                else:
+                    text = "Completely unrelated question about something else entirely."
+                    answer = "Something not in any source."
+                text = f"{text} (#{source_index})"
+                level_by_text[text] = level_key
+                q = {
+                    "id": source_index, "type": chosen_type, "bloom_level": level_key,
+                    "question": text, "explanation": "Explanation.", "source_index": source_index,
+                }
+                if chosen_type == "mcq":
+                    q["options"] = ["Option A", "Option B", "Option C", "Option D"]
+                    q["correctAnswer"] = "A"
+                elif chosen_type == "true_false":
+                    q["options"] = ["True", "False"]
+                    q["correctAnswer"] = "A"
+                else:
+                    q["correctAnswer"] = answer
+                if marks is not None:
+                    q["marks"] = marks_int
+                    q["marking_scheme"] = [{"point": "Correctness", "marks": marks_int}]
+                questions.append(q)
+        return {"questions": questions}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake)
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "ready"
+
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    assert all(slot["question"] is not None for slot in detail["slots"])
+
+
+def test_regenerate_slot_syncs_flagged_warning_then_clears_it(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "regen_warning.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Regen Warning Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    slot = detail["slots"][0]
+    slot_label = f"Section '{slot['section']}' question {slot['number']}"
+    disagree_level = "create" if slot["bloom_level"] != "create" else "remember"
+
+    # First regenerate: the classifier disagrees -- a "classified as X, not
+    # Y" warning for this slot must appear.
+    monkeypatch.setattr(llm_module, "generate_json", _make_single_question_fake(slot, disagree_level, " (v1)"))
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/slots/{slot['id']}/regenerate", headers=headers)
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert any(slot_label in w and "classified as" in w for w in data["warnings"])
+
+    # Second regenerate: the classifier now agrees -- the old warning for
+    # this exact slot must be gone (Phase 5C EXTRA B).
+    monkeypatch.setattr(
+        llm_module, "generate_json", _make_single_question_fake(slot, slot["bloom_level"], " (v2)")
+    )
+    main.limiter.reset()
+    res2 = client.post(f"/papers/{paper_data['id']}/slots/{slot['id']}/regenerate", headers=headers)
+    assert res2.status_code == 200, res2.text
+    data2 = res2.json()
+    assert not any(slot_label in w for w in data2["warnings"])
+
+
+def test_swap_slot_syncs_flagged_warning_from_bank_question(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "swap_warning.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Swap Warning Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    slot = next(s for s in detail["slots"] if s["marks"] == 2)
+    slot_label = f"Section '{slot['section']}' question {slot['number']}"
+
+    db = TestSessionLocal()
+    try:
+        user_id = db.query(main.User).filter(main.User.username == "phase5b_test_user").first().id
+        allowed_types = main.paper.allowed_types_for_slot(slot["bloom_level"], 2, "written") or ["short_answer"]
+        flagged_q = main.Question(
+            user_id=user_id, book_id=book_id, topic="bank", type=allowed_types[0],
+            bloom_level=slot["bloom_level"], bloom_check="flagged", detected_level="create",
+            question="A flagged bank question for swapping in.",
+            correct_answer="A", explanation="Explanation.",
+            marks=2, marking_scheme=json.dumps([{"point": "x", "marks": 2}]),
+        )
+        db.add(flagged_q)
+        db.commit()
+        db.refresh(flagged_q)
+        flagged_q_id = flagged_q.id
+    finally:
+        db.close()
+
+    res = client.patch(
+        f"/papers/{paper_data['id']}/slots/{slot['id']}", headers=headers,
+        json={"question_id": flagged_q_id}
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert any(slot_label in w and "classified as" in w for w in data["warnings"])
+
+
 def test_delete_paper_keeps_bank_questions(client, phase5b_headers, monkeypatch):
     import llm as llm_module
 

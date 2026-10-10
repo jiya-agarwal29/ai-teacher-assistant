@@ -7,6 +7,7 @@ import {
   Brain,
   BarChart3,
   Database,
+  ClipboardList,
   LogOut,
   Sun,
   Moon,
@@ -29,6 +30,7 @@ export default function Sidebar({ darkMode, setDarkMode }) {
     { name: 'Documents', path: '/documents', icon: FileText },
     { name: 'AI Tools', path: '/tools', icon: Brain },
     { name: 'Question Bank', path: '/question-bank', icon: Database },
+    { name: 'Question Papers', path: '/papers', icon: ClipboardList },
     { name: 'Analytics', path: '/analytics', icon: BarChart3 },
   ];
 

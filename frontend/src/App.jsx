@@ -14,6 +14,9 @@ import DocumentReview from './pages/DocumentReview';
 import AITools from './pages/AITools';
 import QuestionBank from './pages/QuestionBank';
 import Analytics from './pages/Analytics';
+import PaperList from './pages/PaperList';
+import PaperNew from './pages/PaperNew';
+import PaperView from './pages/PaperView';
 
 export default function App() {
   // Sync global dark mode preference
@@ -57,6 +60,9 @@ export default function App() {
               <Route path="/documents/:id/review" element={<DocumentReview />} />
               <Route path="/tools" element={<AITools />} />
               <Route path="/question-bank" element={<QuestionBank />} />
+              <Route path="/papers" element={<PaperList />} />
+              <Route path="/papers/new" element={<PaperNew />} />
+              <Route path="/papers/:id" element={<PaperView />} />
               <Route path="/analytics" element={<Analytics />} />
             </Route>
 
