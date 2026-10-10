@@ -16,9 +16,12 @@ columns did was fully processed synchronously, so it backfills
 status="ready" on those rows (never "processing" or "failed", which only
 apply to the new background pipeline). Also adds the Phase 3B OCR columns
 (books.review_ocr, and the whole document_pages table) if missing. Also
-creates the Phase 4B questions table if missing. Safe to run more than
-once: every ALTER TABLE / CREATE TABLE / CREATE INDEX is skipped once it
-already exists, and every UPDATE only ever touches rows that still need it.
+creates the Phase 4B questions table if missing. Also adds the Phase 5B
+questions.marks/marking_scheme columns and the papers/paper_questions
+tables, plus the Phase 5B fix columns papers.unit_weights/waiting_for_ai,
+if missing. Safe to run more than once: every ALTER TABLE / CREATE TABLE
+/ CREATE INDEX is skipped once it already exists, and every UPDATE only
+ever touches rows that still need it.
 
 Usage:
     python migrate.py <username>
@@ -179,6 +182,27 @@ def main():
                 cursor.execute(f"ALTER TABLE questions ADD COLUMN {column} {ddl_type}")
                 conn.commit()
                 logger.info("Added questions.%s column.", column)
+
+    # Phase 5B fix: papers.unit_weights (the weights actually used, JSON)
+    # and papers.waiting_for_ai (set while the background job is paused on
+    # a busy AI response). Only relevant if the papers table already
+    # existed -- a brand-new one gets both from create_all() below.
+    if table_exists(cursor, "papers"):
+        if column_exists(cursor, "papers", "unit_weights"):
+            logger.info("papers.unit_weights column already exists, skipping ALTER TABLE.")
+        else:
+            cursor.execute("ALTER TABLE papers ADD COLUMN unit_weights TEXT")
+            conn.commit()
+            logger.info("Added papers.unit_weights column.")
+
+        if column_exists(cursor, "papers", "waiting_for_ai"):
+            logger.info("papers.waiting_for_ai column already exists, skipping ALTER TABLE.")
+        else:
+            cursor.execute("ALTER TABLE papers ADD COLUMN waiting_for_ai BOOLEAN")
+            conn.commit()
+            cursor.execute("UPDATE papers SET waiting_for_ai = 0 WHERE waiting_for_ai IS NULL")
+            conn.commit()
+            logger.info("Added papers.waiting_for_ai column.")
 
     cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()

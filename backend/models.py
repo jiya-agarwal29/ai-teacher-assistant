@@ -180,6 +180,12 @@ class Paper(Base):
     pattern = Column(Text, nullable=False)        # JSON: the Pattern used (preset or custom)
     bloom_targets = Column(Text, nullable=False)   # JSON: {level: percent}
     book_ids = Column(Text, nullable=False)        # JSON: [book_id, ...] -- the units, in order
+    # JSON: {book_id (str): weight} actually used for this paper's units --
+    # "equal" (default, every selected book weighted 1), "by_size" (chunk
+    # count), or "custom" (teacher-supplied), per POST /papers's
+    # unit_weighting. Kept alongside book_ids so a saved paper still shows
+    # which weights it was planned with.
+    unit_weights = Column(Text, nullable=True)
     plan = Column(Text, nullable=False)            # JSON: paper.plan_paper()'s "plan" list
 
     status = Column(String, default="draft", nullable=False)
@@ -187,6 +193,11 @@ class Paper(Base):
     progress_done = Column(Integer, default=0, nullable=False)
     progress_total = Column(Integer, default=0, nullable=False)
     warnings = Column(Text, nullable=True)  # JSON list of strings
+    # True only while the background generation job is paused, waiting out
+    # a busy/rate-limited AI response (see main.generate_paper) -- status
+    # stays "generating" throughout, this is just an extra flag the UI can
+    # show ("waiting for AI service...") while progress isn't moving.
+    waiting_for_ai = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(

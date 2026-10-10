@@ -2483,6 +2483,26 @@ def _upload_paper_doc(client, headers, filename="paper_source.txt"):
     return res.json()["book_id"]
 
 
+# Deliberately much shorter than PAPER_BOOK_CONTENT -- chunks into far
+# fewer pages, for unit-weighting tests that need two books of visibly
+# different size ("by_size" weighting should treat them differently;
+# "equal" should not).
+SHORT_PAPER_BOOK_CONTENT = "\n\n".join(
+    f"Short paragraph {i} with a little bit of sample text for a small test document."
+    for i in range(1, 4)
+).encode()
+
+
+def _upload_short_paper_doc(client, headers, filename="short_paper_source.txt"):
+    res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": (filename, SHORT_PAPER_BOOK_CONTENT, "text/plain")}
+    )
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "ready"
+    return res.json()["book_id"]
+
+
 def _create_paper(client, headers, book_ids, pattern=None, bloom_targets=None, title="Test Paper"):
     res = client.post(
         "/papers", headers=headers,
@@ -2646,6 +2666,90 @@ def test_create_paper_rejects_other_users_book(client, phase5b_headers, phase5b_
     assert res.status_code == 404
 
 
+def test_create_paper_default_unit_weighting_is_equal_regardless_of_size(client, phase5b_headers):
+    headers = phase5b_headers
+    big_book = _upload_paper_doc(client, headers, "weights_equal_big.txt")
+    small_book = _upload_short_paper_doc(client, headers, "weights_equal_small.txt")
+
+    data = _create_paper(client, headers, [big_book, small_book], title="Equal Weights Paper")
+    assert data["unit_weights"] == {str(big_book): 1, str(small_book): 1}
+
+
+def test_create_paper_by_size_unit_weighting_uses_chunk_counts(client, phase5b_headers):
+    headers = phase5b_headers
+    big_book = _upload_paper_doc(client, headers, "weights_by_size_big.txt")
+    small_book = _upload_short_paper_doc(client, headers, "weights_by_size_small.txt")
+
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "By Size Weights Paper", "pattern": SMALL_PATTERN,
+            "bloom_targets": SMALL_BLOOM_TARGETS, "book_ids": [big_book, small_book],
+            "unit_weighting": "by_size",
+        }
+    )
+    assert res.status_code == 200, res.text
+    weights = res.json()["unit_weights"]
+    assert weights[str(big_book)] > weights[str(small_book)] > 0
+
+
+def test_create_paper_custom_unit_weighting_uses_given_weights(client, phase5b_headers):
+    headers = phase5b_headers
+    book_a = _upload_paper_doc(client, headers, "weights_custom_a.txt")
+    book_b = _upload_short_paper_doc(client, headers, "weights_custom_b.txt")
+
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "Custom Weights Paper", "pattern": SMALL_PATTERN,
+            "bloom_targets": SMALL_BLOOM_TARGETS, "book_ids": [book_a, book_b],
+            "unit_weighting": "custom", "unit_weights": {str(book_a): 5, str(book_b): 1},
+        }
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["unit_weights"] == {str(book_a): 5.0, str(book_b): 1.0}
+
+
+def test_create_paper_custom_unit_weighting_requires_weights_for_every_book(client, phase5b_headers):
+    headers = phase5b_headers
+    book_a = _upload_paper_doc(client, headers, "weights_missing_a.txt")
+    book_b = _upload_short_paper_doc(client, headers, "weights_missing_b.txt")
+
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "Missing Weight Paper", "pattern": SMALL_PATTERN,
+            "bloom_targets": SMALL_BLOOM_TARGETS, "book_ids": [book_a, book_b],
+            "unit_weighting": "custom", "unit_weights": {str(book_a): 5},
+        }
+    )
+    assert res.status_code == 422
+
+    res2 = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "No Weights At All Paper", "pattern": SMALL_PATTERN,
+            "bloom_targets": SMALL_BLOOM_TARGETS, "book_ids": [book_a, book_b],
+            "unit_weighting": "custom",
+        }
+    )
+    assert res2.status_code == 422
+
+
+def test_create_paper_rejects_unknown_unit_weighting(client, phase5b_headers):
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "weights_unknown_mode.txt")
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "Bad Weighting Paper", "pattern": SMALL_PATTERN,
+            "bloom_targets": SMALL_BLOOM_TARGETS, "book_ids": [book_id],
+            "unit_weighting": "bogus",
+        }
+    )
+    assert res.status_code == 422
+
+
 def test_generate_fills_all_slots_and_blueprint_actual_matches_plan(client, phase5b_headers, monkeypatch):
     import llm as llm_module
 
@@ -2737,12 +2841,20 @@ def test_generate_only_fills_slots_still_empty(client, phase5b_headers, monkeypa
     assert all(slot["question"] is not None for slot in detail["slots"])
 
 
-def test_generate_fails_with_friendly_error_when_llm_busy(client, phase5b_headers, monkeypatch):
+def test_generate_exhausts_wait_budget_then_fails_and_retry_fills_empty_slots(
+    client, phase5b_headers, monkeypatch
+):
     import llm as llm_module
 
     headers = phase5b_headers
     book_id = _upload_paper_doc(client, headers, "paper_busy.txt")
     paper_data = _create_paper(client, headers, [book_id], title="Busy Paper")
+
+    # Keep the retry/backoff fast and deterministic: no real waiting, and a
+    # budget small enough that even the first (60s) wait exceeds it, so the
+    # job gives up on its very first busy response.
+    monkeypatch.setattr(main.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(main, "PAPER_JOB_MAX_WAIT_SECONDS", 30.0)
 
     def raise_unavailable(*a, **kw):
         raise llm_module.LLMUnavailableError("boom")
@@ -2755,7 +2867,8 @@ def test_generate_fails_with_friendly_error_when_llm_busy(client, phase5b_header
 
     detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
     assert detail["status"] == "failed"
-    assert detail["error"] == "AI service is busy, please retry"
+    assert detail["error"] == "AI service is busy, click Generate to continue"
+    assert detail["waiting_for_ai"] is False  # cleared, not left stuck mid-wait
     assert all(slot["question"] is None for slot in detail["slots"])
 
     # Retry with a working mock -- nothing was saved from the failed
@@ -2768,6 +2881,53 @@ def test_generate_fails_with_friendly_error_when_llm_busy(client, phase5b_header
 
     detail2 = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
     assert all(slot["question"] is not None for slot in detail2["slots"])
+
+
+def test_generate_waits_out_two_busy_responses_then_succeeds_with_no_manual_retry(
+    client, phase5b_headers, monkeypatch
+):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_busy_then_ok.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Busy Then OK Paper")
+
+    paper_id = paper_data["id"]
+    waiting_flags_seen = []
+
+    def fake_sleep(seconds):
+        # Captures whether the DB shows waiting_for_ai=True *while* the
+        # job is paused -- a concurrent GET /papers/{id}/status would see
+        # exactly this, mid-wait, from a different request/thread.
+        db = TestSessionLocal()
+        try:
+            row = db.query(main.Paper).filter(main.Paper.id == paper_id).first()
+            waiting_flags_seen.append(row.waiting_for_ai)
+        finally:
+            db.close()
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+
+    real_fake = _make_paper_llm_fake()
+    busy_calls_left = [2]  # the very first two generate_json calls are "busy"
+
+    def flaky_then_fake(prompt, schema, system=None):
+        if schema is not main.CLASSIFIER_SCHEMA and busy_calls_left[0] > 0:
+            busy_calls_left[0] -= 1
+            raise llm_module.LLMUnavailableError("boom")
+        return real_fake(prompt, schema, system=system)
+    monkeypatch.setattr(llm_module, "generate_json", flaky_then_fake)
+
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    assert res.status_code == 202
+    assert res.json()["status"] == "ready"  # no manual retry needed
+
+    assert waiting_flags_seen == [True, True]  # both busy waits were visible mid-wait
+
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    assert detail["status"] == "ready"
+    assert detail["waiting_for_ai"] is False
+    assert all(slot["question"] is not None for slot in detail["slots"])
 
 
 def test_paper_stuck_generating_fails_on_startup_cleanup(client, phase5b_headers):

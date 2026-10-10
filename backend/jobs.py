@@ -466,7 +466,7 @@ def _run_paper_generation_job(paper_id: int):
     except llm.LLMUnavailableError:
         logger.warning("AI service busy while generating paper_id=%d", paper_id)
         db.rollback()
-        _fail_paper(db, main.Paper, paper_id, "AI service is busy, please retry")
+        _fail_paper(db, main.Paper, paper_id, "AI service is busy, click Generate to continue")
     except Exception:
         logger.exception("Unhandled error while generating paper_id=%d", paper_id)
         db.rollback()

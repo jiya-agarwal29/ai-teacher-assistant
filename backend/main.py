@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -2608,6 +2609,41 @@ def _book_weight(db: Session, book_id: int) -> int:
     return db.query(Page).filter(Page.book_id == book_id).count()
 
 
+UNIT_WEIGHTING_MODES = ("equal", "by_size", "custom")
+
+
+def _resolve_unit_weights(db: Session, books: list, unit_weighting: str, custom_weights: dict | None) -> dict:
+    """
+    Maps each selected book to the weight its unit gets in paper.plan_paper,
+    per `unit_weighting`:
+      - "equal" (default): every unit weighted 1 -- the plan spreads marks
+        evenly across documents regardless of how much either one has.
+      - "by_size": weighted by chunk count (what Phase 5B originally always
+        did) -- a bigger document earns a bigger share of the paper.
+      - "custom": the teacher's own `custom_weights` ({book_id: weight},
+        JSON string keys), which must cover every selected book with a
+        positive number.
+    Returns {book_id: weight}. Raises HTTPException(422) for a bad/missing
+    custom weight.
+    """
+    if unit_weighting == "custom":
+        weights = {}
+        for book in books:
+            raw = (custom_weights or {}).get(str(book.id))
+            if not isinstance(raw, (int, float)) or raw <= 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail=[f"unit_weights is missing a positive weight for book '{book.name}' (id {book.id})."]
+                )
+            weights[book.id] = float(raw)
+        return weights
+
+    if unit_weighting == "by_size":
+        return {book.id: (_book_weight(db, book.id) or 1) for book in books}
+
+    return {book.id: 1 for book in books}  # "equal"
+
+
 def _slot_label(slot: "PaperQuestion") -> str:
     option_suffix = f" ({slot.option})" if slot.option else ""
     return f"Section '{slot.section}' question {slot.number}{option_suffix}"
@@ -2622,6 +2658,8 @@ class PaperCreateRequest(BaseModel):
     bloom_targets: dict | None = None
     book_ids: list[int]
     duration_minutes: int | None = None
+    unit_weighting: str | None = None  # "equal" (default) | "by_size" | "custom"
+    unit_weights: dict[str, float] | None = None  # required when unit_weighting == "custom"
 
 
 class PaperUpdateRequest(BaseModel):
@@ -2755,8 +2793,10 @@ def _paper_detail(db: Session, paper_row: Paper) -> dict:
         "pattern": json.loads(paper_row.pattern),
         "bloom_targets": bloom_targets,
         "book_ids": json.loads(paper_row.book_ids),
+        "unit_weights": json.loads(paper_row.unit_weights) if paper_row.unit_weights else {},
         "status": paper_row.status,
         "error": paper_row.error,
+        "waiting_for_ai": paper_row.waiting_for_ai,
         "progress_done": paper_row.progress_done,
         "progress_total": paper_row.progress_total,
         "warnings": json.loads(paper_row.warnings) if paper_row.warnings else [],
@@ -2820,6 +2860,12 @@ def create_paper(
     if not payload.book_ids:
         raise HTTPException(status_code=422, detail=["At least one book is required."])
 
+    unit_weighting = payload.unit_weighting or "equal"
+    if unit_weighting not in UNIT_WEIGHTING_MODES:
+        raise HTTPException(status_code=422, detail=[f"Unknown unit_weighting '{unit_weighting}'."])
+    if unit_weighting == "custom" and not payload.unit_weights:
+        raise HTTPException(status_code=422, detail=["unit_weights is required when unit_weighting is 'custom'."])
+
     books = []
     for book_id in payload.book_ids:
         book = _get_owned_book_or_404(db, book_id, current_user.id)
@@ -2827,10 +2873,8 @@ def create_paper(
             raise HTTPException(status_code=422, detail=[f"Book '{book.name}' is not ready yet."])
         books.append(book)
 
-    units = [
-        {"id": book.id, "name": book.name, "weight": _book_weight(db, book.id) or 1}
-        for book in books
-    ]
+    weights_by_book = _resolve_unit_weights(db, books, unit_weighting, payload.unit_weights)
+    units = [{"id": book.id, "name": book.name, "weight": weights_by_book[book.id]} for book in books]
 
     result = paper.plan_paper(pattern, bloom_targets, units)
 
@@ -2841,6 +2885,7 @@ def create_paper(
         pattern=json.dumps(_pattern_to_dict(pattern)),
         bloom_targets=json.dumps(bloom_targets),
         book_ids=json.dumps(payload.book_ids),
+        unit_weights=json.dumps({str(bid): w for bid, w in weights_by_book.items()}),
         plan=json.dumps(result["plan"]),
         status="draft",
         progress_done=0,
@@ -2887,6 +2932,7 @@ def get_paper_status(paper_id: int, current_user: User = Depends(get_current_use
         "id": paper_row.id,
         "status": paper_row.status,
         "error": paper_row.error,
+        "waiting_for_ai": paper_row.waiting_for_ai,
         "progress_done": paper_row.progress_done,
         "progress_total": paper_row.progress_total,
     }
@@ -2947,12 +2993,58 @@ def generate_paper_route(
 
     paper_row.status = "generating"
     paper_row.error = None
+    paper_row.waiting_for_ai = False
     db.commit()
 
     jobs.submit_paper_generation_job(paper_row.id)
     db.refresh(paper_row)
 
     return {"paper_id": paper_row.id, "status": paper_row.status}
+
+
+PAPER_JOB_MAX_WAIT_SECONDS = float(os.getenv("PAPER_JOB_MAX_WAIT_SECONDS", "1800"))
+_PAPER_BUSY_BASE_WAIT_SECONDS = 60.0
+_PAPER_BUSY_MAX_WAIT_SECONDS = 300.0
+
+
+def _make_patient_caller(db: Session, paper_row: Paper):
+    """
+    Returns a `call_patiently(call_fn)` closure for generate_paper: calls
+    `call_fn()`, and on llm.LLMUnavailableError waits out the busy period
+    instead of giving up immediately -- honouring a Retry-After header
+    when the provider gave one, else a 60s wait that doubles on each
+    further busy response (capped at 5 minutes), continuing until either
+    `call_fn()` succeeds or the shared wait budget (PAPER_JOB_MAX_WAIT_
+    SECONDS total, across every call this job makes, not reset per call)
+    runs out, at which point it re-raises. While actually waiting,
+    paper_row.waiting_for_ai is set True (and committed, so a concurrent
+    GET /papers/{id}/status sees it) and cleared again once the wait ends.
+    """
+    state = {"remaining": PAPER_JOB_MAX_WAIT_SECONDS, "wait_seconds": _PAPER_BUSY_BASE_WAIT_SECONDS}
+
+    def call_patiently(call_fn):
+        while True:
+            try:
+                return call_fn()
+            except llm.LLMUnavailableError as exc:
+                this_wait = llm.get_retry_after_seconds(exc) or state["wait_seconds"]
+                if this_wait > state["remaining"]:
+                    raise
+                state["remaining"] -= this_wait
+
+                paper_row.waiting_for_ai = True
+                db.commit()
+                logger.info(
+                    "Paper %d generation: AI busy, waiting %.0fs (%.0fs of budget left)",
+                    paper_row.id, this_wait, state["remaining"]
+                )
+                time.sleep(this_wait)
+                paper_row.waiting_for_ai = False
+                db.commit()
+
+                state["wait_seconds"] = min(state["wait_seconds"] * 2, _PAPER_BUSY_MAX_WAIT_SECONDS)
+
+    return call_patiently
 
 
 def generate_paper(db: Session, paper_row: Paper) -> None:
@@ -2966,9 +3058,16 @@ def generate_paper(db: Session, paper_row: Paper) -> None:
     source window (_assign_source_windows) instead of topic-based
     retrieval. Called from jobs.py's background job, which owns `db`'s
     commit/close lifecycle and translates any exception into a "failed"
-    paper with a friendly error -- this function lets llm.LLMUnavailableError
-    and anything else propagate uncaught.
+    paper with a friendly error.
+
+    The main per-group generation call is wrapped in call_patiently (see
+    _make_patient_caller) so a busy AI service pauses and resumes the job
+    instead of failing it outright -- only once the whole job's wait
+    budget (PAPER_JOB_MAX_WAIT_SECONDS) is used up does
+    llm.LLMUnavailableError finally propagate out of this function
+    uncaught, for jobs.py to turn into a "failed" paper.
     """
+    call_patiently = _make_patient_caller(db, paper_row)
     pattern = _pattern_from_dict(json.loads(paper_row.pattern))
     slots = (
         db.query(PaperQuestion)
@@ -3008,9 +3107,9 @@ def generate_paper(db: Session, paper_row: Paper) -> None:
         drop_log = []
         recent_questions = _recent_question_texts(db, paper_row.user_id, topic)
 
-        questions = _generate_and_validate_questions(
+        questions = call_patiently(lambda: _generate_and_validate_questions(
             topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
-        )
+        ))
         questions = _check_and_fix_bloom_levels(
             questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
         )

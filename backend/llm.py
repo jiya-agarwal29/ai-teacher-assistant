@@ -120,6 +120,19 @@ def _gemini_retry_after_seconds(exc: Exception):
         return None
 
 
+def get_retry_after_seconds(exc: "LLMUnavailableError"):
+    """
+    Reads the Retry-After header off a LLMUnavailableError's underlying
+    provider exception (its __cause__, set by `raise LLMUnavailableError(...)
+    from last_exc` below), for a caller that wants to wait out a busy
+    period itself (e.g. a background job with no user blocked on it)
+    rather than give up as soon as LLMUnavailableError is raised. None if
+    there's no such header -- the caller should fall back to its own
+    default wait in that case.
+    """
+    return _gemini_retry_after_seconds(exc.__cause__) if exc.__cause__ is not None else None
+
+
 def _call_with_retry(call_fn, description: str):
     """
     Calls call_fn() with up to MAX_ATTEMPTS tries, retrying with exponential
