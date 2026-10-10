@@ -169,6 +169,26 @@ def test_allowed_types_for_slot_evaluate_and_create_impossible_on_mcq():
             assert paper.allowed_types_for_slot("create", marks, "mcq") == []
 
 
+@pytest.mark.parametrize("marks", [3, 5, 6, 7, 10])
+def test_allowed_types_for_slot_excludes_mcq_and_true_false_above_2_marks(marks):
+    # Phase 5B quality fix: a 3+ mark slot on a written paper needs an
+    # actual written answer -- mcq/true_false only ever make sense for a
+    # 1-2 mark slot. MCQ papers are unaffected (validate_pattern already
+    # rejects marks_each > 2 there, so they never reach this band).
+    for level in paper.levels_allowed_for_marks(marks):
+        types = paper.allowed_types_for_slot(level, marks, "written")
+        assert "mcq" not in types
+        assert "true_false" not in types
+
+
+@pytest.mark.parametrize("marks", [1, 2])
+def test_allowed_types_for_slot_still_allows_mcq_and_true_false_at_low_marks(marks):
+    for level in paper.levels_allowed_for_marks(marks):
+        types = paper.allowed_types_for_slot(level, marks, "written")
+        if "mcq" in bloom.get_level(level).question_types:
+            assert "mcq" in types
+
+
 # -----------------------------
 # plan_paper: mid_sem_50 + balanced + 3 units
 # -----------------------------

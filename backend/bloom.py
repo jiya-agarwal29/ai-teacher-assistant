@@ -44,6 +44,19 @@ NO_DIRECT_ANSWER_CONSTRAINT = (
     "sources -- the student has to work it out, not find and copy it."
 )
 
+# Create specifically needs this on top of NO_DIRECT_ANSWER_CONSTRAINT: a
+# "design this" question is pointless if the sources already hand over a
+# ready-made plan/list/checklist to copy out -- the student must combine
+# ideas from the sources into something the sources don't already spell
+# out as one finished answer. See also the matching checker-side rule in
+# main.py's CHECKER_DIRECT_ANSWER_RULE.
+NO_COPIED_PLAN_CONSTRAINT = (
+    "The thing the student designs/proposes must NOT already be written "
+    "out in the sources as a ready-made plan, list, or checklist to copy -- "
+    "combine ideas from the sources into something new (a different "
+    "setting, constraint, or goal than any plan already given there)."
+)
+
 
 @dataclass(frozen=True)
 class BloomLevel:
@@ -159,7 +172,7 @@ LEVELS = (
         prompt_rules=(
             "Ask the student to design, propose or plan something new using "
             "the concepts. " + SHARED_SOURCE_CONSTRAINT
-            + " " + NO_DIRECT_ANSWER_CONSTRAINT
+            + " " + NO_DIRECT_ANSWER_CONSTRAINT + " " + NO_COPIED_PLAN_CONSTRAINT
         ),
     ),
 )

@@ -477,8 +477,10 @@ def _build_quiz_prompt(
     if recent_questions:
         recent_list = "\n".join(f"- {text}" for text in recent_questions)
         recent_block = (
-            "\n\nDo not repeat or closely paraphrase any of these questions already "
-            f"asked on this topic:\n{recent_list}"
+            "\n\nThe following questions were already asked on this topic -- this "
+            "list is NOT a source, and none of its facts may be used in your "
+            "questions, answers, or marking scheme. Do not repeat or closely "
+            f"paraphrase any of these questions already asked on this topic:\n{recent_list}"
         )
     return (
         f"Create a quiz about '{topic}' based on the numbered sources below.\n\n"
@@ -500,7 +502,12 @@ def _bloom_level_descriptions_block() -> str:
 # sources just hand over the answer.
 CHECKER_DIRECT_ANSWER_RULE = (
     "If the answer is stated directly (or almost word for word) in the "
-    "sources, the question is at most Understand, whatever verbs it uses."
+    "sources, the question is at most Understand, whatever verbs it uses. "
+    "This also applies when the sources already contain the full answer as "
+    "a ready-made plan, list, or comparison table (e.g. a design or "
+    "hardening checklist copied straight from the text) -- that is still at "
+    "most Understand, not Create, even if the question asks the student to "
+    "'design' or 'propose' it."
 )
 
 
@@ -717,6 +724,71 @@ def _drop_near_duplicates(questions: list, drop_log: list = None) -> list:
                     drop_log.append("too similar to another question in this quiz")
 
     return [q for idx, q in enumerate(questions) if idx not in dropped_indices]
+
+
+# Phase 5B quality fix: a paper question must actually be grounded in the
+# ONE source window it was written for -- caught a real failure where a
+# slot labelled against one document ended up asking about a completely
+# different topic (symmetric/asymmetric encryption on a CRC/Hamming-only
+# document). Simple lexical overlap, not a semantic check: deliberately
+# cheap and deterministic, no extra embedding/LLM call per question.
+GROUNDING_MIN_SHARED_TERMS = 2
+# Common words long enough to survive the >=4-letter filter below but
+# useless as grounding evidence (generic instruction/question vocabulary
+# rather than source-specific facts).
+_GROUNDING_STOPWORDS = frozenset({
+    "what", "which", "that", "this", "these", "those", "with", "from",
+    "into", "about", "over", "after", "before", "between", "during",
+    "each", "some", "any", "all", "most", "more", "other", "same", "such",
+    "also", "using", "used", "according", "based", "explain", "explains",
+    "describe", "describes", "define", "defines", "identify", "identifies",
+    "discuss", "discusses", "compare", "compares", "contrast", "contrasts",
+    "evaluate", "evaluates", "analyze", "analyzes", "design", "designs",
+    "propose", "proposes", "student", "students", "question", "answer",
+    "source", "sources", "text", "following", "above", "below", "exam",
+    "marks", "point", "points", "scheme",
+})
+
+
+def _grounding_terms(text: str) -> set:
+    return {
+        w for w in _normalized_words(text)
+        if len(w) >= 4 and w not in _GROUNDING_STOPWORDS
+    }
+
+
+def _is_grounded(question: dict, window) -> bool:
+    """
+    True if `question`'s own text + correct answer share at least
+    GROUNDING_MIN_SHARED_TERMS non-generic terms (4+ letters) with the
+    specific source window it was written for. Never raises -- an empty/
+    missing window or question text just fails the check (not grounded).
+    """
+    combined = f"{question.get('question', '')} {question.get('correctAnswer', '')}"
+    question_terms = _grounding_terms(combined)
+    source_terms = _grounding_terms(getattr(window, "content", "") or "")
+    return len(question_terms & source_terms) >= GROUNDING_MIN_SHARED_TERMS
+
+
+def _filter_grounded(questions: list, slot_windows: list, drop_log: list = None) -> list:
+    """
+    Drops any question whose self-reported source_index points at a window
+    (within `slot_windows`, the SAME list _build_quiz_prompt's numbered
+    sources were built from) it isn't actually grounded in -- see
+    _is_grounded. _validate_quiz_questions already guarantees source_index
+    is a valid 1-based index into that same list, so every question here
+    has a real window to check against. Dropped questions are logged as
+    "not grounded in the slot's document" so the caller's existing top-up
+    mechanism naturally refills whichever slot that leaves empty.
+    """
+    kept = []
+    for q in questions:
+        window = slot_windows[q["source_index"] - 1][1]
+        if _is_grounded(q, window):
+            kept.append(q)
+        elif drop_log is not None:
+            drop_log.append("not grounded in the slot's document")
+    return kept
 
 
 class RegisterRequest(BaseModel):
@@ -3096,11 +3168,18 @@ def generate_paper(db: Session, paper_row: Paper) -> None:
             continue
         window = pool[idx]
         next_window_index[slot.book_id] = idx + 1
-        groups.setdefault((slot.bloom_level, slot.marks), []).append((slot, window))
+        # Grouping key includes book_id (not just level/marks) so a single
+        # generate_json call's numbered sources are ALWAYS all from one
+        # document -- batching slots from different books into one call let
+        # the model answer a CN-labelled slot with NS-document content in
+        # practice (Phase 5B quality fix); grounding is only guaranteed by
+        # construction when every source in the prompt is from the slot's
+        # own book to begin with.
+        groups.setdefault((slot.bloom_level, slot.marks, slot.book_id), []).append((slot, window))
 
     topic = paper_row.subject or paper_row.title
 
-    for (level, marks), slot_windows in groups.items():
+    for (level, marks, _book_id), slot_windows in groups.items():
         top_pages = [(1.0, window) for _, window in slot_windows]
         level_counts = {level: len(slot_windows)}
         marks_by_level = {level: marks}
@@ -3114,9 +3193,11 @@ def generate_paper(db: Session, paper_row: Paper) -> None:
             questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
         )
         questions = _drop_near_duplicates(questions, drop_log)
+        questions = _filter_grounded(questions, slot_windows, drop_log)
         questions, _ = _top_up_missing_levels(
             questions, topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
         )
+        questions = _filter_grounded(questions, slot_windows, drop_log)
 
         if drop_log:
             reason_counts = Counter(drop_log)
@@ -3272,6 +3353,8 @@ def regenerate_paper_slot(
         )
     except llm.LLMUnavailableError:
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+    questions = _filter_grounded(questions, [(slot, window)], drop_log)
 
     if not questions:
         raise HTTPException(status_code=422, detail="Couldn't write a question for this slot. Try again.")

@@ -311,3 +311,76 @@ def test_classifier_prompt_omits_rule_without_sources(monkeypatch):
     main._classify_questions_with_gemini(["Some question?"])
 
     assert "stated directly" not in captured["prompt"]
+
+
+# -----------------------------
+# Phase 5B quality fix: grounding check (_is_grounded / _filter_grounded)
+# -----------------------------
+class _FakeWindow:
+    def __init__(self, content):
+        self.content = content
+
+
+def test_is_grounded_true_when_question_shares_source_terms():
+    window = _FakeWindow(
+        "Cyclic Redundancy Check CRC detects transmission errors using polynomial division."
+    )
+    q = {
+        "question": "What does CRC use to detect transmission errors?",
+        "correctAnswer": "Polynomial division."
+    }
+    assert main._is_grounded(q, window) is True
+
+
+def test_is_grounded_false_for_a_completely_different_topic():
+    # Reproduces the real bug: a slot grounded in CRC/Hamming source text
+    # must not pass a question that's actually about encryption key types.
+    window = _FakeWindow(
+        "Cyclic Redundancy Check CRC detects transmission errors using polynomial division."
+    )
+    q = {
+        "question": "Compare symmetric and asymmetric encryption key distribution.",
+        "correctAnswer": "Asymmetric keys can be published openly."
+    }
+    assert main._is_grounded(q, window) is False
+
+
+def test_is_grounded_requires_at_least_the_minimum_shared_terms():
+    window = _FakeWindow("Hamming code parity bits correct single bit transmission errors.")
+    # Shares only "errors" (1 term) -- below GROUNDING_MIN_SHARED_TERMS.
+    one_term_q = {"question": "Describe common network errors in a cable.", "correctAnswer": "Noise."}
+    assert main._is_grounded(one_term_q, window) is False
+    # Shares "parity" and "bits" (2 terms) -- meets the minimum.
+    two_term_q = {"question": "How do parity bits help detect errors?", "correctAnswer": "They flag mismatches."}
+    assert main._is_grounded(two_term_q, window) is True
+
+
+def test_filter_grounded_drops_ungrounded_question_and_logs_reason():
+    window_a = _FakeWindow("Cyclic Redundancy Check CRC detects transmission errors using polynomial division.")
+    window_b = _FakeWindow("Hamming code parity bits correct single bit errors in transmitted data.")
+    slot_windows = [(object(), window_a), (object(), window_b)]
+
+    grounded_q = {
+        "question": "Explain CRC polynomial division for error detection.",
+        "correctAnswer": "It uses the division remainder.", "source_index": 1
+    }
+    ungrounded_q = {
+        "question": "Compare symmetric and asymmetric encryption approaches.",
+        "correctAnswer": "Asymmetric keys are public.", "source_index": 2
+    }
+
+    drop_log = []
+    result = main._filter_grounded([grounded_q, ungrounded_q], slot_windows, drop_log)
+
+    assert result == [grounded_q]
+    assert drop_log == ["not grounded in the slot's document"]
+
+
+def test_filter_grounded_keeps_everything_when_all_grounded():
+    window = _FakeWindow("Cyclic Redundancy Check CRC detects transmission errors using polynomial division.")
+    slot_windows = [(object(), window)]
+    q = {
+        "question": "What does CRC detect using polynomial division?",
+        "correctAnswer": "Transmission errors.", "source_index": 1
+    }
+    assert main._filter_grounded([q], slot_windows) == [q]

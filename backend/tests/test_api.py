@@ -2557,6 +2557,17 @@ def _make_paper_llm_fake():
                 items.append({"id": int(m.group(1)), "level": level_by_text.get(m.group(2).strip(), "remember")})
             return {"items": items}
 
+        # Parse each numbered source's real text out of the prompt, so the
+        # fake's generated questions can quote a snippet of it -- Phase 5B's
+        # grounding check (main._is_grounded) requires real term overlap
+        # with the slot's own source window, so a generic placeholder
+        # question text would get dropped as "not grounded".
+        sources_text = prompt.split("Sources:\n", 1)[1] if "Sources:\n" in prompt else ""
+        source_content_by_index = {
+            int(m.group(1)): m.group(2).strip()
+            for m in re.finditer(r"\[(\d+)\]\s*(.*?)(?=\n\n\[\d+\]|\Z)", sources_text, re.DOTALL)
+        }
+
         questions = []
         source_index = 0
         for match in re.finditer(
@@ -2577,7 +2588,8 @@ def _make_paper_llm_fake():
             for _ in range(count):
                 counter["n"] += 1
                 source_index += 1
-                text = f"Generated paper question #{counter['n']} about {level_key}?"
+                snippet = " ".join(source_content_by_index.get(source_index, "").split()[:15])
+                text = f"Generated paper question #{counter['n']} about {level_key}: {snippet}".strip()
                 level_by_text[text] = level_key
                 q = {
                     "id": counter["n"], "type": chosen_type, "bloom_level": level_key,
@@ -2839,6 +2851,62 @@ def test_generate_only_fills_slots_still_empty(client, phase5b_headers, monkeypa
     detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
     assert detail["slots"][0]["question"]["question_id"] == existing_id  # untouched
     assert all(slot["question"] is not None for slot in detail["slots"])
+
+
+def test_generate_never_mixes_two_books_sources_in_one_call(client, phase5b_headers, monkeypatch):
+    # Phase 5B quality fix: grouping slots purely by (level, marks) let one
+    # generate_json call's numbered sources span two different books --
+    # the real bug this reproduces is a CN-labelled slot (CRC/Hamming
+    # content) coming back answered from the NS document's encryption
+    # content instead. Grouping now includes book_id, so this must never
+    # happen: no single call's "Sources:" block may contain both books'
+    # distinctive marker text.
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_a = _upload_paper_doc(client, headers, "grounding_book_a.txt")  # contains "networking"
+    book_b = _upload_short_paper_doc(client, headers, "grounding_book_b.txt")  # contains "small test document"
+    paper_data = _create_paper(client, headers, [book_a, book_b], title="Grounding Paper")
+
+    # Force two slots (one per book) into the exact same (level, marks)
+    # group, regardless of what plan_paper happened to assign naturally.
+    db = TestSessionLocal()
+    try:
+        slots = (
+            db.query(main.PaperQuestion)
+            .filter(main.PaperQuestion.paper_id == paper_data["id"])
+            .order_by(main.PaperQuestion.position)
+            .all()
+        )
+        slot_a, slot_b = slots[0], slots[1]
+        slot_a.bloom_level = "remember"
+        slot_a.book_id = book_a
+        slot_b.bloom_level = "remember"
+        slot_b.book_id = book_b
+        db.commit()
+    finally:
+        db.close()
+
+    captured_sources = []
+
+    def fake(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            return {"items": []}
+        sources_text = prompt.split("Sources:\n", 1)[1] if "Sources:\n" in prompt else ""
+        captured_sources.append(sources_text)
+        return {"questions": []}
+    monkeypatch.setattr(llm_module, "generate_json", fake)
+
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+
+    assert len(captured_sources) >= 2
+    for sources_text in captured_sources:
+        has_a = "networking" in sources_text
+        has_b = "small test document" in sources_text
+        assert not (has_a and has_b), "a single call's sources must never span two different books"
+    assert any("networking" in s for s in captured_sources)
+    assert any("small test document" in s for s in captured_sources)
 
 
 def test_generate_exhausts_wait_budget_then_fails_and_retry_fills_empty_slots(

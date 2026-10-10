@@ -225,10 +225,17 @@ _LEVELS_BY_MARKS_BAND = {
     "high": ("analyze", "evaluate", "create"),               # 7+ marks
 }
 
-# marks -> which question *types* fit in that much space, regardless of level.
+# marks -> which question *types* fit in that much space, regardless of
+# level. mcq/true_false (a single pre-written correct option) only ever
+# make sense for a 1-2 mark slot -- a 3+ mark slot needs an actual written
+# answer (short_answer/scenario/long_answer), never a multiple-choice or
+# true/false pick (Phase 5B quality fix: a 5+ mark MCQ was both unrealistic
+# for a written exam and easy for the model to get subtly wrong). MCQ
+# papers are unaffected: validate_pattern already rejects any MCQ-paper
+# section with marks_each > 2, so they only ever land in the "low" band.
 _TYPES_BY_MARKS_BAND = {
     "low": ("mcq", "true_false", "fill_blank", "short_answer"),
-    "mid": ("short_answer", "scenario", "long_answer", "mcq"),
+    "mid": ("short_answer", "scenario", "long_answer"),
     "high": ("long_answer", "scenario"),
 }
 
