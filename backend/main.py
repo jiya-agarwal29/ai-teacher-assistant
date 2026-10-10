@@ -13,7 +13,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 import bloom
 import paper
+import paper_export
 import embeddings
 import jobs
 import llm
@@ -197,6 +198,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Content-Disposition isn't one of the CORS-safelisted response headers,
+    # so without this, frontend fetch() calls across origins (the dev
+    # server on :5173 talking to the API on :8000) can't read the
+    # server-chosen filename off a download response (api.papers.download)
+    # -- it silently comes back null and falls back to a generic name.
+    expose_headers=["Content-Disposition"],
 )
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
@@ -3521,3 +3528,43 @@ def get_paper_slot_candidates(
     fitting.sort(key=lambda q: q.book_id != slot.book_id)
 
     return [_question_summary(db, q) for q in fitting[:20]]
+
+
+@app.get("/papers/{paper_id}/export")
+def export_paper(
+    paper_id: int,
+    kind: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Downloads `paper_id` as a .docx -- see paper_export.py for what each
+    `kind` ("student" | "teacher" | "answer_key") actually contains. Built
+    straight from _paper_detail()'s own dict shape, so the export can
+    never drift from what GET /papers/{id} already shows the frontend.
+    """
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+
+    if kind not in paper_export.EXPORT_KINDS:
+        raise HTTPException(
+            status_code=422, detail=f"Unknown export kind '{kind}'. Use one of: {', '.join(paper_export.EXPORT_KINDS)}."
+        )
+
+    if paper_row.status != "ready":
+        raise HTTPException(status_code=409, detail="This paper isn't ready yet.")
+
+    detail = _paper_detail(db, paper_row)
+
+    if kind == "student" and any(slot["question"] is None for slot in detail["slots"]):
+        raise HTTPException(status_code=409, detail="Fill all questions first.")
+
+    buffer = paper_export.build_docx(detail, kind)
+
+    safe_title = re.sub(r"[^A-Za-z0-9 _-]", "", paper_row.title).strip() or "paper"
+    filename = f"{safe_title}-{kind}.docx"
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )

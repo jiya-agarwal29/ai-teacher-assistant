@@ -587,6 +587,49 @@ export const api = {
      * questions that fit this slot (same book first).
      */
     candidates: (id, slotId) => request(`/papers/${id}/slots/${slotId}/candidates`),
+
+    /**
+     * GET /papers/{id}/export?kind=student|teacher|answer_key -- fetched
+     * manually (not through the request() helper, which assumes a JSON
+     * body), same as books.pages.getImageUrl: a plain <a href> can't carry
+     * the Authorization header, so this fetches the .docx as a blob itself
+     * and triggers the browser's save-file flow via a throwaway <a download>
+     * element. The saved filename comes from the response's
+     * Content-Disposition header.
+     */
+    download: async (id, kind) => {
+      const token = getToken();
+      const headers = token ? { Authorization: `Bearer ${token}` } : {};
+      let response;
+      try {
+        response = await fetch(`${API_BASE_URL}/papers/${id}/export?kind=${kind}`, { headers });
+      } catch (netError) {
+        throw new Error('Failed to connect to backend server. Please ensure the backend is running.', { cause: netError });
+      }
+      if (!response.ok) {
+        let detail = 'Failed to export this paper.';
+        try {
+          detail = (await response.json()).detail || detail;
+        } catch {
+          // Response body wasn't JSON -- keep the default detail above.
+        }
+        throw new Error(detail);
+      }
+
+      const blob = await response.blob();
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="([^"]+)"/);
+      const filename = match ? match[1] : `paper-${kind}.docx`;
+
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    },
   },
 
   tools: {

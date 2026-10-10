@@ -3446,3 +3446,111 @@ def test_delete_book_empties_paper_slots(client, phase5b_headers, monkeypatch):
     detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
     assert detail["status"] == "ready"  # untouched
     assert all(slot["question"] is None for slot in detail["slots"])  # all emptied
+
+
+# -----------------------------
+# PHASE 5D: WORD EXPORT
+# -----------------------------
+DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def test_export_requires_ready_status(client, phase5b_headers):
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "export_not_ready.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Export Not Ready Paper")
+
+    res = client.get(f"/papers/{paper_data['id']}/export", headers=headers, params={"kind": "teacher"})
+    assert res.status_code == 409
+
+
+def test_export_rejects_unknown_kind(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "export_bad_kind.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Export Bad Kind Paper")
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+
+    res = client.get(f"/papers/{paper_data['id']}/export", headers=headers, params={"kind": "bogus"})
+    assert res.status_code == 422
+
+
+def test_export_owner_only(client, phase5b_headers, phase5b_other_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "export_owner.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Export Owner Paper")
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+
+    res = client.get(
+        f"/papers/{paper_data['id']}/export", headers=phase5b_other_headers, params={"kind": "teacher"}
+    )
+    assert res.status_code == 404
+
+
+def test_export_student_blocked_with_empty_slots_but_teacher_and_key_still_work(
+    client, phase5b_headers, monkeypatch
+):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "export_blocked.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Export Blocked Paper")
+
+    def fake(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            return {"items": []}
+        return {"questions": []}  # nothing generated -- every slot stays empty
+    monkeypatch.setattr(llm_module, "generate_json", fake)
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+
+    res = client.get(f"/papers/{paper_data['id']}/export", headers=headers, params={"kind": "student"})
+    assert res.status_code == 409
+    assert res.json()["detail"] == "Fill all questions first."
+
+    for kind in ("teacher", "answer_key"):
+        res2 = client.get(f"/papers/{paper_data['id']}/export", headers=headers, params={"kind": kind})
+        assert res2.status_code == 200, res2.text
+        assert res2.headers["content-type"] == DOCX_CONTENT_TYPE
+        assert len(res2.content) > 0
+
+
+def test_export_student_succeeds_with_correct_content_type_and_filename(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "export_ok.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Export OK Paper")
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+
+    res = client.get(f"/papers/{paper_data['id']}/export", headers=headers, params={"kind": "student"})
+    assert res.status_code == 200
+    assert res.headers["content-type"] == DOCX_CONTENT_TYPE
+    assert 'filename="Export OK Paper-student.docx"' in res.headers["content-disposition"]
+    assert len(res.content) > 0
+
+
+def test_export_filename_strips_unsafe_characters(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "export_unsafe_name.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Mid/Sem: Exam? 2026*")
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+
+    res = client.get(f"/papers/{paper_data['id']}/export", headers=headers, params={"kind": "answer_key"})
+    assert res.status_code == 200
+    disposition = res.headers["content-disposition"]
+    assert "/" not in disposition.split("filename=")[1]
+    assert ":" not in disposition.split("filename=")[1]
+    assert 'filename="MidSem Exam 2026-answer_key.docx"' in disposition
