@@ -142,4 +142,83 @@ class Question(Base):
     correct_answer = Column(Text, nullable=False)
     explanation = Column(Text, nullable=False)
 
+    # Phase 5B: set when this question was written for an exam paper slot
+    # (null for a plain AI Tools quiz question). marking_scheme is a JSON
+    # list of {point, marks}, whose marks always sum to exactly `marks`.
+    marks = Column(Integer, nullable=True)
+    marking_scheme = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class Paper(Base):
+    """
+    An exam paper (Phase 5B): a chosen Section/marks pattern plus Bloom
+    targets, planned once (paper.plan_paper) against the selected books
+    (each book is one "unit", weighted by its chunk count) before any AI
+    call -- `plan` is that plan, saved as-is so the teacher can see and
+    adjust it before generating actual question text.
+
+    status: "draft" (planned, nothing generated yet) -> "generating" ->
+    "ready" (every slot that could be filled, was) or "failed" (see
+    `error`). A "failed" paper can be retried -- POST /papers/{id}/generate
+    only ever fills still-empty slots, never regenerates a filled one.
+    progress_done/progress_total track slots filled during "generating"
+    for a status-poll progress bar, the same idea as Book's pages_done/
+    pages_total. `warnings` (JSON list of strings) collects anything the
+    plan or generation step couldn't fully satisfy (an unreachable Bloom
+    target, a slot that came up empty, a book that got removed).
+    """
+    __tablename__ = "papers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+
+    title = Column(String, nullable=False)
+    subject = Column(String, nullable=True)
+
+    pattern = Column(Text, nullable=False)        # JSON: the Pattern used (preset or custom)
+    bloom_targets = Column(Text, nullable=False)   # JSON: {level: percent}
+    book_ids = Column(Text, nullable=False)        # JSON: [book_id, ...] -- the units, in order
+    plan = Column(Text, nullable=False)            # JSON: paper.plan_paper()'s "plan" list
+
+    status = Column(String, default="draft", nullable=False)
+    error = Column(Text, nullable=True)
+    progress_done = Column(Integer, default=0, nullable=False)
+    progress_total = Column(Integer, default=0, nullable=False)
+    warnings = Column(Text, nullable=True)  # JSON list of strings
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False
+    )
+
+
+class PaperQuestion(Base):
+    """
+    One slot of a Paper's plan, linking it to the actual Question written
+    for it (question_id is null until generation fills the slot -- an
+    empty slot after generation just stays null, with a warning on the
+    Paper explaining why). Deleting a Paper deletes its PaperQuestions
+    (cascade) but never the underlying Questions -- those stay in the
+    user's bank regardless. Deleting a Book deletes its Questions as
+    today (DELETE /books/{id}), which sets this row's question_id back to
+    null (not delete the row itself) -- the slot just becomes empty again.
+    """
+    __tablename__ = "paper_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id"), index=True, nullable=False)
+
+    section = Column(String, nullable=False)
+    number = Column(String, nullable=False)
+    option = Column(String, nullable=True)  # "a" | "b" | None
+    marks = Column(Integer, nullable=False)
+    bloom_level = Column(String, nullable=False)
+    book_id = Column(Integer, ForeignKey("books.id"), nullable=True)
+
+    question_id = Column(Integer, ForeignKey("questions.id"), nullable=True)
+    position = Column(Integer, nullable=False)  # the slot's order in the plan, for display

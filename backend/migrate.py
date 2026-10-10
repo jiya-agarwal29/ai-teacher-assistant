@@ -160,13 +160,25 @@ def main():
     conn.commit()
     logger.info("Ensured document_pages table and index exist.")
 
-    # Phase 4B: the questions table. create_all() only ever creates tables
-    # that don't exist yet (every other table here is left untouched), so
-    # it's safe even though this file otherwise speaks raw sqlite3 -- but it
-    # needs its own SQLAlchemy engine connection, so check existence here
-    # (on the already-open cursor) and run create_all() after conn.close()
-    # below, rather than holding both connections open at once.
+    # Phase 4B: the questions table, and Phase 5B: questions.marks/
+    # marking_scheme plus the papers/paper_questions tables. create_all()
+    # only ever creates tables that don't exist yet (every other table
+    # here is left untouched), so it's safe even though this file
+    # otherwise speaks raw sqlite3 -- but it needs its own SQLAlchemy
+    # engine connection, so check existence here (on the already-open
+    # cursor) and run create_all() after conn.close() below, rather than
+    # holding both connections open at once.
     questions_table_already_existed = table_exists(cursor, "questions")
+    papers_tables_already_existed = table_exists(cursor, "papers") and table_exists(cursor, "paper_questions")
+
+    if questions_table_already_existed:
+        for column, ddl_type in (("marks", "INTEGER"), ("marking_scheme", "TEXT")):
+            if column_exists(cursor, "questions", column):
+                logger.info("questions.%s column already exists, skipping ALTER TABLE.", column)
+            else:
+                cursor.execute(f"ALTER TABLE questions ADD COLUMN {column} {ddl_type}")
+                conn.commit()
+                logger.info("Added questions.%s column.", column)
 
     cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()
@@ -185,11 +197,14 @@ def main():
     conn.commit()
     conn.close()
 
-    if questions_table_already_existed:
-        logger.info("questions table already exists, skipping create_all.")
+    if questions_table_already_existed and papers_tables_already_existed:
+        logger.info("questions/papers/paper_questions tables already exist, skipping create_all.")
     else:
         Base.metadata.create_all(bind=engine)
-        logger.info("Created questions table.")
+        if not questions_table_already_existed:
+            logger.info("Created questions table.")
+        if not papers_tables_already_existed:
+            logger.info("Created papers and paper_questions tables.")
 
     logger.info("Assigned %d previously-unowned book(s) to '%s' (user_id=%d).", unowned_count, username, user_id)
 

@@ -247,6 +247,52 @@ def test_plan_mid_sem_50_balanced_sections_a_and_b_use_at_least_two_units():
     assert len(units_by_section["B"]) >= 2
 
 
+def test_plan_mid_sem_50_balanced_sections_ordered_low_to_high_level():
+    # EXTRA: within each section, questions run lower Bloom level first;
+    # an either_or pair (one group, two options) always stays together.
+    pattern = paper.PRESET_PATTERNS["mid_sem_50"]
+    result = paper.plan_paper(pattern, paper.BLOOM_PRESETS["balanced"], UNITS_3)
+
+    by_section = {}
+    for entry in result["plan"]:
+        by_section.setdefault(entry["section"], []).append(entry)
+
+    for section_entries in by_section.values():
+        orders = [bloom.get_level(e["bloom_level"]).order for e in section_entries]
+        assert orders == sorted(orders), f"not ascending: {orders}"
+
+    # Section C's pairs must still be adjacent and share a level/number.
+    c_entries = by_section["C"]
+    assert c_entries[0]["number"] == c_entries[1]["number"]
+    assert c_entries[0]["bloom_level"] == c_entries[1]["bloom_level"]
+    assert c_entries[2]["number"] == c_entries[3]["number"]
+    assert c_entries[2]["bloom_level"] == c_entries[3]["bloom_level"]
+
+
+def test_plan_mid_sem_50_balanced_units_roughly_proportional_within_section():
+    # EXTRA: within each section, each unit gets roughly its weighted
+    # share of that section's *questions* -- for weights 3:2:1 over a
+    # 5-question section, the standard (largest-remainder) proportional
+    # split is 2/2/1, not a uniform ~1.67 each, and the heaviest unit
+    # never ends up with fewer questions than the lightest.
+    pattern = paper.PRESET_PATTERNS["mid_sem_50"]
+    result = paper.plan_paper(pattern, paper.BLOOM_PRESETS["balanced"], UNITS_3)
+
+    for section_key in ("A", "B"):
+        question_units = []
+        for entry in result["plan"]:
+            if entry["section"] != section_key:
+                continue
+            if entry["option"] in (None, "a"):  # count each question once
+                question_units.append(entry["unit_id"])
+
+        assert len(question_units) == 5
+        counts = {uid: question_units.count(uid) for uid in ("u1", "u2", "u3")}
+        assert sum(counts.values()) == 5
+        assert counts["u1"] >= counts["u3"]  # heaviest unit never trails the lightest
+        assert all(c >= 1 for c in counts.values())  # every unit represented
+
+
 def test_plan_mid_sem_50_balanced_unit_totals_equal_marks_on_paper():
     # Phase 5A fix: units are counted the same way as levels (either_or's
     # option (a) only), so by_unit sums to marks_on_paper, not more.

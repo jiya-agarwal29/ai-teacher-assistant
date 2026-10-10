@@ -426,6 +426,55 @@ def _run_indexing_job(book_id: int):
         db.close()
 
 
+def submit_paper_generation_job(paper_id: int):
+    """
+    Queues Phase 5B exam-paper generation for an already-planned Paper
+    (status set to "generating" by the route before this runs). Returns
+    immediately -- the job opens its own DB session and is responsible for
+    leaving the paper "ready" or "failed" no matter how it exits.
+    """
+    if JOBS_SYNC:
+        _run_paper_generation_job(paper_id)
+    else:
+        _executor.submit(_run_paper_generation_job, paper_id)
+
+
+def _fail_paper(db, paper_model, paper_id: int, error: str):
+    try:
+        paper_row = db.query(paper_model).filter(paper_model.id == paper_id).first()
+        if paper_row:
+            paper_row.status = "failed"
+            paper_row.error = error
+            db.commit()
+    except Exception:
+        logger.exception("Also failed to mark paper_id=%d as failed", paper_id)
+
+
+def _run_paper_generation_job(paper_id: int):
+    # Lazy import: main.py imports jobs at its own module top level, so
+    # importing main back at jobs.py's top level would be circular -- see
+    # llm.py's _generate_local for the same pattern already used elsewhere.
+    import main
+
+    db = database.SessionLocal()
+    try:
+        paper_row = db.query(main.Paper).filter(main.Paper.id == paper_id).first()
+        if not paper_row:
+            logger.error("Paper generation job: paper_id=%d no longer exists, skipping", paper_id)
+            return
+        main.generate_paper(db, paper_row)
+    except llm.LLMUnavailableError:
+        logger.warning("AI service busy while generating paper_id=%d", paper_id)
+        db.rollback()
+        _fail_paper(db, main.Paper, paper_id, "AI service is busy, please retry")
+    except Exception:
+        logger.exception("Unhandled error while generating paper_id=%d", paper_id)
+        db.rollback()
+        _fail_paper(db, main.Paper, paper_id, "Something went wrong while generating this paper. Please try again.")
+    finally:
+        db.close()
+
+
 def submit_reread_job(book_id: int, page_number: int):
     """
     Queues a single page's OCR to run again against its already-saved

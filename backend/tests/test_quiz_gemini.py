@@ -218,6 +218,85 @@ def test_classifier_prompt_contains_direct_answer_rule(monkeypatch):
     assert "at most Understand" in captured["prompt"]
 
 
+# -----------------------------
+# Phase 5B: marks_by_level / marking_scheme checks
+# -----------------------------
+def _paper_short_answer(**overrides):
+    q = {
+        "id": 1, "type": "short_answer", "bloom_level": "understand",
+        "question": "Explain how condensation forms clouds.",
+        "correctAnswer": "Water vapor cools and condenses into droplets.",
+        "explanation": "Covered in source 1.", "source_index": 1,
+        "marks": 5,
+        "marking_scheme": [
+            {"point": "Mentions cooling", "marks": 2},
+            {"point": "Mentions droplets", "marks": 3},
+        ],
+    }
+    q.update(overrides)
+    return q
+
+
+def test_paper_question_with_correct_marking_scheme_passes():
+    q = _paper_short_answer()
+    result = main._validate_quiz_questions(
+        [q], 1, ["understand"], marks_by_level={"understand": 5}
+    )
+    assert len(result) == 1
+    assert result[0]["marks"] == 5
+    assert result[0]["marking_scheme"] == [
+        {"point": "Mentions cooling", "marks": 2},
+        {"point": "Mentions droplets", "marks": 3},
+    ]
+
+
+def test_paper_question_with_wrong_marks_value_is_dropped():
+    bad = _paper_short_answer(marks=4)  # doesn't match the slot's 5
+    assert main._validate_quiz_questions([bad], 1, ["understand"], marks_by_level={"understand": 5}) == []
+
+
+def test_paper_marking_scheme_not_summing_to_marks_is_dropped():
+    bad = _paper_short_answer(marking_scheme=[{"point": "Only partial", "marks": 2}])  # sums to 2, not 5
+    assert main._validate_quiz_questions([bad], 1, ["understand"], marks_by_level={"understand": 5}) == []
+
+
+def test_paper_missing_marking_scheme_is_dropped():
+    bad = _paper_short_answer()
+    del bad["marking_scheme"]
+    assert main._validate_quiz_questions([bad], 1, ["understand"], marks_by_level={"understand": 5}) == []
+
+
+def test_paper_marking_scheme_point_without_integer_marks_is_dropped():
+    bad = _paper_short_answer(marking_scheme=[{"point": "Vague", "marks": "two"}])
+    assert main._validate_quiz_questions([bad], 1, ["understand"], marks_by_level={"understand": 5}) == []
+
+
+def test_paper_type_not_allowed_for_marks_band_is_dropped():
+    # long_answer doesn't fit a 1-2 mark ("low" band) slot even though
+    # "understand" generally allows it at other marks levels.
+    bad = _paper_short_answer(type="long_answer", marks=2, marking_scheme=[{"point": "x", "marks": 2}])
+    assert main._validate_quiz_questions([bad], 1, ["understand"], marks_by_level={"understand": 2}) == []
+
+
+def test_paper_mcq_on_mcq_paper_passes_with_single_full_mark_point():
+    q = _paper_short_answer(
+        type="mcq", bloom_level="remember", options=["A", "B", "C", "D"], correctAnswer="A",
+        marks=1, marking_scheme=[{"point": "Correct option", "marks": 1}],
+    )
+    result = main._validate_quiz_questions(
+        [q], 1, ["remember"], marks_by_level={"remember": 1}, paper_kind="mcq"
+    )
+    assert len(result) == 1
+
+
+def test_paper_non_marks_aware_call_is_unaffected():
+    # marks_by_level omitted entirely -- behaves exactly like Phase 4B.
+    q = _short_answer()
+    result = main._validate_quiz_questions([q], 1, ALL_LEVELS)
+    assert len(result) == 1
+    assert "marks" not in result[0]
+
+
 def test_classifier_prompt_omits_rule_without_sources(monkeypatch):
     import llm as llm_module
 

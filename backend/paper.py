@@ -380,20 +380,45 @@ def _pick_unit(unit_ids: list, assigned: dict, targets: dict, exclude=None) -> s
     return max(candidates, key=lambda uid: targets.get(uid, 0) - assigned.get(uid, 0))
 
 
+def _apportion_seats(total_seats: int, weights: dict) -> dict:
+    """
+    Hamilton's largest-remainder method: splits `total_seats` discrete
+    seats across `weights` (unit_id -> weight) as proportionally as
+    possible -- the standard way to turn weight ratios into whole counts
+    that still sum to exactly `total_seats`. Ties on the fractional
+    remainder favour the larger-weight unit, then dict order, so the
+    result is deterministic.
+    """
+    unit_ids = list(weights.keys())
+    total_weight = sum(weights.values()) or 1
+    exact = {uid: total_seats * weights[uid] / total_weight for uid in unit_ids}
+    seats = {uid: int(exact[uid]) for uid in unit_ids}  # floor
+
+    remaining = total_seats - sum(seats.values())
+    order = sorted(
+        unit_ids,
+        key=lambda uid: (-(exact[uid] - seats[uid]), -weights[uid], unit_ids.index(uid))
+    )
+    for uid in order[:remaining]:
+        seats[uid] += 1
+
+    return seats
+
+
 def _assign_units(groups: list, pattern: Pattern, units: list) -> dict:
     """
-    Assigns a unit to every slot. Driven by ONE running balance
-    (`assigned_full`, every printed slot counted once each -- both
-    either_or options included, since that's what's really spread across
-    the page) against `targets_full` (the same convention). Two things
-    layered on top of that single greedy pick:
-
-    - Either_or pairs always get two DIFFERENT units for their two options
-      (when 2+ units exist).
-    - A repair pass afterward: no section with 2+ questions may end up
-      using only one unit when 2+ units exist overall -- if the greedy
-      picks left a section monotone, its last question is moved to the
-      next-best alternative unit.
+    Assigns a unit to every slot, section by section. Each section gets
+    its own per-unit QUOTA -- `section.num_questions` seats apportioned
+    across the units by weight (_apportion_seats), the same global
+    weights every section uses, so the whole paper still follows the
+    overall unit weights even though each section is balanced on its own
+    (e.g. weights 3:2:1 over a 5-question section apportions to 2/2/1 --
+    the standard largest-remainder answer; a cruder split like 3/1/1
+    would over-represent the heaviest unit relative to its actual share).
+    Groups within a section are assigned to whichever quota-holding unit
+    needs it most (most seats still unused); either_or pairs always draw
+    two DIFFERENT units for their two options (when 2+ units exist), which
+    on its own already guarantees that section isn't monotone.
 
     Returns {
       "unit_by_slot_index": {...},
@@ -417,61 +442,54 @@ def _assign_units(groups: list, pattern: Pattern, units: list) -> dict:
     weights = {u["id"]: (u.get("weight") or 1) for u in units}
     total_weight = sum(weights.values()) or 1
 
-    all_slots = [slot for group in groups for slot in group]
-    full_total = sum(slot["marks"] for slot in all_slots)
-    targets_full = {uid: (weights[uid] / total_weight) * full_total for uid in unit_ids}
-    assigned_full = {uid: 0 for uid in unit_ids}
-
     section_of_group = []
     for section in pattern.sections:
         section_of_group.extend([section.key] * section.num_questions)
 
+    section_group_indices = {}
+    for gi, key in enumerate(section_of_group):
+        section_group_indices.setdefault(key, []).append(gi)
+
     unit_by_group = [None] * len(groups)       # "none"/"any_n": a single unit
     unit_pair_by_group = [None] * len(groups)  # "either_or": (unit_a, unit_b)
 
-    for gi, group in enumerate(groups):
-        if len(group) == 2:
-            u1 = _pick_unit(unit_ids, assigned_full, targets_full)
-            assigned_full[u1] += group[0]["marks"]
-            exclude = u1 if len(unit_ids) >= 2 else None
-            u2 = _pick_unit(unit_ids, assigned_full, targets_full, exclude=exclude)
-            assigned_full[u2] += group[1]["marks"]
-            unit_pair_by_group[gi] = (u1, u2)
-        else:
-            u = _pick_unit(unit_ids, assigned_full, targets_full)
-            assigned_full[u] += group[0]["marks"]
-            unit_by_group[gi] = u
+    # Secondary tie-break for _pick_quota_unit below, tracked globally
+    # (not reset per section) so that when several units are equally
+    # under-quota, picks spread across units instead of always favouring
+    # whichever happens to be first in `unit_ids`.
+    global_draws = {uid: 0 for uid in unit_ids}
 
-    # Repair pass: no 2+-question section may be monotone when 2+ units exist.
-    if len(unit_ids) >= 2:
-        section_group_indices = {}
-        for gi, key in enumerate(section_of_group):
-            section_group_indices.setdefault(key, []).append(gi)
+    def _pick_quota_unit(quota_remaining, exclude=None):
+        candidates = [uid for uid in unit_ids if uid != exclude and quota_remaining.get(uid, 0) > 0]
+        if not candidates:
+            candidates = [uid for uid in unit_ids if uid != exclude] or list(unit_ids)
+        chosen = min(candidates, key=lambda uid: (-quota_remaining.get(uid, 0), global_draws[uid]))
+        global_draws[chosen] += 1
+        return chosen
 
-        for group_indices in section_group_indices.values():
-            if len(group_indices) < 2:
-                continue  # exempt -- the section has only 1 question
+    for section in pattern.sections:
+        group_indices = section_group_indices.get(section.key, [])
+        if not group_indices:
+            continue
+        # Each either_or question draws a unit TWICE (one per option), so
+        # the quota basis is total draws, not question count, or an
+        # either_or-heavy section would run out of quota halfway through.
+        total_draws = sum(2 if len(groups[gi]) == 2 else 1 for gi in group_indices)
+        quota_remaining = _apportion_seats(total_draws, weights)
 
-            units_in_section = set()
-            for gi in group_indices:
-                if unit_pair_by_group[gi] is not None:
-                    units_in_section.update(unit_pair_by_group[gi])
-                else:
-                    units_in_section.add(unit_by_group[gi])
-
-            if len(units_in_section) > 1:
-                continue  # already spread -- nothing to repair
-
-            # Monotone (either_or pairs already guarantee 2+ units on
-            # their own, so only a run of "none"/"any_n" slots can land
-            # here) -- move the section's last slot to the next-best unit.
-            only_unit = next(iter(units_in_section))
-            last_gi = group_indices[-1]
-            last_group = groups[last_gi]
-            assigned_full[only_unit] -= last_group[0]["marks"]
-            new_unit = _pick_unit(unit_ids, assigned_full, targets_full, exclude=only_unit)
-            assigned_full[new_unit] += last_group[0]["marks"]
-            unit_by_group[last_gi] = new_unit
+        for gi in group_indices:
+            group = groups[gi]
+            if len(group) == 2:
+                u1 = _pick_quota_unit(quota_remaining)
+                quota_remaining[u1] -= 1
+                exclude = u1 if len(unit_ids) >= 2 else None
+                u2 = _pick_quota_unit(quota_remaining, exclude=exclude)
+                quota_remaining[u2] -= 1
+                unit_pair_by_group[gi] = (u1, u2)
+            else:
+                u = _pick_quota_unit(quota_remaining)
+                quota_remaining[u] -= 1
+                unit_by_group[gi] = u
 
     # --- Flatten into per-slot-index maps, and the two reporting totals ---
     unit_by_slot_index = {}
@@ -558,6 +576,34 @@ def plan_paper(pattern: Pattern, bloom_targets: dict, units: list) -> dict:
         target_pct = bloom_targets.get(level, 0)
         reason = _impossibility_reason(level, pattern.paper_kind)
         warnings.append(f"{bloom.get_level(level).label} target {target_pct:g}% can't be met: {reason}")
+
+    # Reorder each section's questions lower Bloom level first (an
+    # either_or pair is one group, so both its options always move
+    # together). Stable sort keeps same-level questions in their original
+    # relative order, so this is still fully deterministic. Units are
+    # assigned, and the plan numbered, AFTER this reorder, against the
+    # final sequence.
+    def _level_order(gi):
+        level = level_by_group[gi]
+        return bloom.get_level(level).order if level else len(bloom.LEVELS) + 1
+
+    reordered_groups = []
+    reordered_levels = []
+    start = 0
+    for section in pattern.sections:
+        section_indices = sorted(range(start, start + section.num_questions), key=_level_order)
+        for gi in section_indices:
+            reordered_groups.append(groups[gi])
+            reordered_levels.append(level_by_group[gi])
+        start += section.num_questions
+    groups = reordered_groups
+    level_by_group = reordered_levels
+
+    number = 1
+    for group in groups:
+        for slot in group:
+            slot["number"] = str(number)
+        number += 1
 
     # --- Units ---
     unit_plan = _assign_units(groups, pattern, units)

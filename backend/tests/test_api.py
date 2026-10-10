@@ -4,7 +4,9 @@ using an isolated on-disk SQLite database so nothing here touches the real
 dev database (teacher_ai.db). Exercises the full auth + upload + per-user
 isolation flow described in the deployment checklist.
 """
+import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -2423,3 +2425,588 @@ def test_generate_quiz_drops_near_duplicate_and_tops_up(client, phase4b_headers,
     assert any("too similar to another question in this quiz" in msg for msg in drop_logs)
 
     client.delete(f"/books/{book_id}", headers=headers)
+
+
+# -----------------------------
+# PHASE 5B: EXAM PAPER GENERATION
+# -----------------------------
+@pytest.fixture(scope="session")
+def phase5b_headers(client):
+    main.limiter.reset()
+    _register(client, "phase5b_test_user", "phase5bpass1")
+    return _auth_headers(client, "phase5b_test_user", "phase5bpass1")
+
+
+@pytest.fixture(scope="session")
+def phase5b_other_headers(client):
+    main.limiter.reset()
+    _register(client, "phase5b_other_user", "phase5bopass1")
+    return _auth_headers(client, "phase5b_other_user", "phase5bopass1")
+
+
+PAPER_BOOK_CONTENT = "\n\n".join(
+    f"Paragraph {i}: sample study material about computer networking concept number {i}, "
+    "covering routing tables, switching hardware, and protocol layering in enough depth "
+    "to fill a distinct chunk of text for exam-paper generation testing."
+    for i in range(1, 41)
+).encode()
+
+# A small, fast pattern for most tests: 2 questions worth 2 marks (Section
+# A, "low" marks band) + 2 questions worth 5 marks (Section B, "mid" marks
+# band) -- 4 slots total, no either_or pairs to keep assertions simple.
+SMALL_PATTERN = {
+    "key": "small_test", "name": "Small Test Pattern", "duration_minutes": 30,
+    "paper_kind": "written",
+    "sections": [
+        {
+            "key": "A", "title": "Section A", "instructions": "Answer all.",
+            "marks_each": 2, "num_questions": 2, "choice": "none"
+        },
+        {
+            "key": "B", "title": "Section B", "instructions": "Answer all.",
+            "marks_each": 5, "num_questions": 2, "choice": "none"
+        },
+    ],
+}
+SMALL_BLOOM_TARGETS = {
+    "remember": 25, "understand": 25, "apply": 25, "analyze": 25, "evaluate": 0, "create": 0
+}
+
+
+def _upload_paper_doc(client, headers, filename="paper_source.txt"):
+    res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": (filename, PAPER_BOOK_CONTENT, "text/plain")}
+    )
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "ready"  # JOBS_SYNC=true: already processed
+    return res.json()["book_id"]
+
+
+def _create_paper(client, headers, book_ids, pattern=None, bloom_targets=None, title="Test Paper"):
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": title,
+            "pattern": pattern or SMALL_PATTERN,
+            "bloom_targets": bloom_targets or SMALL_BLOOM_TARGETS,
+            "book_ids": book_ids,
+        }
+    )
+    assert res.status_code == 200, res.text
+    return res.json()
+
+
+_PAPER_LABEL_TO_LEVEL = {}
+
+
+def _paper_label_to_level_map():
+    if not _PAPER_LABEL_TO_LEVEL:
+        import bloom as bloom_module
+        for key in bloom_module.level_keys():
+            _PAPER_LABEL_TO_LEVEL[bloom_module.get_level(key).label] = key
+    return _PAPER_LABEL_TO_LEVEL
+
+
+def _make_paper_llm_fake():
+    """
+    A generate_json fake good for the whole Phase 5B flow: for any
+    non-classifier schema, it invents exactly as many questions as the
+    prompt's "write exactly N question(s) at this level" bullets ask for,
+    each tagged with the requested bloom_level (and marks/marking_scheme
+    when the bullet is marks-aware), with source_index assigned 1..N in
+    call order so main.generate_paper's source_index-based slot matching
+    has something real to match against. For CLASSIFIER_SCHEMA calls it
+    agrees with whatever level each question text was invented at, so no
+    mismatch/regeneration branch fires unless a test overrides this fake.
+    """
+    import main as main_module
+    import paper as paper_module
+    label_to_level = _paper_label_to_level_map()
+    counter = {"n": 0}
+    level_by_text = {}
+
+    def fake(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            items = []
+            tail = prompt.split("Questions:\n", 1)[1] if "Questions:\n" in prompt else ""
+            for line in tail.strip().split("\n"):
+                m = re.match(r"(\d+)\.\s*(.*)", line.strip())
+                if not m:
+                    continue
+                items.append({"id": int(m.group(1)), "level": level_by_text.get(m.group(2).strip(), "remember")})
+            return {"items": items}
+
+        questions = []
+        source_index = 0
+        for match in re.finditer(
+            r"- ([A-Za-z]+) -- write exactly (\d+) question\(s\) at this level"
+            r"(?:, each worth EXACTLY (\d+) marks)?",
+            prompt
+        ):
+            label, count, marks = match.group(1), int(match.group(2)), match.group(3)
+            level_key = label_to_level[label]
+            marks_int = int(marks) if marks is not None else 2
+            # Pick a type this (level, marks, "written") slot actually
+            # allows -- bloom.py's per-level types and paper.py's marks-band
+            # types don't always overlap the way a naive "short vs long"
+            # guess would assume (e.g. remember never allows short_answer).
+            allowed_types = paper_module.allowed_types_for_slot(level_key, marks_int, "written") or ["short_answer"]
+            chosen_type = allowed_types[0]
+
+            for _ in range(count):
+                counter["n"] += 1
+                source_index += 1
+                text = f"Generated paper question #{counter['n']} about {level_key}?"
+                level_by_text[text] = level_key
+                q = {
+                    "id": counter["n"], "type": chosen_type, "bloom_level": level_key,
+                    "question": text, "explanation": "A sample explanation.", "source_index": source_index,
+                }
+                if chosen_type == "mcq":
+                    q["options"] = ["Option A", "Option B", "Option C", "Option D"]
+                    q["correctAnswer"] = "A"
+                elif chosen_type == "true_false":
+                    q["options"] = ["True", "False"]
+                    q["correctAnswer"] = "A"
+                else:
+                    q["correctAnswer"] = "A sample correct answer."
+                if marks is not None:
+                    q["marks"] = marks_int
+                    q["marking_scheme"] = [{"point": "Correctness", "marks": marks_int}]
+                questions.append(q)
+
+        return {"questions": questions}
+
+    return fake
+
+
+def test_create_paper_builds_plan_without_any_llm_call(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_create.txt")
+
+    def fail_generate_json(*a, **kw):
+        raise AssertionError("generate_json should not be called during paper creation")
+    monkeypatch.setattr(llm_module, "generate_json", fail_generate_json)
+
+    data = _create_paper(client, headers, [book_id], title="Unit Test Paper")
+
+    assert data["status"] == "draft"
+    assert len(data["plan"]) == 4
+    assert len(data["slots"]) == 4
+    assert all(slot["question"] is None for slot in data["slots"])
+    assert data["warnings"] == []
+    assert set(data["blueprint_target"].keys()) == set(data["blueprint_planned"]["by_level"].keys())
+
+
+def test_create_paper_rejects_invalid_pattern(client, phase5b_headers):
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_bad_pattern.txt")
+    bad_pattern = dict(SMALL_PATTERN, sections=[dict(SMALL_PATTERN["sections"][0], num_questions=0)])
+
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "Bad Pattern", "pattern": bad_pattern,
+            "bloom_targets": SMALL_BLOOM_TARGETS, "book_ids": [book_id]
+        }
+    )
+    assert res.status_code == 422
+    assert isinstance(res.json()["detail"], list) and res.json()["detail"]
+
+
+def test_create_paper_rejects_invalid_bloom_targets(client, phase5b_headers):
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_bad_targets.txt")
+    bad_targets = {"remember": 50, "understand": 10}  # sums to 60, not 100
+
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "Bad Targets", "pattern": SMALL_PATTERN,
+            "bloom_targets": bad_targets, "book_ids": [book_id]
+        }
+    )
+    assert res.status_code == 422
+    assert isinstance(res.json()["detail"], list) and res.json()["detail"]
+
+
+def test_create_paper_rejects_other_users_book(client, phase5b_headers, phase5b_other_headers):
+    other_book_id = _upload_paper_doc(client, phase5b_other_headers, "paper_other_owner.txt")
+
+    res = client.post(
+        "/papers", headers=phase5b_headers,
+        json={
+            "title": "Not Mine", "pattern": SMALL_PATTERN,
+            "bloom_targets": SMALL_BLOOM_TARGETS, "book_ids": [other_book_id]
+        }
+    )
+    assert res.status_code == 404
+
+
+def test_generate_fills_all_slots_and_blueprint_actual_matches_plan(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_generate_full.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Full Generate Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "ready"  # JOBS_SYNC=true: already generated
+
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    assert detail["status"] == "ready"
+    assert all(slot["question"] is not None for slot in detail["slots"])
+    assert detail["warnings"] == []
+
+    for slot in detail["slots"]:
+        q = slot["question"]
+        assert q["marks"] == slot["marks"]
+        assert sum(p["marks"] for p in q["marking_scheme"]) == slot["marks"]
+
+    assert detail["blueprint_actual"]["by_level"] == detail["blueprint_planned"]["by_level"]
+
+
+def test_generate_with_no_usable_questions_leaves_warnings_but_stays_ready(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_empty_slots.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Empty Slots Paper")
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": []}
+        return {"questions": []}
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    assert res.status_code == 202
+    assert res.json()["status"] == "ready"
+
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    assert detail["status"] == "ready"
+    assert all(slot["question"] is None for slot in detail["slots"])
+    assert len(detail["warnings"]) >= 1
+    assert "couldn't generate a question for this slot" in detail["warnings"][0]
+
+
+def test_generate_only_fills_slots_still_empty(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_partial_fill.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Partial Fill Paper")
+
+    db = TestSessionLocal()
+    try:
+        user_id = db.query(main.User).filter(main.User.username == "phase5b_test_user").first().id
+        slot0_marks = paper_data["slots"][0]["marks"]
+        existing = main.Question(
+            user_id=user_id, book_id=book_id, topic="pre-existing", type="short_answer",
+            bloom_level="remember", bloom_check="unchecked",
+            question="A question already sitting in this slot.",
+            correct_answer="Pre-existing answer.", explanation="Pre-existing explanation.",
+            marks=slot0_marks, marking_scheme=json.dumps([{"point": "x", "marks": slot0_marks}]),
+        )
+        db.add(existing)
+        db.flush()
+        slot0 = db.query(main.PaperQuestion).filter(main.PaperQuestion.id == paper_data["slots"][0]["id"]).first()
+        slot0.question_id = existing.id
+        db.commit()
+        existing_id = existing.id
+    finally:
+        db.close()
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    assert res.status_code == 202
+    assert res.json()["status"] == "ready"
+
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    assert detail["slots"][0]["question"]["question_id"] == existing_id  # untouched
+    assert all(slot["question"] is not None for slot in detail["slots"])
+
+
+def test_generate_fails_with_friendly_error_when_llm_busy(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_busy.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Busy Paper")
+
+    def raise_unavailable(*a, **kw):
+        raise llm_module.LLMUnavailableError("boom")
+    monkeypatch.setattr(llm_module, "generate_json", raise_unavailable)
+
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    assert res.status_code == 202
+    assert res.json()["status"] == "failed"  # JOBS_SYNC=true: already ran and hit the busy error
+
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    assert detail["status"] == "failed"
+    assert detail["error"] == "AI service is busy, please retry"
+    assert all(slot["question"] is None for slot in detail["slots"])
+
+    # Retry with a working mock -- nothing was saved from the failed
+    # attempt, so this fills every slot.
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    res2 = client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    assert res2.status_code == 202
+    assert res2.json()["status"] == "ready"
+
+    detail2 = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    assert all(slot["question"] is not None for slot in detail2["slots"])
+
+
+def test_paper_stuck_generating_fails_on_startup_cleanup(client, phase5b_headers):
+    db = TestSessionLocal()
+    paper_id = None
+    try:
+        user = db.query(main.User).filter(main.User.username == "phase5b_test_user").first()
+        p = main.Paper(
+            user_id=user.id, title="Interrupted", pattern="{}", bloom_targets="{}",
+            book_ids="[]", plan="[]", status="generating",
+        )
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        paper_id = p.id
+
+        failed_count = main._fail_interrupted_papers(db)
+        assert failed_count >= 1
+
+        db.refresh(p)
+        assert p.status == "failed"
+        assert p.error == "Generation was interrupted, click Generate to continue."
+    finally:
+        if paper_id is not None:
+            db.query(main.Paper).filter(main.Paper.id == paper_id).delete()
+            db.commit()
+        db.close()
+
+
+def test_swap_slot_accepts_matching_bank_question_and_flags_level_change(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_swap.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Swap Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+
+    slot = next(s for s in detail["slots"] if s["marks"] == 2)
+    other_level = next(lvl for lvl in ("remember", "understand", "apply") if lvl != slot["bloom_level"])
+
+    db = TestSessionLocal()
+    try:
+        user_id = db.query(main.User).filter(main.User.username == "phase5b_test_user").first().id
+        bank_q = main.Question(
+            user_id=user_id, book_id=book_id, topic="bank",
+            type="short_answer", bloom_level=other_level, bloom_check="unchecked",
+            question="A freshly written bank question for swapping in.",
+            correct_answer="Some answer.", explanation="Some explanation.",
+            marks=2, marking_scheme=json.dumps([{"point": "x", "marks": 2}]),
+        )
+        db.add(bank_q)
+        db.commit()
+        db.refresh(bank_q)
+        bank_question_id = bank_q.id
+    finally:
+        db.close()
+
+    res = client.patch(
+        f"/papers/{paper_data['id']}/slots/{slot['id']}", headers=headers,
+        json={"question_id": bank_question_id}
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    swapped_slot = next(s for s in data["slots"] if s["id"] == slot["id"])
+    assert swapped_slot["question"]["question_id"] == bank_question_id
+    assert any("swapped in a" in w for w in data["warnings"])
+
+
+def test_swap_slot_rejects_wrong_marks_and_enforces_ownership(
+    client, phase5b_headers, phase5b_other_headers, monkeypatch
+):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_swap_reject.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Swap Reject Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    slot_2marks = next(s for s in detail["slots"] if s["marks"] == 2)
+    slot_5marks = next(s for s in detail["slots"] if s["marks"] == 5)
+
+    # Wrong marks: a 5-mark slot's question doesn't fit a 2-mark slot.
+    res = client.patch(
+        f"/papers/{paper_data['id']}/slots/{slot_2marks['id']}", headers=headers,
+        json={"question_id": slot_5marks["question"]["question_id"]}
+    )
+    assert res.status_code == 400
+
+    # Another user's question is 404 -- not theirs to use.
+    other_book_id = _upload_paper_doc(client, phase5b_other_headers, "paper_swap_other.txt")
+    other_paper = _create_paper(client, phase5b_other_headers, [other_book_id], title="Other User Paper")
+    main.limiter.reset()
+    client.post(f"/papers/{other_paper['id']}/generate", headers=phase5b_other_headers)
+    other_detail = client.get(f"/papers/{other_paper['id']}", headers=phase5b_other_headers).json()
+    foreign_question_id = next(s["question"]["question_id"] for s in other_detail["slots"] if s["question"])
+
+    res2 = client.patch(
+        f"/papers/{paper_data['id']}/slots/{slot_2marks['id']}", headers=headers,
+        json={"question_id": foreign_question_id}
+    )
+    assert res2.status_code == 404
+
+    # Owner-only on the paper/slot itself too.
+    res3 = client.patch(
+        f"/papers/{paper_data['id']}/slots/{slot_2marks['id']}", headers=phase5b_other_headers,
+        json={"question_id": slot_5marks["question"]["question_id"]}
+    )
+    assert res3.status_code == 404
+
+
+def test_regenerate_slot_writes_new_question_and_is_owner_only(
+    client, phase5b_headers, phase5b_other_headers, monkeypatch
+):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_regen_slot.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Regen Slot Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    slot = detail["slots"][0]
+    old_question_id = slot["question"]["question_id"]
+
+    res_other = client.post(
+        f"/papers/{paper_data['id']}/slots/{slot['id']}/regenerate", headers=phase5b_other_headers
+    )
+    assert res_other.status_code == 404
+
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/slots/{slot['id']}/regenerate", headers=headers)
+    assert res.status_code == 200, res.text
+    new_detail = res.json()
+    new_slot = next(s for s in new_detail["slots"] if s["id"] == slot["id"])
+    assert new_slot["question"]["question_id"] != old_question_id
+    assert new_slot["question"]["marks"] == slot["marks"]
+
+
+def test_slot_candidates_filters_by_marks_and_level_and_is_owner_only(
+    client, phase5b_headers, phase5b_other_headers
+):
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_candidates.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Candidates Paper")
+    slot = paper_data["slots"][0]  # a still-empty 2-mark slot (draft paper)
+
+    db = TestSessionLocal()
+    try:
+        user_id = db.query(main.User).filter(main.User.username == "phase5b_test_user").first().id
+        # "remember" at 2 marks ("low" band) only allows mcq/true_false/
+        # fill_blank -- short_answer isn't in the intersection, so these use
+        # true_false to actually fit the slot.
+        matching = main.Question(
+            user_id=user_id, book_id=book_id, topic="bank", type="true_false",
+            bloom_level="remember", bloom_check="unchecked",
+            question="A matching candidate question.", correct_answer="A",
+            explanation="Explanation.", marks=slot["marks"],
+            marking_scheme=json.dumps([{"point": "x", "marks": slot["marks"]}]),
+        )
+        no_marks_yet = main.Question(
+            user_id=user_id, book_id=book_id, topic="bank", type="true_false",
+            bloom_level="remember", bloom_check="unchecked",
+            question="A plain quiz question with no marks assigned yet.",
+            correct_answer="A", explanation="Explanation.",
+        )
+        wrong_marks = main.Question(
+            user_id=user_id, book_id=book_id, topic="bank", type="long_answer",
+            bloom_level="analyze", bloom_check="unchecked",
+            question="A question worth the wrong number of marks.",
+            correct_answer="Answer.", explanation="Explanation.",
+            marks=10, marking_scheme=json.dumps([{"point": "x", "marks": 10}]),
+        )
+        db.add_all([matching, no_marks_yet, wrong_marks])
+        db.commit()
+    finally:
+        db.close()
+
+    res = client.get(f"/papers/{paper_data['id']}/slots/{slot['id']}/candidates", headers=headers)
+    assert res.status_code == 200
+    candidate_texts = [c["question"] for c in res.json()]
+    assert "A matching candidate question." in candidate_texts
+    assert "A plain quiz question with no marks assigned yet." in candidate_texts
+    assert "A question worth the wrong number of marks." not in candidate_texts
+
+    res_other = client.get(
+        f"/papers/{paper_data['id']}/slots/{slot['id']}/candidates", headers=phase5b_other_headers
+    )
+    assert res_other.status_code == 404
+
+
+def test_delete_paper_keeps_bank_questions(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_delete.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Delete Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    question_ids = [s["question"]["question_id"] for s in detail["slots"]]
+
+    res = client.delete(f"/papers/{paper_data['id']}", headers=headers)
+    assert res.status_code == 200
+    assert client.get(f"/papers/{paper_data['id']}", headers=headers).status_code == 404
+
+    db = TestSessionLocal()
+    try:
+        remaining = db.query(main.Question).filter(main.Question.id.in_(question_ids)).count()
+        assert remaining == len(question_ids)
+        assert db.query(main.PaperQuestion).filter(main.PaperQuestion.paper_id == paper_data["id"]).count() == 0
+    finally:
+        db.close()
+
+
+def test_delete_book_empties_paper_slots(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_book_delete.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Book Delete Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+
+    res = client.delete(f"/books/{book_id}", headers=headers)
+    assert res.status_code == 200
+
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    assert detail["status"] == "ready"  # untouched
+    assert all(slot["question"] is None for slot in detail["slots"])  # all emptied

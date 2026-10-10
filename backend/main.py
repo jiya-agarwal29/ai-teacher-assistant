@@ -6,6 +6,7 @@ import re
 import shutil
 from collections import Counter
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
@@ -16,10 +17,11 @@ from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 import bloom
+import paper
 import embeddings
 import jobs
 import llm
@@ -37,7 +39,7 @@ from retrieval import retrieve, invalidate_cache, user_has_documents, user_has_a
 
 import database
 from database import engine, get_db
-from models import Base, Book, DocumentPage, Page, Question, User
+from models import Base, Book, DocumentPage, Page, Question, Paper, PaperQuestion, User
 
 from auth import (
     create_access_token,
@@ -77,6 +79,22 @@ def _fail_interrupted_books(db: Session) -> int:
     return len(interrupted)
 
 
+def _fail_interrupted_papers(db: Session) -> int:
+    """
+    Same reasoning as _fail_interrupted_books: a Paper stuck "generating"
+    belonged to a worker thread that no longer exists after a restart.
+    POST /papers/{id}/generate can simply be called again -- it only ever
+    fills still-empty slots.
+    """
+    interrupted = db.query(Paper).filter(Paper.status == "generating").all()
+    for paper_row in interrupted:
+        paper_row.status = "failed"
+        paper_row.error = "Generation was interrupted, click Generate to continue."
+    if interrupted:
+        db.commit()
+    return len(interrupted)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up: loading AI models and preparing database")
@@ -98,6 +116,9 @@ async def lifespan(app: FastAPI):
         failed_count = _fail_interrupted_books(db)
         if failed_count:
             logger.warning("Marked %d interrupted upload(s) as failed on startup", failed_count)
+        failed_paper_count = _fail_interrupted_papers(db)
+        if failed_paper_count:
+            logger.warning("Marked %d interrupted paper generation(s) as failed on startup", failed_paper_count)
     finally:
         db.close()
 
@@ -311,6 +332,51 @@ QUIZ_SCHEMA = {
     "required": ["questions"]
 }
 
+# Same shape as QUIZ_SCHEMA, but marks/marking_scheme are REQUIRED -- used
+# only for exam-paper generation (Phase 5B), where every question must
+# carry both. A separate schema object (not QUIZ_SCHEMA with an extra
+# optional field) so the plain quiz path never has to think about marks
+# at all, and Gemini's structured-output mode reliably returns these
+# fields only when they're actually required.
+PAPER_QUIZ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "type": {"type": "string", "enum": QUIZ_QUESTION_TYPES},
+                    "bloom_level": {"type": "string", "enum": bloom.level_keys()},
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "correctAnswer": {"type": "string"},
+                    "explanation": {"type": "string"},
+                    "source_index": {"type": "integer"},
+                    "marks": {"type": "integer"},
+                    "marking_scheme": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "point": {"type": "string"},
+                                "marks": {"type": "integer"}
+                            },
+                            "required": ["point", "marks"]
+                        }
+                    }
+                },
+                "required": [
+                    "id", "type", "bloom_level", "question", "correctAnswer",
+                    "explanation", "source_index", "marks", "marking_scheme"
+                ]
+            }
+        }
+    },
+    "required": ["questions"]
+}
+
 # The per-type/option-format rules shared by every question regardless of
 # Bloom level; the level-specific breakdown (which levels, how many of each,
 # their prompt_rules) is built separately per call by _bloom_level_prompt_block
@@ -356,14 +422,34 @@ CLASSIFIER_SCHEMA = {
 }
 
 
-def _bloom_level_prompt_block(level_counts: dict) -> str:
-    """One bullet per requested level with a non-zero count: its label,
-    description, prompt_rules, allowed question types and how many to write."""
+def _bloom_level_prompt_block(level_counts: dict, marks_by_level: dict = None, paper_kind: str = "written") -> str:
+    """
+    One bullet per requested level with a non-zero count: its label,
+    description, prompt_rules, allowed question types and how many to
+    write. `marks_by_level` (Phase 5B exam papers only -- a question at
+    this level must be worth exactly this many marks) swaps in
+    paper.allowed_types_for_slot's marks-aware type list instead of the
+    level's full type list, and adds the marks/marking_scheme instruction.
+    """
     lines = []
     for key, count in level_counts.items():
         if count <= 0:
             continue
         level = bloom.get_level(key)
+        marks = (marks_by_level or {}).get(key)
+        if marks is not None:
+            allowed = ", ".join(paper.allowed_types_for_slot(key, marks, paper_kind))
+            lines.append(
+                f"- {level.label} -- write exactly {count} question(s) at this level, "
+                f"each worth EXACTLY {marks} marks (a {marks}-mark question needs about a "
+                f"{marks}-mark answer -- longer/deeper for more marks). {level.description} "
+                f"{level.prompt_rules} Allowed question types: {allowed}. Also return "
+                f"marking_scheme: a list of {{point, marks}} key points a full answer needs, "
+                f"whose marks add up to EXACTLY {marks} (e.g. a 2-mark question needs 2 points "
+                "worth 1 each, or 1 point worth 2; an mcq always has exactly one point worth "
+                "all the marks)."
+            )
+            continue
         allowed = ", ".join(level.question_types)
         lines.append(
             f"- {level.label} -- write exactly {count} question(s) at this level. "
@@ -372,12 +458,16 @@ def _bloom_level_prompt_block(level_counts: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_quiz_prompt(topic: str, top_pages, level_counts: dict, recent_questions: list = None) -> str:
+def _build_quiz_prompt(
+    topic: str, top_pages, level_counts: dict, recent_questions: list = None,
+    marks_by_level: dict = None, paper_kind: str = "written"
+) -> str:
     """
     `recent_questions` (up to 15 of the user's own previously-saved question
     *texts* for this topic, newest first -- never another user's, and never
     answers/explanations) is handed to the model as extra context on what
     not to repeat; omitted entirely when there's no history yet.
+    `marks_by_level`/`paper_kind` -- see _bloom_level_prompt_block.
     """
     numbered_sources = "\n\n".join(
         f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
@@ -392,7 +482,8 @@ def _build_quiz_prompt(topic: str, top_pages, level_counts: dict, recent_questio
     return (
         f"Create a quiz about '{topic}' based on the numbered sources below.\n\n"
         f"{QUIZ_PROMPT_RULES}\n\n"
-        f"Bloom's taxonomy levels to write:\n{_bloom_level_prompt_block(level_counts)}"
+        f"Bloom's taxonomy levels to write:"
+        f"\n{_bloom_level_prompt_block(level_counts, marks_by_level, paper_kind)}"
         f"{recent_block}\n\n"
         f"Sources:\n{numbered_sources}"
     )
@@ -459,7 +550,8 @@ def _classify_questions_with_gemini(question_texts: list, top_pages=None):
 
 
 def _generate_and_validate_questions(
-    topic: str, top_pages, level_counts: dict, drop_log: list = None, recent_questions: list = None
+    topic: str, top_pages, level_counts: dict, drop_log: list = None, recent_questions: list = None,
+    marks_by_level: dict = None, paper_kind: str = "written"
 ) -> list:
     """
     ONE generate_json call for exactly the levels/counts in `level_counts`
@@ -472,15 +564,24 @@ def _generate_and_validate_questions(
     exactly the slots it asked for, so they all share this instead of
     duplicating the prompt-build-validate sequence. Propagates
     llm.LLMUnavailableError; callers decide how to handle it.
+
+    `marks_by_level`/`paper_kind` (Phase 5B exam papers only): forwarded to
+    _build_quiz_prompt/_validate_quiz_questions, and switch the structured-
+    output schema to PAPER_QUIZ_SCHEMA (marks/marking_scheme required)
+    instead of QUIZ_SCHEMA. Omitted entirely, this behaves exactly as before.
     """
-    prompt = _build_quiz_prompt(topic, top_pages, level_counts, recent_questions)
-    result = llm.generate_json(prompt, schema=QUIZ_SCHEMA)
+    prompt = _build_quiz_prompt(topic, top_pages, level_counts, recent_questions, marks_by_level, paper_kind)
+    schema = PAPER_QUIZ_SCHEMA if marks_by_level else QUIZ_SCHEMA
+    result = llm.generate_json(prompt, schema=schema)
     raw_questions = result.get("questions", []) if isinstance(result, dict) else []
-    return _validate_quiz_questions(raw_questions, len(top_pages), list(level_counts.keys()), drop_log)
+    return _validate_quiz_questions(
+        raw_questions, len(top_pages), list(level_counts.keys()), drop_log, marks_by_level, paper_kind
+    )
 
 
 def _check_and_fix_bloom_levels(
-    questions: list, topic: str, top_pages, drop_log: list = None, recent_questions: list = None
+    questions: list, topic: str, top_pages, drop_log: list = None, recent_questions: list = None,
+    marks_by_level: dict = None, paper_kind: str = "written"
 ) -> list:
     """
     Runs the Bloom level check on `questions` (each already carrying the
@@ -489,6 +590,9 @@ def _check_and_fix_bloom_levels(
     with bloom_check/detected_level set on every item. Never raises -- an
     unavailable or malformed checker call just leaves the affected
     questions bloom_check="unchecked" instead of failing the whole quiz.
+
+    `marks_by_level`/`paper_kind` (Phase 5B exam papers only): forwarded to
+    the regeneration call so replacements still carry marks/marking_scheme.
     """
     for q in questions:
         verb_level = bloom.classify_by_verbs(q["question"])["level"]
@@ -529,7 +633,9 @@ def _check_and_fix_bloom_levels(
         regen_counts[level] = regen_counts.get(level, 0) + 1
 
     try:
-        regenerated = _generate_and_validate_questions(topic, top_pages, regen_counts, drop_log, recent_questions)
+        regenerated = _generate_and_validate_questions(
+            topic, top_pages, regen_counts, drop_log, recent_questions, marks_by_level, paper_kind
+        )
     except llm.LLMUnavailableError:
         regenerated = []
 
@@ -1237,7 +1343,16 @@ def delete_book(
     book = _get_owned_book_or_404(db, book_id, current_user.id)
 
     # Questions aren't a cascade relationship on Book (a separate concern
-    # from its pages/chunks) -- delete them explicitly.
+    # from its pages/chunks) -- delete them explicitly. Any paper slot that
+    # pointed at one of these questions becomes empty (not deleted) --
+    # the paper's status is untouched, the slot just shows as unfilled.
+    doomed_question_ids = [
+        qid for (qid,) in db.query(Question.id).filter(Question.book_id == book_id).all()
+    ]
+    if doomed_question_ids:
+        db.query(PaperQuestion).filter(PaperQuestion.question_id.in_(doomed_question_ids)).update(
+            {PaperQuestion.question_id: None}, synchronize_session=False
+        )
     db.query(Question).filter(Question.book_id == book_id).delete()
 
     # Cascades to the book's pages via the Book.pages relationship
@@ -1585,7 +1700,10 @@ def ai_tutor(
     return _answer_question(payload.question, current_user, db)
 
 
-def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: list, drop_log: list = None):
+def _validate_quiz_questions(
+    raw_questions, num_sources: int, requested_levels: list, drop_log: list = None,
+    marks_by_level: dict = None, paper_kind: str = "written"
+):
     """
     Validates and cleans Gemini's raw quiz question list: correct option
     counts, a valid correctAnswer, no question leaking its own answer (for
@@ -1597,6 +1715,15 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
     correctAnswer/explanation/source_index, matching the existing response
     shape plus the two Phase 4B fields the caller needs (bloom_level,
     source_index) before building the final API response.
+
+    `marks_by_level` (Phase 5B exam papers only -- {level: exact marks}):
+    when a question's bloom_level is a key in this dict, its type is
+    checked against paper.allowed_types_for_slot (marks-aware) instead of
+    the level's full type list, and it must additionally carry `marks`
+    equal to that exact value and a `marking_scheme` (list of {point,
+    marks}) whose marks sum to exactly that value. Omitted entirely
+    (marks_by_level=None, the plain-quiz-question default) skips all of
+    this and behaves exactly as before.
 
     If `drop_log` is given, one short reason string (never the question's
     own text, or anything from the source documents) is appended to it for
@@ -1631,9 +1758,46 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
         if not bloom.is_valid_level(bloom_level) or bloom_level not in requested_levels:
             _drop(f"bloom_level '{bloom_level}' is not one of the requested levels")
             continue
-        if q_type not in bloom.get_level(bloom_level).question_types:
+        slot_marks = (marks_by_level or {}).get(bloom_level)
+        if slot_marks is not None:
+            if q_type not in paper.allowed_types_for_slot(bloom_level, slot_marks, paper_kind):
+                _drop(f"type '{q_type}' not allowed for '{bloom_level}' at {slot_marks} marks")
+                continue
+        elif q_type not in bloom.get_level(bloom_level).question_types:
             _drop(f"type '{q_type}' not allowed for '{bloom_level}'")
             continue
+
+        marking_scheme = None
+        if slot_marks is not None:
+            marks_value = q.get("marks")
+            if marks_value != slot_marks:
+                _drop(f"marks {marks_value!r} does not match the required {slot_marks}")
+                continue
+            raw_scheme = q.get("marking_scheme")
+            if not isinstance(raw_scheme, list) or not raw_scheme:
+                _drop("missing or empty marking_scheme")
+                continue
+            cleaned_scheme = []
+            scheme_total = 0
+            scheme_ok = True
+            for point in raw_scheme:
+                if (
+                    not isinstance(point, dict)
+                    or not isinstance(point.get("point"), str) or not point["point"].strip()
+                    or not isinstance(point.get("marks"), int)
+                ):
+                    scheme_ok = False
+                    break
+                cleaned_scheme.append({"point": point["point"].strip(), "marks": point["marks"]})
+                scheme_total += point["marks"]
+            if not scheme_ok:
+                _drop("marking_scheme entries are malformed")
+                continue
+            if scheme_total != slot_marks:
+                _drop(f"marking_scheme marks sum to {scheme_total}, not {slot_marks}")
+                continue
+            marking_scheme = cleaned_scheme
+
         if not isinstance(question_text, str) or not question_text.strip():
             _drop("missing or empty question text")
             continue
@@ -1706,6 +1870,9 @@ def _validate_quiz_questions(raw_questions, num_sources: int, requested_levels: 
         }
         if cleaned_options is not None:
             cleaned["options"] = cleaned_options
+        if slot_marks is not None:
+            cleaned["marks"] = slot_marks
+            cleaned["marking_scheme"] = marking_scheme
         valid.append(cleaned)
 
     return valid
@@ -1735,7 +1902,8 @@ def _generate_quiz_with_gemini(
 
 
 def _top_up_missing_levels(
-    questions: list, topic: str, top_pages, level_counts: dict, drop_log: list = None, recent_questions: list = None
+    questions: list, topic: str, top_pages, level_counts: dict, drop_log: list = None, recent_questions: list = None,
+    marks_by_level: dict = None, paper_kind: str = "written"
 ) -> tuple:
     """
     Compares what actually survived validation/checking against what was
@@ -1747,6 +1915,10 @@ def _top_up_missing_levels(
     warning for it instead of a silently smaller quiz. Returns
     (questions, warnings); never raises (an unavailable top-up call just
     means that level stays short and gets a warning).
+
+    `marks_by_level`/`paper_kind` (Phase 5B exam papers only): forwarded to
+    both the top-up generation and its own Bloom check, so topped-up
+    questions still carry marks/marking_scheme.
     """
     actual_counts = Counter(q["bloom_level"] for q in questions)
     missing_counts = {
@@ -1759,11 +1931,15 @@ def _top_up_missing_levels(
         return questions, []
 
     try:
-        topped_up = _generate_and_validate_questions(topic, top_pages, missing_counts, drop_log, recent_questions)
+        topped_up = _generate_and_validate_questions(
+            topic, top_pages, missing_counts, drop_log, recent_questions, marks_by_level, paper_kind
+        )
     except llm.LLMUnavailableError:
         topped_up = []
 
-    topped_up = _check_and_fix_bloom_levels(topped_up, topic, top_pages, drop_log, recent_questions)
+    topped_up = _check_and_fix_bloom_levels(
+        topped_up, topic, top_pages, drop_log, recent_questions, marks_by_level, paper_kind
+    )
 
     next_id = max((q["id"] for q in questions), default=0) + 1
     for q in topped_up:
@@ -2040,6 +2216,8 @@ def _question_summary(db: Session, question: Question) -> dict:
         "options": json.loads(question.options) if question.options else None,
         "correct_answer": question.correct_answer,
         "explanation": question.explanation,
+        "marks": question.marks,
+        "marking_scheme": json.loads(question.marking_scheme) if question.marking_scheme else None,
         "created_at": question.created_at.isoformat(),
         "source": _question_source(db, question)
     }
@@ -2121,6 +2299,7 @@ class QuestionUpdateRequest(BaseModel):
     correct_answer: str | None = None
     explanation: str | None = None
     bloom_level: str | None = None
+    marking_scheme: list | None = None
 
 
 @app.patch("/questions/{question_id}")
@@ -2180,6 +2359,34 @@ def update_question(
         question.bloom_level = payload.bloom_level
         question.bloom_check = "teacher_set"
         question.detected_level = None
+
+    if payload.marking_scheme is not None:
+        if question.marks is None:
+            raise HTTPException(
+                status_code=400, detail="This question has no marks to check a marking scheme against."
+            )
+        if not isinstance(payload.marking_scheme, list) or not payload.marking_scheme:
+            raise HTTPException(status_code=400, detail="marking_scheme must be a non-empty list.")
+        cleaned_scheme = []
+        scheme_total = 0
+        for point in payload.marking_scheme:
+            if (
+                not isinstance(point, dict)
+                or not isinstance(point.get("point"), str) or not point["point"].strip()
+                or not isinstance(point.get("marks"), int)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Each marking_scheme point needs a 'point' string and an integer 'marks'."
+                )
+            cleaned_scheme.append({"point": point["point"].strip(), "marks": point["marks"]})
+            scheme_total += point["marks"]
+        if scheme_total != question.marks:
+            raise HTTPException(
+                status_code=400,
+                detail=f"marking_scheme marks must sum to {question.marks} (got {scheme_total})."
+            )
+        question.marking_scheme = json.dumps(cleaned_scheme)
 
     db.commit()
     return _question_summary(db, question)
@@ -2290,3 +2497,744 @@ def regenerate_question(
 
     db.commit()
     return _question_summary(db, question)
+
+
+# -----------------------------
+# PHASE 5B: EXAM PAPER GENERATION
+# -----------------------------
+class _SourceWindow:
+    """
+    Adapts a contiguous block of a book's Page rows into the single-object
+    shape _build_quiz_prompt/_resolve_question_source/_classify_questions_
+    with_gemini already expect from a (score, page) tuple's page half --
+    this lets paper generation reuse every one of those functions
+    completely unmodified. `.content` joins the block's chunks so the
+    model sees them as one numbered source; `.book_id`/`.id`/`.page_number`
+    all come from the block's first page (good enough for "where did this
+    come from" attribution -- paper slots don't need per-paragraph
+    precision).
+    """
+    def __init__(self, pages: list):
+        self.pages = pages
+        self.content = "\n\n".join(p.content for p in pages)
+        self.book_id = pages[0].book_id
+        self.id = pages[0].id
+        self.page_number = pages[0].page_number
+
+
+def _assign_source_windows(db: Session, book_id: int, num_slots: int, window_size: int = 3) -> list:
+    """
+    Splits a book's Page rows (ordered by page_number, chunk_number) into
+    `num_slots` non-overlapping contiguous blocks spread evenly through the
+    whole document, and wraps each in a _SourceWindow of up to
+    `window_size` pages -- so a paper's questions are grounded across the
+    WHOLE document instead of just the most topically-relevant chunks
+    (unlike plain quiz generation's retrieve()), and no chunk is used
+    twice within one call. Shrinks each window automatically when a block
+    has fewer than `window_size` pages. Returns exactly `num_slots`
+    windows (empty list if the book has no indexed pages at all).
+    """
+    pages = (
+        db.query(Page)
+        .filter(Page.book_id == book_id)
+        .order_by(Page.page_number, Page.chunk_number)
+        .all()
+    )
+    if not pages or num_slots <= 0:
+        return []
+
+    total = len(pages)
+    boundaries = [round(i * total / num_slots) for i in range(num_slots + 1)]
+
+    windows = []
+    for i in range(num_slots):
+        start, end = boundaries[i], boundaries[i + 1]
+        if end <= start:
+            start = min(start, total - 1)
+            end = start + 1
+        end = min(end, total)
+        block = pages[start:end]
+
+        if len(block) > window_size:
+            center = len(block) // 2
+            offset = max(0, center - window_size // 2)
+            block = block[offset:offset + window_size]
+
+        windows.append(_SourceWindow(block))
+
+    return windows
+
+
+def _pattern_to_dict(pattern: paper.Pattern) -> dict:
+    return {
+        "key": pattern.key,
+        "name": pattern.name,
+        "duration_minutes": pattern.duration_minutes,
+        "paper_kind": pattern.paper_kind,
+        "sections": [
+            {
+                "key": s.key, "title": s.title, "instructions": s.instructions,
+                "marks_each": s.marks_each, "num_questions": s.num_questions,
+                "choice": s.choice, "attempt": s.attempt,
+            }
+            for s in pattern.sections
+        ],
+    }
+
+
+def _pattern_from_dict(d: dict) -> paper.Pattern:
+    sections = tuple(
+        paper.Section(
+            key=s["key"],
+            title=s.get("title", s["key"]),
+            instructions=s.get("instructions", ""),
+            marks_each=s["marks_each"],
+            num_questions=s["num_questions"],
+            choice=s.get("choice", "none"),
+            attempt=s.get("attempt"),
+        )
+        for s in d.get("sections", [])
+    )
+    return paper.Pattern(
+        key=d.get("key", "custom"),
+        name=d.get("name", "Custom Pattern"),
+        duration_minutes=d.get("duration_minutes", 60),
+        sections=sections,
+        paper_kind=d.get("paper_kind", "written"),
+    )
+
+
+def _book_weight(db: Session, book_id: int) -> int:
+    return db.query(Page).filter(Page.book_id == book_id).count()
+
+
+def _slot_label(slot: "PaperQuestion") -> str:
+    option_suffix = f" ({slot.option})" if slot.option else ""
+    return f"Section '{slot.section}' question {slot.number}{option_suffix}"
+
+
+class PaperCreateRequest(BaseModel):
+    title: str
+    subject: str | None = None
+    pattern_key: str | None = None
+    pattern: dict | None = None
+    bloom_preset: str | None = None
+    bloom_targets: dict | None = None
+    book_ids: list[int]
+    duration_minutes: int | None = None
+
+
+class PaperUpdateRequest(BaseModel):
+    title: str | None = None
+    subject: str | None = None
+    duration_minutes: int | None = None
+
+
+class SlotSwapRequest(BaseModel):
+    question_id: int
+
+
+def _get_owned_paper_or_404(db: Session, paper_id: int, user_id: int) -> Paper:
+    paper_row = db.query(Paper).filter(Paper.id == paper_id, Paper.user_id == user_id).first()
+    if not paper_row:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    return paper_row
+
+
+def _get_paper_slot_or_404(db: Session, paper_id: int, slot_id: int) -> PaperQuestion:
+    slot = db.query(PaperQuestion).filter(
+        PaperQuestion.id == slot_id, PaperQuestion.paper_id == paper_id
+    ).first()
+    if not slot:
+        raise HTTPException(status_code=404, detail="Slot not found")
+    return slot
+
+
+def _paper_summary(paper_row: Paper) -> dict:
+    plan = json.loads(paper_row.plan)
+    total_marks = sum(slot["marks"] for slot in plan if slot.get("option") in (None, "a"))
+    return {
+        "id": paper_row.id,
+        "title": paper_row.title,
+        "status": paper_row.status,
+        "total_marks": total_marks,
+        "created_at": paper_row.created_at.isoformat() if paper_row.created_at else None,
+    }
+
+
+def _compute_blueprint_actual(db: Session, paper_row: Paper) -> dict:
+    """
+    Marks per level and per unit from the questions actually saved into
+    this paper's slots so far. A flagged question (the independent
+    checker disagreed with its intended level) still counts at its
+    intended level here -- it's listed in `warnings` instead, matching
+    plan_paper's own "intended level" convention. Only one option of an
+    either_or pair is counted (marks_on_paper convention), same as
+    blueprint_target/blueprint_planned.
+    """
+    slots = (
+        db.query(PaperQuestion)
+        .filter(
+            PaperQuestion.paper_id == paper_row.id,
+            PaperQuestion.question_id.isnot(None),
+            or_(PaperQuestion.option.is_(None), PaperQuestion.option == "a")
+        )
+        .all()
+    )
+
+    by_level = {level: 0 for level in bloom.level_keys()}
+    by_unit = {}
+
+    if slots:
+        question_ids = [s.question_id for s in slots]
+        questions_by_id = {
+            q.id: q for q in db.query(Question).filter(Question.id.in_(question_ids)).all()
+        }
+        for slot in slots:
+            question = questions_by_id.get(slot.question_id)
+            if not question:
+                continue
+            by_level[question.bloom_level] = by_level.get(question.bloom_level, 0) + slot.marks
+            if slot.book_id is not None:
+                by_unit[slot.book_id] = by_unit.get(slot.book_id, 0) + slot.marks
+
+    return {"by_level": by_level, "by_unit": by_unit}
+
+
+def _paper_detail(db: Session, paper_row: Paper) -> dict:
+    slots = (
+        db.query(PaperQuestion)
+        .filter(PaperQuestion.paper_id == paper_row.id)
+        .order_by(PaperQuestion.position)
+        .all()
+    )
+    question_ids = [s.question_id for s in slots if s.question_id]
+    questions_by_id = {
+        q.id: q for q in db.query(Question).filter(Question.id.in_(question_ids)).all()
+    } if question_ids else {}
+
+    slot_items = [
+        {
+            "id": slot.id,
+            "section": slot.section,
+            "number": slot.number,
+            "option": slot.option,
+            "marks": slot.marks,
+            "bloom_level": slot.bloom_level or None,
+            "book_id": slot.book_id,
+            "question": _question_summary(db, questions_by_id[slot.question_id])
+            if slot.question_id in questions_by_id else None,
+        }
+        for slot in slots
+    ]
+
+    plan = json.loads(paper_row.plan)
+    paper_total = sum(s["marks"] for s in plan if s.get("option") in (None, "a"))
+    bloom_targets = json.loads(paper_row.bloom_targets)
+
+    blueprint_target = {
+        level: round((bloom_targets.get(level, 0) / 100.0) * paper_total, 2)
+        for level in bloom.level_keys()
+    }
+    blueprint_planned_by_level = {level: 0 for level in bloom.level_keys()}
+    blueprint_planned_by_unit = {}
+    for s in plan:
+        if s.get("option") not in (None, "a"):
+            continue
+        if s.get("bloom_level"):
+            blueprint_planned_by_level[s["bloom_level"]] = (
+                blueprint_planned_by_level.get(s["bloom_level"], 0) + s["marks"]
+            )
+        if s.get("unit_id") is not None:
+            blueprint_planned_by_unit[s["unit_id"]] = blueprint_planned_by_unit.get(s["unit_id"], 0) + s["marks"]
+
+    return {
+        "id": paper_row.id,
+        "title": paper_row.title,
+        "subject": paper_row.subject,
+        "pattern": json.loads(paper_row.pattern),
+        "bloom_targets": bloom_targets,
+        "book_ids": json.loads(paper_row.book_ids),
+        "status": paper_row.status,
+        "error": paper_row.error,
+        "progress_done": paper_row.progress_done,
+        "progress_total": paper_row.progress_total,
+        "warnings": json.loads(paper_row.warnings) if paper_row.warnings else [],
+        "plan": plan,
+        "slots": slot_items,
+        "blueprint_target": blueprint_target,
+        "blueprint_planned": {"by_level": blueprint_planned_by_level, "by_unit": blueprint_planned_by_unit},
+        "blueprint_actual": _compute_blueprint_actual(db, paper_row),
+        "created_at": paper_row.created_at.isoformat() if paper_row.created_at else None,
+        "updated_at": paper_row.updated_at.isoformat() if paper_row.updated_at else None,
+    }
+
+
+@app.get("/paper-patterns")
+def get_paper_patterns(current_user: User = Depends(get_current_user)):
+    return {
+        "patterns": [_pattern_to_dict(p) for p in paper.PRESET_PATTERNS.values()],
+        "bloom_presets": paper.BLOOM_PRESETS,
+    }
+
+
+@app.post("/papers")
+def create_paper(
+    payload: PaperCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if payload.pattern_key:
+        preset = paper.PRESET_PATTERNS.get(payload.pattern_key)
+        if not preset:
+            raise HTTPException(status_code=422, detail=[f"Unknown pattern_key '{payload.pattern_key}'."])
+        pattern = preset
+    elif payload.pattern:
+        try:
+            pattern = _pattern_from_dict(payload.pattern)
+        except (KeyError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=[f"Invalid pattern: {exc}"])
+    else:
+        raise HTTPException(status_code=422, detail=["pattern_key or pattern is required."])
+
+    if payload.duration_minutes:
+        pattern = replace(pattern, duration_minutes=payload.duration_minutes)
+
+    pattern_errors = paper.validate_pattern(pattern)
+    if pattern_errors:
+        raise HTTPException(status_code=422, detail=pattern_errors)
+
+    if payload.bloom_preset:
+        bloom_targets = paper.BLOOM_PRESETS.get(payload.bloom_preset)
+        if not bloom_targets:
+            raise HTTPException(status_code=422, detail=[f"Unknown bloom_preset '{payload.bloom_preset}'."])
+    elif payload.bloom_targets:
+        bloom_targets = payload.bloom_targets
+    else:
+        raise HTTPException(status_code=422, detail=["bloom_preset or bloom_targets is required."])
+
+    bloom_errors = paper.validate_bloom_targets(bloom_targets)
+    if bloom_errors:
+        raise HTTPException(status_code=422, detail=bloom_errors)
+
+    if not payload.book_ids:
+        raise HTTPException(status_code=422, detail=["At least one book is required."])
+
+    books = []
+    for book_id in payload.book_ids:
+        book = _get_owned_book_or_404(db, book_id, current_user.id)
+        if book.status != "ready":
+            raise HTTPException(status_code=422, detail=[f"Book '{book.name}' is not ready yet."])
+        books.append(book)
+
+    units = [
+        {"id": book.id, "name": book.name, "weight": _book_weight(db, book.id) or 1}
+        for book in books
+    ]
+
+    result = paper.plan_paper(pattern, bloom_targets, units)
+
+    paper_row = Paper(
+        user_id=current_user.id,
+        title=payload.title,
+        subject=payload.subject,
+        pattern=json.dumps(_pattern_to_dict(pattern)),
+        bloom_targets=json.dumps(bloom_targets),
+        book_ids=json.dumps(payload.book_ids),
+        plan=json.dumps(result["plan"]),
+        status="draft",
+        progress_done=0,
+        progress_total=len(result["plan"]),
+        warnings=json.dumps(result["warnings"]),
+    )
+    db.add(paper_row)
+    db.flush()
+
+    for position, slot in enumerate(result["plan"]):
+        db.add(PaperQuestion(
+            paper_id=paper_row.id,
+            section=slot["section"],
+            number=slot["number"],
+            option=slot["option"],
+            marks=slot["marks"],
+            bloom_level=slot["bloom_level"] or "",
+            book_id=slot["unit_id"],
+            question_id=None,
+            position=position,
+        ))
+    db.commit()
+    db.refresh(paper_row)
+
+    return _paper_detail(db, paper_row)
+
+
+@app.get("/papers")
+def list_papers(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    papers = db.query(Paper).filter(Paper.user_id == current_user.id).order_by(Paper.created_at.desc()).all()
+    return [_paper_summary(p) for p in papers]
+
+
+@app.get("/papers/{paper_id}")
+def get_paper(paper_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+    return _paper_detail(db, paper_row)
+
+
+@app.get("/papers/{paper_id}/status")
+def get_paper_status(paper_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+    return {
+        "id": paper_row.id,
+        "status": paper_row.status,
+        "error": paper_row.error,
+        "progress_done": paper_row.progress_done,
+        "progress_total": paper_row.progress_total,
+    }
+
+
+@app.patch("/papers/{paper_id}")
+def update_paper(
+    paper_id: int,
+    payload: PaperUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+
+    if payload.title is not None:
+        if not payload.title.strip():
+            raise HTTPException(status_code=400, detail="title cannot be empty.")
+        paper_row.title = payload.title.strip()
+
+    if payload.subject is not None:
+        paper_row.subject = payload.subject.strip() or None
+
+    if payload.duration_minutes is not None:
+        if payload.duration_minutes <= 0:
+            raise HTTPException(status_code=400, detail="duration_minutes must be positive.")
+        pattern_dict = json.loads(paper_row.pattern)
+        pattern_dict["duration_minutes"] = payload.duration_minutes
+        paper_row.pattern = json.dumps(pattern_dict)
+
+    db.commit()
+    return _paper_detail(db, paper_row)
+
+
+@app.delete("/papers/{paper_id}")
+def delete_paper(paper_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+    # PaperQuestions are deleted (this paper's slots), but the underlying
+    # Questions stay in the user's bank -- a paper is just one arrangement
+    # of bank questions, not their owner.
+    db.query(PaperQuestion).filter(PaperQuestion.paper_id == paper_id).delete()
+    db.delete(paper_row)
+    db.commit()
+    return {"status": "Paper deleted successfully"}
+
+
+@app.post("/papers/{paper_id}/generate", status_code=202)
+@limiter.limit("3/minute", key_func=_user_rate_limit_key)
+def generate_paper_route(
+    request: Request,
+    paper_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+
+    if paper_row.status == "generating":
+        raise HTTPException(status_code=400, detail="This paper is already generating.")
+
+    paper_row.status = "generating"
+    paper_row.error = None
+    db.commit()
+
+    jobs.submit_paper_generation_job(paper_row.id)
+    db.refresh(paper_row)
+
+    return {"paper_id": paper_row.id, "status": paper_row.status}
+
+
+def generate_paper(db: Session, paper_row: Paper) -> None:
+    """
+    Fills every still-empty slot of `paper_row` (status is already
+    "generating", set by the route above before this runs). Reuses the
+    exact same Phase 4B pipeline /generate-quiz uses --
+    _generate_and_validate_questions, _check_and_fix_bloom_levels,
+    _drop_near_duplicates, _top_up_missing_levels -- once per (bloom_level,
+    marks) group of slots, grounding each slot in its own non-overlapping
+    source window (_assign_source_windows) instead of topic-based
+    retrieval. Called from jobs.py's background job, which owns `db`'s
+    commit/close lifecycle and translates any exception into a "failed"
+    paper with a friendly error -- this function lets llm.LLMUnavailableError
+    and anything else propagate uncaught.
+    """
+    pattern = _pattern_from_dict(json.loads(paper_row.pattern))
+    slots = (
+        db.query(PaperQuestion)
+        .filter(PaperQuestion.paper_id == paper_row.id)
+        .order_by(PaperQuestion.position)
+        .all()
+    )
+    empty_slots = [s for s in slots if s.question_id is None and s.bloom_level]
+    warnings = json.loads(paper_row.warnings) if paper_row.warnings else []
+
+    # One set of non-overlapping source windows per book, sized to exactly
+    # how many of ITS still-empty slots need filling -- a retry after a
+    # partial failure only consumes windows for the slots still empty.
+    book_ids = sorted({s.book_id for s in empty_slots if s.book_id})
+    windows_by_book = {
+        book_id: _assign_source_windows(db, book_id, sum(1 for s in empty_slots if s.book_id == book_id))
+        for book_id in book_ids
+    }
+    next_window_index = {book_id: 0 for book_id in book_ids}
+
+    groups = {}
+    for slot in empty_slots:
+        pool = windows_by_book.get(slot.book_id) or []
+        idx = next_window_index.get(slot.book_id, 0)
+        if idx >= len(pool):
+            continue
+        window = pool[idx]
+        next_window_index[slot.book_id] = idx + 1
+        groups.setdefault((slot.bloom_level, slot.marks), []).append((slot, window))
+
+    topic = paper_row.subject or paper_row.title
+
+    for (level, marks), slot_windows in groups.items():
+        top_pages = [(1.0, window) for _, window in slot_windows]
+        level_counts = {level: len(slot_windows)}
+        marks_by_level = {level: marks}
+        drop_log = []
+        recent_questions = _recent_question_texts(db, paper_row.user_id, topic)
+
+        questions = _generate_and_validate_questions(
+            topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+        )
+        questions = _check_and_fix_bloom_levels(
+            questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+        )
+        questions = _drop_near_duplicates(questions, drop_log)
+        questions, _ = _top_up_missing_levels(
+            questions, topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+        )
+
+        if drop_log:
+            reason_counts = Counter(drop_log)
+            logger.info(
+                "Paper %d generation for level '%s' (%d marks): %s",
+                paper_row.id, level, marks,
+                "; ".join(f"dropped {c}: {r}" for r, c in reason_counts.items())
+            )
+
+        # Match each returned question back to the slot whose window it
+        # was (self-reported, via source_index) grounded in; anything left
+        # over fills whatever slot in this group is still unmatched, in
+        # order. A slot nothing is left for just stays empty (warning).
+        by_source_index = {}
+        leftovers = []
+        for q in questions:
+            idx = q.get("source_index")
+            if isinstance(idx, int) and 1 <= idx <= len(slot_windows) and idx not in by_source_index:
+                by_source_index[idx] = q
+            else:
+                leftovers.append(q)
+
+        for idx, (slot, window) in enumerate(slot_windows, start=1):
+            q = by_source_index.pop(idx, None)
+            if q is None and leftovers:
+                q = leftovers.pop(0)
+            if q is None:
+                warnings.append(f"{_slot_label(slot)}: couldn't generate a question for this slot.")
+                continue
+
+            db_question = Question(
+                user_id=paper_row.user_id,
+                book_id=window.book_id,
+                page_id=window.id,
+                topic=topic,
+                type=q["type"],
+                bloom_level=q["bloom_level"],
+                bloom_check=q["bloom_check"],
+                detected_level=q.get("detected_level"),
+                question=q["question"],
+                options=json.dumps(q["options"]) if q.get("options") else None,
+                correct_answer=q["correctAnswer"],
+                explanation=q["explanation"],
+                marks=q["marks"],
+                marking_scheme=json.dumps(q["marking_scheme"]),
+            )
+            db.add(db_question)
+            db.flush()
+            slot.question_id = db_question.id
+
+            if q["bloom_check"] == "flagged":
+                detected = q.get("detected_level")
+                detected_label = bloom.get_level(detected).label if detected else "a different level"
+                warnings.append(
+                    f"{_slot_label(slot)}: classified as {detected_label}, "
+                    f"not the intended {bloom.get_level(level).label}."
+                )
+
+        paper_row.progress_done = sum(1 for s in slots if s.question_id is not None)
+        paper_row.warnings = json.dumps(warnings)
+        db.commit()
+
+    paper_row.status = "ready"
+    paper_row.warnings = json.dumps(warnings)
+    db.commit()
+
+
+@app.patch("/papers/{paper_id}/slots/{slot_id}")
+def swap_paper_slot(
+    paper_id: int,
+    slot_id: int,
+    payload: SlotSwapRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+    slot = _get_paper_slot_or_404(db, paper_row.id, slot_id)
+    question = _get_owned_question_or_404(db, payload.question_id, current_user.id)
+
+    if question.marks is not None and question.marks != slot.marks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This question is worth {question.marks} marks, but the slot needs {slot.marks}."
+        )
+
+    allowed_levels = paper.levels_allowed_for_marks(slot.marks)
+    if question.bloom_level not in allowed_levels:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{question.bloom_level}' is not an allowed level for a {slot.marks}-mark slot."
+        )
+
+    pattern = _pattern_from_dict(json.loads(paper_row.pattern))
+    if question.type not in paper.allowed_types_for_slot(question.bloom_level, slot.marks, pattern.paper_kind):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Question type '{question.type}' doesn't fit this slot."
+        )
+
+    if question.marks is None:
+        question.marks = slot.marks
+
+    slot.question_id = question.id
+
+    if question.bloom_level != slot.bloom_level:
+        warnings = json.loads(paper_row.warnings) if paper_row.warnings else []
+        warnings.append(
+            f"{_slot_label(slot)}: swapped in a {bloom.get_level(question.bloom_level).label} question "
+            f"(planned {bloom.get_level(slot.bloom_level).label if slot.bloom_level else 'none'})."
+        )
+        paper_row.warnings = json.dumps(warnings)
+
+    db.commit()
+    return _paper_detail(db, paper_row)
+
+
+@app.post("/papers/{paper_id}/slots/{slot_id}/regenerate")
+@limiter.limit("10/minute", key_func=_user_rate_limit_key)
+def regenerate_paper_slot(
+    request: Request,
+    paper_id: int,
+    slot_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+    slot = _get_paper_slot_or_404(db, paper_row.id, slot_id)
+
+    if not slot.bloom_level:
+        raise HTTPException(status_code=400, detail="This slot has no Bloom level assigned and can't be filled.")
+    if not slot.book_id:
+        raise HTTPException(status_code=400, detail="This slot has no book assigned.")
+
+    pattern = _pattern_from_dict(json.loads(paper_row.pattern))
+    windows = _assign_source_windows(db, slot.book_id, 1)
+    if not windows:
+        raise HTTPException(status_code=400, detail="This slot's book has no indexed content to generate from.")
+    window = windows[0]
+
+    topic = paper_row.subject or paper_row.title
+    top_pages = [(1.0, window)]
+    level_counts = {slot.bloom_level: 1}
+    marks_by_level = {slot.bloom_level: slot.marks}
+    drop_log = []
+    recent_questions = _recent_question_texts(db, current_user.id, topic)
+
+    try:
+        questions = _generate_and_validate_questions(
+            topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+        )
+        questions = _check_and_fix_bloom_levels(
+            questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+        )
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+    if not questions:
+        raise HTTPException(status_code=422, detail="Couldn't write a question for this slot. Try again.")
+
+    q = questions[0]
+    db_question = Question(
+        user_id=current_user.id,
+        book_id=window.book_id,
+        page_id=window.id,
+        topic=topic,
+        type=q["type"],
+        bloom_level=q["bloom_level"],
+        bloom_check=q["bloom_check"],
+        detected_level=q.get("detected_level"),
+        question=q["question"],
+        options=json.dumps(q["options"]) if q.get("options") else None,
+        correct_answer=q["correctAnswer"],
+        explanation=q["explanation"],
+        marks=q["marks"],
+        marking_scheme=json.dumps(q["marking_scheme"]),
+    )
+    db.add(db_question)
+    db.flush()
+    slot.question_id = db_question.id
+    db.commit()
+
+    return _paper_detail(db, paper_row)
+
+
+@app.get("/papers/{paper_id}/slots/{slot_id}/candidates")
+def get_paper_slot_candidates(
+    paper_id: int,
+    slot_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    paper_row = _get_owned_paper_or_404(db, paper_id, current_user.id)
+    slot = _get_paper_slot_or_404(db, paper_row.id, slot_id)
+
+    allowed_levels = paper.levels_allowed_for_marks(slot.marks)
+    if not allowed_levels:
+        return []
+
+    pattern = _pattern_from_dict(json.loads(paper_row.pattern))
+
+    candidates = (
+        db.query(Question)
+        .filter(
+            Question.user_id == current_user.id,
+            Question.bloom_level.in_(allowed_levels),
+            (Question.marks == slot.marks) | (Question.marks.is_(None))
+        )
+        .order_by(Question.created_at.desc())
+        .limit(100)
+        .all()
+    )
+
+    fitting = [
+        q for q in candidates
+        if q.type in paper.allowed_types_for_slot(q.bloom_level, slot.marks, pattern.paper_kind)
+    ]
+    # Same book as the slot first; stable sort keeps created_at-desc order within each group.
+    fitting.sort(key=lambda q: q.book_id != slot.book_id)
+
+    return [_question_summary(db, q) for q in fitting[:20]]
