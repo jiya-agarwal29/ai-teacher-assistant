@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { AlertCircle, Plus, Trash2, Loader2, ArrowLeft, Sparkles } from 'lucide-react';
+import { AlertCircle, Plus, Trash2, Loader2, ArrowLeft, Sparkles, Upload } from 'lucide-react';
 import { api } from '../services/api';
 import useBloomLevels from '../hooks/useBloomLevels';
 import { getBloomColor } from '../utils/bloomColors';
@@ -36,6 +36,12 @@ function sectionKeyFor(idx) {
 }
 
 function instructionsFor(section) {
+  // An imported section's real printed instructions win, if there is one
+  // (and the teacher hasn't blanked it back out); otherwise fall back to
+  // the same auto-generated wording a from-scratch custom section gets.
+  if (section.instructions && section.instructions.trim()) {
+    return section.instructions.trim();
+  }
   if (section.choice === 'any_n') {
     return `Attempt any ${section.attempt || 1} of the following ${section.num_questions} questions.`;
   }
@@ -48,6 +54,7 @@ function instructionsFor(section) {
 function defaultCustomSection(idx) {
   return {
     title: `Section ${sectionKeyFor(idx)}`,
+    instructions: '',
     num_questions: 5,
     marks_each: 2,
     choice: 'none',
@@ -66,6 +73,10 @@ export default function PaperNew() {
 
   const [patternChoice, setPatternChoice] = useState('mid_sem_50');
   const [customSections, setCustomSections] = useState([defaultCustomSection(0), defaultCustomSection(1)]);
+
+  const [importingPattern, setImportingPattern] = useState(false);
+  const [importError, setImportError] = useState('');
+  const [oldPaperBloomMix, setOldPaperBloomMix] = useState(null);
 
   const [bloomChoice, setBloomChoice] = useState('balanced');
   const [customBloomTargets, setCustomBloomTargets] = useState({});
@@ -127,6 +138,32 @@ export default function PaperNew() {
 
   const updateCustomSection = (idx, field, value) => {
     setCustomSections((prev) => prev.map((s, i) => (i === idx ? { ...s, [field]: value } : s)));
+  };
+
+  const handleImportFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-selecting the same file later
+    if (!file) return;
+
+    setImportingPattern(true);
+    setImportError('');
+    try {
+      const data = await api.papers.importPattern(file);
+      setCustomSections((data.pattern?.sections || []).map((s) => ({
+        title: s.title,
+        instructions: s.instructions || '',
+        num_questions: s.num_questions,
+        marks_each: s.marks_each,
+        choice: s.choice,
+        attempt: s.attempt || 4
+      })));
+      setPatternChoice('custom');
+      setOldPaperBloomMix(data.bloom_mix || null);
+    } catch (err) {
+      setImportError(err.message || 'Could not read this file.');
+    } finally {
+      setImportingPattern(false);
+    }
   };
 
   const customBloomTotal = Object.values(customBloomTargets).reduce((sum, v) => sum + (Number(v) || 0), 0);
@@ -364,6 +401,21 @@ export default function PaperNew() {
             </button>
           </div>
 
+          <div className="flex items-center justify-between gap-3 flex-wrap pt-1">
+            <label className="flex items-center gap-2 text-[11px] font-bold text-violet-600 dark:text-violet-400 cursor-pointer hover:underline">
+              {importingPattern ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />}
+              {importingPattern ? 'Reading old paper...' : "Use an old paper's layout"}
+              <input
+                type="file"
+                accept=".pdf,.docx,.doc,.pptx,.ppt,.txt,.md,.jpg,.jpeg,.png,.webp,.heic"
+                disabled={importingPattern}
+                onChange={handleImportFileChange}
+                className="hidden"
+              />
+            </label>
+          </div>
+          {importError && <p className="text-[10px] font-semibold text-rose-500">{importError}</p>}
+
           {patternChoice === 'custom' && (
             <div className="space-y-3 pt-2">
               {customSections.map((s, idx) => (
@@ -428,6 +480,13 @@ export default function PaperNew() {
                       <span className="text-[10px] text-slate-400 dark:text-slate-500">of {s.num_questions}</span>
                     </div>
                   )}
+                  <input
+                    type="text"
+                    value={s.instructions || ''}
+                    onChange={(e) => updateCustomSection(idx, 'instructions', e.target.value)}
+                    placeholder="Instructions (optional -- auto-generated if left blank)"
+                    className={inputClass}
+                  />
                 </div>
               ))}
               <div className="flex items-center justify-between">
@@ -478,64 +537,92 @@ export default function PaperNew() {
         {/* d. Bloom's mix */}
         <div className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm space-y-4">
           <h3 className="text-xs font-bold text-slate-900 dark:text-white">Bloom&apos;s mix</h3>
-          <div className="flex flex-wrap gap-2">
-            {patternsData && Object.keys(patternsData.bloom_presets).map((key) => {
-              const active = bloomChoice === key;
-              return (
+
+          <div className={oldPaperBloomMix ? 'grid grid-cols-1 lg:grid-cols-2 gap-5' : ''}>
+            <div className="space-y-4">
+              <div className="flex flex-wrap gap-2">
+                {patternsData && Object.keys(patternsData.bloom_presets).map((key) => {
+                  const active = bloomChoice === key;
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setBloomChoice(key)}
+                      className={`px-3.5 py-1.5 rounded-full text-[10px] font-bold border transition-all ${
+                        active
+                          ? 'bg-violet-600 text-white border-violet-600'
+                          : 'border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/30'
+                      }`}
+                    >
+                      {BLOOM_PRESET_LABELS[key] || key}
+                    </button>
+                  );
+                })}
                 <button
-                  key={key}
                   type="button"
-                  onClick={() => setBloomChoice(key)}
+                  onClick={() => setBloomChoice('custom')}
                   className={`px-3.5 py-1.5 rounded-full text-[10px] font-bold border transition-all ${
-                    active
+                    bloomChoice === 'custom'
                       ? 'bg-violet-600 text-white border-violet-600'
                       : 'border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/30'
                   }`}
                 >
-                  {BLOOM_PRESET_LABELS[key] || key}
+                  Custom
                 </button>
-              );
-            })}
-            <button
-              type="button"
-              onClick={() => setBloomChoice('custom')}
-              className={`px-3.5 py-1.5 rounded-full text-[10px] font-bold border transition-all ${
-                bloomChoice === 'custom'
-                  ? 'bg-violet-600 text-white border-violet-600'
-                  : 'border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/30'
-              }`}
-            >
-              Custom
-            </button>
-          </div>
-
-          {bloomChoice === 'custom' && (
-            <div className="space-y-3 pt-2">
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                {bloomLevels.map((lvl) => {
-                  const colors = getBloomColor(lvl.key);
-                  return (
-                    <div key={lvl.key} className="space-y-1">
-                      <span className={`inline-block px-2 py-0.5 rounded-full border text-[9px] font-bold ${colors.pill}`}>
-                        {lvl.label}
-                      </span>
-                      <input
-                        type="number"
-                        min={0}
-                        max={100}
-                        value={customBloomTargets[lvl.key] ?? 0}
-                        onChange={(e) => setCustomBloomTargets((prev) => ({ ...prev, [lvl.key]: e.target.value }))}
-                        className={inputClass}
-                      />
-                    </div>
-                  );
-                })}
               </div>
-              <p className={`text-[11px] font-bold ${Math.round(customBloomTotal) === 100 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-500'}`}>
-                Total: {customBloomTotal}% {Math.round(customBloomTotal) !== 100 && '(must add up to 100)'}
-              </p>
+
+              {bloomChoice === 'custom' && (
+                <div className="space-y-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {bloomLevels.map((lvl) => {
+                      const colors = getBloomColor(lvl.key);
+                      return (
+                        <div key={lvl.key} className="space-y-1">
+                          <span className={`inline-block px-2 py-0.5 rounded-full border text-[9px] font-bold ${colors.pill}`}>
+                            {lvl.label}
+                          </span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={100}
+                            value={customBloomTargets[lvl.key] ?? 0}
+                            onChange={(e) => setCustomBloomTargets((prev) => ({ ...prev, [lvl.key]: e.target.value }))}
+                            className={inputClass}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className={`text-[11px] font-bold ${Math.round(customBloomTotal) === 100 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-500'}`}>
+                    Total: {customBloomTotal}% {Math.round(customBloomTotal) !== 100 && '(must add up to 100)'}
+                  </p>
+                </div>
+              )}
             </div>
-          )}
+
+            {oldPaperBloomMix && (
+              <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 space-y-2.5 h-fit">
+                <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
+                  Old paper&apos;s estimated Bloom&apos;s mix
+                </span>
+                <div className="space-y-1.5">
+                  {bloomLevels.map((lvl) => {
+                    const pct = oldPaperBloomMix.percent?.[lvl.key] || 0;
+                    const colors = getBloomColor(lvl.key);
+                    return (
+                      <div key={lvl.key} className="flex items-center gap-2">
+                        <span className="w-20 text-[9px] font-bold text-slate-500 dark:text-slate-400 shrink-0">{lvl.label}</span>
+                        <div className="flex-1 bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
+                          <div className={`h-full rounded-full transition-all duration-500 ${colors.bar}`} style={{ width: `${pct}%` }} />
+                        </div>
+                        <span className="w-10 text-right text-[9px] font-bold text-slate-400 dark:text-slate-500">{pct}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {formError && (

@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -22,6 +23,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 import bloom
+import document_parsers
 import paper
 import paper_export
 import embeddings
@@ -427,6 +429,48 @@ CLASSIFIER_SCHEMA = {
         }
     },
     "required": ["items"]
+}
+
+
+# Phase 5E: POST /papers/import-pattern's structured-output schema -- reads
+# an old exam paper's layout (sections + the individual questions printed
+# in them) back out of Gemini.
+PATTERN_IMPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "duration_minutes": {"type": "integer"},
+        "total_marks": {"type": "integer"},
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "marks_each": {"type": "integer"},
+                    "num_questions": {"type": "integer"},
+                    "choice": {"type": "string", "enum": list(paper.CHOICE_KINDS)},
+                    "attempt": {"type": "integer"}
+                },
+                "required": ["title", "instructions", "marks_each", "num_questions", "choice"]
+            }
+        },
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "section": {"type": "string"},
+                    "number": {"type": "string"},
+                    "option": {"type": "string"},
+                    "text": {"type": "string"},
+                    "marks": {"type": "integer"}
+                },
+                "required": ["section", "number", "text", "marks"]
+            }
+        }
+    },
+    "required": ["sections", "questions"]
 }
 
 
@@ -2768,13 +2812,16 @@ def _get_paper_slot_or_404(db: Session, paper_id: int, slot_id: int) -> PaperQue
 
 
 def _paper_summary(paper_row: Paper) -> dict:
-    plan = json.loads(paper_row.plan)
-    total_marks = sum(slot["marks"] for slot in plan if slot.get("option") in (None, "a"))
+    # total_marks is what a student actually answers (paper.total_marks()
+    # -- e.g. 50 for mid_sem_50's "any 4 of 5" section), not marks_on_paper
+    # (55, every printed question). Phase 5E EXTRA fix: this used to sum
+    # marks_on_paper and call it total_marks.
+    pattern_obj = _pattern_from_dict(json.loads(paper_row.pattern))
     return {
         "id": paper_row.id,
         "title": paper_row.title,
         "status": paper_row.status,
-        "total_marks": total_marks,
+        "total_marks": paper.total_marks(pattern_obj),
         "created_at": paper_row.created_at.isoformat() if paper_row.created_at else None,
     }
 
@@ -2846,6 +2893,11 @@ def _paper_detail(db: Session, paper_row: Paper) -> dict:
     ]
 
     plan = json.loads(paper_row.plan)
+    pattern_dict = json.loads(paper_row.pattern)
+    # marks_on_paper (marks_on_paper convention): the basis plan_paper()
+    # itself used for blueprint_target's percentages -- kept as-is here.
+    # total_marks (what a student actually answers, e.g. 50 not 55 for
+    # mid_sem_50) is exposed separately below for display (Phase 5E EXTRA).
     paper_total = sum(s["marks"] for s in plan if s.get("option") in (None, "a"))
     bloom_targets = json.loads(paper_row.bloom_targets)
 
@@ -2869,7 +2921,8 @@ def _paper_detail(db: Session, paper_row: Paper) -> dict:
         "id": paper_row.id,
         "title": paper_row.title,
         "subject": paper_row.subject,
-        "pattern": json.loads(paper_row.pattern),
+        "pattern": pattern_dict,
+        "total_marks": paper.total_marks(_pattern_from_dict(pattern_dict)),
         "bloom_targets": bloom_targets,
         "book_ids": json.loads(paper_row.book_ids),
         "unit_weights": json.loads(paper_row.unit_weights) if paper_row.unit_weights else {},
@@ -2887,6 +2940,235 @@ def _paper_detail(db: Session, paper_row: Paper) -> dict:
         "created_at": paper_row.created_at.isoformat() if paper_row.created_at else None,
         "updated_at": paper_row.updated_at.isoformat() if paper_row.updated_at else None,
     }
+
+
+def _extract_text_for_pattern_import(file_path: str, filename: str) -> str:
+    """
+    Extracts plain text from an uploaded file for POST /papers/import-
+    pattern -- never creates a Book/DocumentPage/Page row (this file is
+    never added to the user's documents or search index), just returns
+    the combined text so it can be handed to Gemini and the temp file
+    deleted right after. Reuses document_parsers.py for text extraction
+    and the same Gemini-vision OCR fallback jobs.py's background pipeline
+    uses for a low-text PDF page or a bare photo/scan -- run synchronously
+    here (no Book to track progress against, and the whole import has to
+    finish within one request) rather than as a background job.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext in ALLOWED_IMAGE_EXTENSIONS:
+        with open(file_path, "rb") as f:
+            raw_bytes = f.read()
+        prepared = ocr.prepare_image_for_ocr(raw_bytes)
+        return llm.read_image(prepared, mime_type="image/jpeg")
+
+    if ext == ".pdf":
+        with open(file_path, "rb") as f:
+            pages_data = document_parsers.parse_pdf(f)
+
+        low_text_pages = [p for p in pages_data if len(p["content"].strip()) < jobs.OCR_MIN_CHARS]
+        if len(low_text_pages) > MAX_OCR_PAGES:
+            raise ValueError(
+                f"This document has {len(low_text_pages)} scanned or low-text pages, "
+                f"over the {MAX_OCR_PAGES}-page OCR limit."
+            )
+
+        texts = []
+        for page in pages_data:
+            content = page["content"]
+            if len(content.strip()) >= jobs.OCR_MIN_CHARS:
+                texts.append(content)
+                continue
+            rendered = ocr.render_pdf_page_to_png(file_path, page_index=page["page_number"] - 1)
+            prepared = ocr.prepare_image_for_ocr(rendered)
+            texts.append(llm.read_image(prepared, mime_type="image/jpeg"))
+        return "\n\n".join(texts)
+
+    with open(file_path, "rb") as f:
+        pages_data = document_parsers.parse_document(f, filename)
+    return "\n\n".join(p["content"] for p in pages_data)
+
+
+def _build_pattern_import_prompt(text: str) -> str:
+    return (
+        "The following is the text of an old/existing exam question paper "
+        "(it may have been OCR'd from a scan or photo, so formatting can be "
+        "rough). Identify its structure and transcribe its questions exactly "
+        "as written -- do not invent or rephrase anything.\n\n"
+        "Return:\n"
+        "- sections: one entry per printed section (e.g. 'Section A'), each "
+        "with title, instructions (its printed instruction line, if any), "
+        "marks_each (every question in that section is worth the same marks), "
+        "num_questions (how many questions are printed in that section), "
+        "choice ('none' if every question must be answered, 'any_n' if the "
+        "student only attempts some of them, 'either_or' if each numbered "
+        "question offers two alternative options worth the same marks), and "
+        "attempt (only when choice is 'any_n': how many of num_questions the "
+        "student actually answers).\n"
+        "- duration_minutes and total_marks for the whole paper, if stated "
+        "anywhere on it.\n"
+        "- questions: every individual question found, each with section "
+        "(matching one of the section titles above exactly), number (its "
+        "printed question number), option ('a' or 'b' if it's one half of an "
+        "either/or pair, omitted otherwise), text (the question exactly as "
+        "written), and marks.\n\n"
+        f"Paper text:\n{text}"
+    )
+
+
+def _pattern_from_import_result(result: dict) -> paper.Pattern:
+    raw_sections = result.get("sections") or []
+    if not raw_sections:
+        raise ValueError("no sections found")
+
+    sections = tuple(
+        paper.Section(
+            key=_section_key_for_index(idx),
+            title=(s.get("title") or f"Section {_section_key_for_index(idx)}").strip(),
+            instructions=(s.get("instructions") or "").strip(),
+            marks_each=int(s["marks_each"]),
+            num_questions=int(s["num_questions"]),
+            choice=s.get("choice") if s.get("choice") in paper.CHOICE_KINDS else "none",
+            attempt=int(s["attempt"]) if s.get("choice") == "any_n" and s.get("attempt") else None,
+        )
+        for idx, s in enumerate(raw_sections)
+    )
+
+    return paper.Pattern(
+        key="imported",
+        name="Imported Pattern",
+        duration_minutes=int(result.get("duration_minutes") or 60),
+        sections=sections,
+        paper_kind="written",
+    )
+
+
+def _section_key_for_index(idx: int) -> str:
+    return chr(65 + idx) if idx < 26 else str(idx + 1)
+
+
+def _estimate_bloom_mix(raw_questions: list):
+    """
+    Classifies an imported paper's questions with the existing (Phase 4B)
+    level checker, in one batched call, and returns marks + percentage per
+    level -- always clearly an ESTIMATE (the checker is independently
+    guessing a level from question text alone, same as it does for a
+    freshly-generated question, just with no "intended" level to compare
+    against here). None if there are no questions to classify, or the
+    checker is unavailable -- never blocks the import itself.
+    """
+    if not raw_questions:
+        return None
+
+    question_texts = [str(q.get("text") or "") for q in raw_questions]
+    try:
+        detected_levels = _classify_questions_with_gemini(question_texts)
+    except llm.LLMUnavailableError:
+        detected_levels = None
+    if not detected_levels:
+        return None
+
+    marks_by_level = {level: 0 for level in bloom.level_keys()}
+    for q, level in zip(raw_questions, detected_levels):
+        if level and bloom.is_valid_level(level):
+            marks_by_level[level] += int(q.get("marks") or 0)
+
+    total = sum(marks_by_level.values())
+    return {
+        "estimated": True,
+        "marks": marks_by_level,
+        "percent": {
+            level: (round((marks / total) * 100, 1) if total else 0)
+            for level, marks in marks_by_level.items()
+        },
+    }
+
+
+@app.post("/papers/import-pattern")
+@limiter.limit("5/minute", key_func=_user_rate_limit_key)
+def import_paper_pattern(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Reads an old/existing question paper (a document, or a single photo/
+    scan) and extracts its section layout + questions with Gemini, for the
+    "New paper" builder's custom pattern editor to start from. Never saved
+    as a Book or added to the user's documents/search index -- the
+    uploaded file is deleted again once its text has been read, whether
+    this succeeds or fails.
+    """
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    is_image = ext in ALLOWED_IMAGE_EXTENSIONS
+
+    if is_image:
+        file.file.seek(0, os.SEEK_END)
+        size = file.file.tell()
+        file.file.seek(0)
+        if size > MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413, detail=f"Image exceeds the maximum allowed size of {MAX_IMAGE_MB:g} MB"
+            )
+    elif ext in ALLOWED_UPLOAD_EXTENSIONS:
+        _validate_document_upload(file)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file extension '{ext}'. "
+                f"Allowed: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS))}"
+            )
+        )
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            file.file.seek(0)
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
+
+        try:
+            text = _extract_text_for_pattern_import(tmp_path, filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except llm.LLMUnavailableError:
+            raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+        if not text or not text.strip():
+            raise HTTPException(status_code=422, detail="Could not read any text from this file.")
+
+        try:
+            result = llm.generate_json(_build_pattern_import_prompt(text), schema=PATTERN_IMPORT_SCHEMA)
+        except llm.LLMUnavailableError:
+            raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+        if not isinstance(result, dict) or not result.get("sections"):
+            raise HTTPException(
+                status_code=422,
+                detail="Couldn't find a question paper layout in this file. Try a clearer scan or a different file."
+            )
+
+        try:
+            pattern = _pattern_from_import_result(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Couldn't understand this paper's layout ({exc}).")
+
+        pattern_errors = paper.validate_pattern(pattern)
+        if pattern_errors:
+            raise HTTPException(status_code=422, detail=pattern_errors)
+
+        raw_questions = result.get("questions") or []
+
+        return {
+            "pattern": _pattern_to_dict(pattern),
+            "questions": raw_questions,
+            "bloom_mix": _estimate_bloom_mix(raw_questions),
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 @app.get("/paper-patterns")

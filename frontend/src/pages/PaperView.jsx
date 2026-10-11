@@ -820,9 +820,10 @@ export default function PaperView() {
 
   // status === "ready"
   const sections = groupSlotsBySection(paper.slots || []);
-  const maxMarks = (paper.slots || [])
-    .filter((s) => s.option === null || s.option === 'a')
-    .reduce((sum, s) => sum + s.marks, 0);
+  // What a student actually answers (e.g. 50 for mid_sem_50's "any 4 of
+  // 5" section), not marks_on_paper (55, every printed question) --
+  // Phase 5E EXTRA fix.
+  const maxMarks = paper.total_marks;
   const problemCount = (paper.slots || []).filter(isProblemSlot).length;
 
   return (

@@ -20,6 +20,7 @@ job (the export route) to decide whether that should block the request
 instead (409 for a student copy with gaps).
 """
 import io
+import os
 
 import bloom
 from docx import Document
@@ -114,8 +115,42 @@ def _right_tab_stop(doc: Document):
 # -----------------------------
 # Shared data helpers
 # -----------------------------
-def _max_marks(paper: dict) -> int:
+def _marks_on_paper(paper: dict) -> int:
+    """Every distinct numbered question once each, regardless of choice -- matches paper.marks_on_paper()."""
     return sum(s["marks"] for s in paper.get("slots", []) if s.get("option") in (None, "a"))
+
+
+def _total_marks(paper: dict) -> int:
+    """
+    What a student answering optimally actually scores -- matches
+    paper.total_marks(): identical to _marks_on_paper() except an "any_n"
+    section only counts `attempt` of its num_questions (the student never
+    answers the rest). This, not _marks_on_paper(), is the right "Max
+    Marks" figure on a printed paper (Phase 5E EXTRA fix) -- e.g. 50 for
+    mid_sem_50's "any 4 of 5" section, not 55. _marks_on_paper() stays the
+    basis for the Bloom blueprint's percentages, matching how plan_paper()
+    computed the targets in the first place.
+    """
+    total = 0
+    for section in (paper.get("pattern") or {}).get("sections", []):
+        if section.get("choice") == "any_n" and section.get("attempt"):
+            total += section["attempt"] * section["marks_each"]
+        else:
+            total += section["num_questions"] * section["marks_each"]
+    return total
+
+
+def _format_duration(minutes) -> str:
+    """120 -> "2 hours", 90 -> "1 hour 30 minutes", 60 -> "1 hour", 45 -> "45 minutes"."""
+    if not minutes:
+        return ""
+    hours, mins = divmod(int(minutes), 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} hour" + ("s" if hours != 1 else ""))
+    if mins:
+        parts.append(f"{mins} minute" + ("s" if mins != 1 else ""))
+    return " ".join(parts) if parts else "0 minutes"
 
 
 def _group_slots(slots: list) -> list:
@@ -138,10 +173,15 @@ def _level_label(level_key) -> str:
         return level_key or "Unknown level"
 
 
+def _strip_extension(filename: str) -> str:
+    return os.path.splitext(filename)[0] if filename else filename
+
+
 def _document_name(slot: dict) -> str:
+    """The document's name, without its file extension (Phase 5E polish) -- e.g. "CN Notes", not "CN Notes.docx"."""
     question = slot.get("question")
     if question and question.get("source") and question["source"].get("book_name"):
-        return question["source"]["book_name"]
+        return _strip_extension(question["source"]["book_name"])
     if slot.get("book_id") is not None:
         return f"Document #{slot['book_id']}"
     return "Unknown document"
@@ -155,7 +195,7 @@ def _document_names_by_id(paper: dict) -> dict:
             continue
         question = slot.get("question")
         if question and question.get("source") and question["source"].get("book_name"):
-            names[str(slot["book_id"])] = question["source"]["book_name"]
+            names[str(slot["book_id"])] = _document_name(slot)
     return names
 
 
@@ -176,10 +216,10 @@ def _add_header(doc: Document, paper: dict) -> None:
         subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
         subtitle.add_run(paper["subject"]).italic = True
 
-    meta_parts = [f"Max Marks: {_max_marks(paper)}"]
+    meta_parts = [f"Max Marks: {_total_marks(paper)}"]
     duration = (paper.get("pattern") or {}).get("duration_minutes")
     if duration:
-        meta_parts.append(f"Duration: {duration} minutes")
+        meta_parts.append(f"Duration: {_format_duration(duration)}")
     meta = doc.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
     meta.add_run("      ".join(meta_parts)).bold = True
@@ -313,6 +353,14 @@ def _answer_text(question: dict) -> str:
 def _add_blueprint_page(doc: Document, paper: dict) -> None:
     doc.add_page_break()
     doc.add_heading("Blueprint", level=1)
+
+    # Marks on paper (every printed question once, incl. unattempted any_n
+    # choices) differs from the "Max Marks" on the header (what a student
+    # actually answers) whenever any section offers a choice -- labelled
+    # here so that distinction stays visible to the teacher.
+    marks_on_paper = _marks_on_paper(paper)
+    if marks_on_paper != _total_marks(paper):
+        doc.add_paragraph().add_run(f"Marks on paper (all printed questions): {marks_on_paper}").italic = True
 
     doc.add_heading("Marks by Bloom's level", level=2)
     target = paper.get("blueprint_target") or {}

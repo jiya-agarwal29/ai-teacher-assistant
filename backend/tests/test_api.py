@@ -3554,3 +3554,181 @@ def test_export_filename_strips_unsafe_characters(client, phase5b_headers, monke
     assert "/" not in disposition.split("filename=")[1]
     assert ":" not in disposition.split("filename=")[1]
     assert 'filename="MidSem Exam 2026-answer_key.docx"' in disposition
+
+
+# -----------------------------
+# PHASE 5E EXTRA: total_marks excludes unattempted any_n marks
+# -----------------------------
+def test_paper_total_marks_excludes_unattempted_any_n_marks(client, phase5b_headers):
+    # mid_sem_50: Section A (5x2=10) + Section B ("any 4 of 5" x5m -- a
+    # student only ever answers 4*5=20, not the 25 printed) + Section C
+    # (2 either_or pairs x10m, marks_on_paper counts each pair once = 20).
+    # total_marks = 10+20+20 = 50; marks_on_paper = 10+25+20 = 55.
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "total_marks_check.txt")
+
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "Total Marks Check Paper", "pattern_key": "mid_sem_50",
+            "bloom_preset": "balanced", "book_ids": [book_id]
+        }
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["total_marks"] == 50
+
+    list_res = client.get("/papers", headers=headers)
+    assert list_res.status_code == 200
+    summary = next(p for p in list_res.json() if p["id"] == data["id"])
+    assert summary["total_marks"] == 50
+
+
+# -----------------------------
+# PHASE 5E: IMPORT LAYOUT FROM AN OLD PAPER
+# -----------------------------
+def _fake_pattern_import_response():
+    return {
+        "duration_minutes": 120,
+        "total_marks": 50,
+        "sections": [
+            {
+                "title": "Section A", "instructions": "Answer all questions.",
+                "marks_each": 2, "num_questions": 5, "choice": "none", "attempt": None
+            },
+            {
+                "title": "Section B", "instructions": "Attempt any 4 of the following 5 questions.",
+                "marks_each": 5, "num_questions": 5, "choice": "any_n", "attempt": 4
+            },
+            {
+                "title": "Section C", "instructions": "Answer EITHER (a) OR (b) for each question.",
+                "marks_each": 10, "num_questions": 2, "choice": "either_or", "attempt": None
+            },
+        ],
+        "questions": [
+            {"section": "Section A", "number": "1", "text": "Define a firewall.", "marks": 2},
+            {"section": "Section A", "number": "2", "text": "What is a VPN?", "marks": 2},
+            {"section": "Section A", "number": "3", "text": "State the CIA triad.", "marks": 2},
+            {"section": "Section A", "number": "4", "text": "List two symmetric ciphers.", "marks": 2},
+            {"section": "Section A", "number": "5", "text": "Define a digital signature.", "marks": 2},
+            {"section": "Section B", "number": "6", "text": "Explain how TLS establishes a secure session.", "marks": 5},
+        ],
+    }
+
+
+def test_import_paper_pattern_returns_pattern_and_bloom_mix(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+
+    def fake(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": "remember"} for i in range(1, 7)]}
+        return _fake_pattern_import_response()
+    monkeypatch.setattr(llm_module, "generate_json", fake)
+
+    main.limiter.reset()
+    res = client.post(
+        "/papers/import-pattern", headers=headers,
+        files={"file": ("old_paper.txt", b"Some old paper text content.", "text/plain")}
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+
+    sections = data["pattern"]["sections"]
+    assert len(sections) == 3
+    assert sections[0]["key"] == "A"
+    assert sections[0]["choice"] == "none"
+    assert sections[1]["choice"] == "any_n"
+    assert sections[1]["attempt"] == 4
+    assert sections[2]["choice"] == "either_or"
+    assert data["pattern"]["duration_minutes"] == 120
+
+    assert len(data["questions"]) == 6
+
+    # All 6 questions' marks (2+2+2+2+2+5=15) classified "remember" --
+    # clearly labelled an estimate.
+    assert data["bloom_mix"]["estimated"] is True
+    assert data["bloom_mix"]["marks"]["remember"] == 15
+    assert data["bloom_mix"]["percent"]["remember"] == 100.0
+
+
+def test_import_paper_pattern_invalid_layout_returns_422(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+
+    def fake(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            return {"items": []}
+        return {"sections": [], "questions": []}
+    monkeypatch.setattr(llm_module, "generate_json", fake)
+
+    main.limiter.reset()
+    res = client.post(
+        "/papers/import-pattern", headers=headers,
+        files={"file": ("bad_old_paper.txt", b"Not recognizable as a paper.", "text/plain")}
+    )
+    assert res.status_code == 422
+    assert "layout" in res.json()["detail"].lower()
+
+
+def test_import_paper_pattern_structurally_invalid_section_returns_422(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+
+    def fake(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            return {"items": []}
+        return {
+            "duration_minutes": 60, "total_marks": 0,
+            "sections": [{
+                "title": "Section A", "instructions": "x",
+                "marks_each": 0, "num_questions": 0, "choice": "none", "attempt": None
+            }],
+            "questions": [],
+        }
+    monkeypatch.setattr(llm_module, "generate_json", fake)
+
+    main.limiter.reset()
+    res = client.post(
+        "/papers/import-pattern", headers=headers,
+        files={"file": ("invalid_section.txt", b"text", "text/plain")}
+    )
+    assert res.status_code == 422
+
+
+def test_import_paper_pattern_file_not_added_to_documents_and_deleted(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    captured = {}
+    real_extract = main._extract_text_for_pattern_import
+
+    def spy_extract(file_path, filename):
+        captured["path"] = file_path
+        assert os.path.exists(file_path)  # still there while the request is in flight
+        return real_extract(file_path, filename)
+    monkeypatch.setattr(main, "_extract_text_for_pattern_import", spy_extract)
+
+    def fake(prompt, schema, system=None):
+        if schema is main.CLASSIFIER_SCHEMA:
+            return {"items": []}
+        return _fake_pattern_import_response()
+    monkeypatch.setattr(llm_module, "generate_json", fake)
+
+    books_before = client.get("/books", headers=headers).json()
+
+    main.limiter.reset()
+    res = client.post(
+        "/papers/import-pattern", headers=headers,
+        files={"file": ("old_paper_cleanup.txt", b"Some old paper text content.", "text/plain")}
+    )
+    assert res.status_code == 200, res.text
+
+    books_after = client.get("/books", headers=headers).json()
+    assert len(books_after) == len(books_before)  # never added as a document
+
+    assert "path" in captured
+    assert not os.path.exists(captured["path"])  # deleted once the request finished

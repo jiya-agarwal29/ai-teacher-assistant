@@ -589,6 +589,22 @@ export const api = {
     candidates: (id, slotId) => request(`/papers/${id}/slots/${slotId}/candidates`),
 
     /**
+     * POST /papers/import-pattern (multipart) -- reads an old/existing
+     * question paper's layout (a document, or a single photo/scan) with
+     * Gemini: {pattern, questions, bloom_mix}. Never saved as a document
+     * -- just returns the detected pattern for the "New paper" builder's
+     * custom pattern editor to start from. `file` is a single File.
+     */
+    importPattern: (file) => {
+      const formData = new FormData();
+      formData.append('file', file);
+      return request('/papers/import-pattern', {
+        method: 'POST',
+        body: formData,
+      });
+    },
+
+    /**
      * GET /papers/{id}/export?kind=student|teacher|answer_key -- fetched
      * manually (not through the request() helper, which assumes a JSON
      * body), same as books.pages.getImageUrl: a plain <a href> can't carry

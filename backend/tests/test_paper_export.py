@@ -124,7 +124,7 @@ def test_student_copy_has_no_level_names_document_tags_or_answers():
     assert "Mid-Sem Mock Paper" in text
     assert "Networks" in text
     assert "Max Marks: 14" in text
-    assert "Duration: 120 minutes" in text
+    assert "Duration: 2 hours" in text
     assert "Roll No." in text
 
 
@@ -149,8 +149,8 @@ def test_teacher_copy_has_tags_and_blueprint():
     text = _docx_text(paper_export.build_docx(_mock_paper(), "teacher"))
     assert "Remember" in text
     assert "Analyze" in text
-    assert "CN Notes.docx" in text
-    assert "NS Notes.pdf" in text
+    assert "CN Notes" in text
+    assert "NS Notes" in text
     assert "Blueprint" in text
     assert "Marks by Bloom's level" in text
     assert "Marks by document" in text
@@ -187,3 +187,56 @@ def test_true_false_answer_key_shows_true_or_false_word():
     paper["slots"][0]["question"]["correct_answer"] = "B"
     text = _docx_text(paper_export.build_docx(paper, "answer_key"))
     assert "False" in text
+
+
+# -----------------------------
+# Phase 5E EXTRA: total_marks (not marks_on_paper), duration wording,
+# document names without their file extension
+# -----------------------------
+def test_header_shows_total_marks_not_marks_on_paper_for_any_n_sections():
+    # mid_sem_50-style "attempt any 2 of 3" section: a student only ever
+    # answers 2 * 5 = 10 marks, not the 15 marks printed on the page.
+    paper = {
+        "title": "Any-N Test Paper", "subject": None, "status": "ready",
+        "pattern": {
+            "duration_minutes": 60,
+            "sections": [
+                {
+                    "key": "A", "title": "Section A", "instructions": "Attempt any 2 of the following 3 questions.",
+                    "marks_each": 5, "num_questions": 3, "choice": "any_n", "attempt": 2
+                },
+            ],
+        },
+        "blueprint_target": {}, "blueprint_actual": {"by_level": {}, "by_unit": {}}, "warnings": [],
+        "slots": [
+            {
+                "id": n, "section": "A", "number": str(n), "option": None, "marks": 5,
+                "bloom_level": "remember", "book_id": 1,
+                "question": _question(n, "short_answer", "remember", f"Question {n} text", f"Answer {n}", 5,
+                                       [{"point": "x", "marks": 5}])
+            }
+            for n in (1, 2, 3)
+        ],
+    }
+    text = _docx_text(paper_export.build_docx(paper, "student"))
+    assert "Max Marks: 10" in text  # attempt(2) * marks_each(5), not 3 * 5 = 15
+
+    # The teacher copy's blueprint page may still show the 15-mark
+    # "marks on paper" figure, explicitly labelled as such.
+    teacher_text = _docx_text(paper_export.build_docx(paper, "teacher"))
+    assert "Marks on paper (all printed questions): 15" in teacher_text
+
+
+@pytest.mark.parametrize("minutes,expected", [(120, "2 hours"), (90, "1 hour 30 minutes"), (60, "1 hour"), (45, "45 minutes")])
+def test_duration_is_worded_not_raw_minutes(minutes, expected):
+    paper = _mock_paper()
+    paper["pattern"]["duration_minutes"] = minutes
+    text = _docx_text(paper_export.build_docx(paper, "student"))
+    assert f"Duration: {expected}" in text
+
+
+def test_teacher_tags_show_document_name_without_extension():
+    text = _docx_text(paper_export.build_docx(_mock_paper(), "teacher"))
+    assert "CN Notes ·" in text or "· CN Notes]" in text
+    assert "CN Notes.docx" not in text
+    assert "NS Notes.pdf" not in text
