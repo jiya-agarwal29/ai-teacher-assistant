@@ -453,18 +453,23 @@ export const api = {
 
   questions: {
     /**
-     * GET /questions?level=...&topic=...&check=...&limit=...&offset=...
+     * GET /questions?level=...&topic=...&check=...&source=...&limit=...&offset=...
      * `level` may be a single key, an array of keys, or an already
      * comma-joined string (multi-select filtering on the Question Bank
      * page) -- the backend accepts a comma-separated list for this param.
+     * `source` is "quiz" (never written for a paper), "paper" (written
+     * for a paper slot, whether or not it's still in one), or "unused"
+     * (not currently in any paper slot -- true of every quiz question,
+     * and of a paper question swapped/regenerated out of its slot).
      */
-    list: ({ level, topic, check, limit, offset } = {}) => {
+    list: ({ level, topic, check, source, limit, offset } = {}) => {
       const params = new URLSearchParams();
       if (level && (!Array.isArray(level) || level.length > 0)) {
         params.append('level', Array.isArray(level) ? level.join(',') : level);
       }
       if (topic) params.append('topic', topic);
       if (check) params.append('check', check);
+      if (source) params.append('source', source);
       if (limit !== undefined && limit !== null) params.append('limit', String(limit));
       if (offset !== undefined && offset !== null) params.append('offset', String(offset));
       return request(`/questions?${params.toString()}`);
@@ -499,6 +504,15 @@ export const api = {
      * DELETE /questions/{id}
      */
     delete: (id) => request(`/questions/${id}`, {
+      method: 'DELETE',
+    }),
+
+    /**
+     * DELETE /questions/unused -- removes every bank question not
+     * currently filling a paper slot (not origin -- a quiz question
+     * counts as unused too). Returns {deleted: n}.
+     */
+    deleteUnused: () => request('/questions/unused', {
       method: 'DELETE',
     }),
   },

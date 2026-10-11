@@ -65,8 +65,7 @@ export default function PaperPlanPreview({ paperData, documentNames, actions }) 
 
       <BlueprintPanel
         target={paperData.blueprint_target}
-        comparison={paperData.blueprint_planned?.by_level}
-        comparisonLabel="Planned"
+        planned={paperData.blueprint_planned?.by_level}
         byUnit={paperData.blueprint_planned?.by_unit}
         documentNames={documentNames}
         warnings={paperData.warnings}

@@ -8,7 +8,8 @@ import {
   RefreshCw,
   Pencil,
   Trash2,
-  Database
+  Database,
+  Eraser
 } from 'lucide-react';
 import { api } from '../services/api';
 import useBloomLevels from '../hooks/useBloomLevels';
@@ -30,6 +31,28 @@ const TYPE_LABELS = {
 };
 
 const inputClass = 'w-full px-3 py-2 rounded-xl text-[11px] bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all';
+
+const SOURCE_FILTERS = [
+  { key: 'quiz', label: 'From quizzes' },
+  { key: 'paper', label: 'From papers' },
+  { key: 'unused', label: 'Not used in any paper' }
+];
+
+// "Quiz: <topic>" for a question never written for a paper; "Paper:
+// <title>" for one that is (listing every paper it's CURRENTLY in, since
+// the same bank question can be swapped into more than one) -- or
+// "Paper (not currently used)" for a paper-origin question swapped or
+// regenerated out of every slot that once held it (Phase 5 fixes from
+// browser testing, item 9a/9b).
+function originLabel(item) {
+  if (item.used_in_papers && item.used_in_papers.length > 0) {
+    return `Paper: ${item.used_in_papers.map((p) => p.title).join(', ')}`;
+  }
+  if (item.origin === 'paper') {
+    return 'Paper (not currently used)';
+  }
+  return `Quiz: ${item.topic}`;
+}
 
 function QuestionRow({ item, bloomLevels, onUpdated, onDeleted }) {
   const [expanded, setExpanded] = useState(false);
@@ -61,6 +84,13 @@ function QuestionRow({ item, bloomLevels, onUpdated, onDeleted }) {
   };
 
   const handleSave = async () => {
+    const usedInPapers = item.used_in_papers || [];
+    if (usedInPapers.length >= 2) {
+      const titles = usedInPapers.map((p) => p.title).join(', ');
+      if (!window.confirm(`This question is used in ${usedInPapers.length} papers (${titles}) -- your edit changes all of them. Save anyway?`)) {
+        return;
+      }
+    }
     setSaving(true);
     setSaveError('');
     try {
@@ -134,7 +164,7 @@ function QuestionRow({ item, bloomLevels, onUpdated, onDeleted }) {
                 Flagged
               </span>
             )}
-            <span className="text-[9px] font-semibold text-slate-400 dark:text-slate-500">{item.topic}</span>
+            <span className="text-[9px] font-semibold text-slate-400 dark:text-slate-500">{originLabel(item)}</span>
           </div>
           <p className="text-xs font-semibold text-slate-800 dark:text-white">{item.question}</p>
           {item.source && (
@@ -284,6 +314,7 @@ export default function QuestionBank() {
 
   const [selectedLevels, setSelectedLevels] = useState([]);
   const [flaggedOnly, setFlaggedOnly] = useState(false);
+  const [sourceFilter, setSourceFilter] = useState('');
   const [topicInput, setTopicInput] = useState('');
   const [debouncedTopic, setDebouncedTopic] = useState('');
 
@@ -292,6 +323,9 @@ export default function QuestionBank() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
+
+  const [deletingUnused, setDeletingUnused] = useState(false);
+  const [deleteUnusedError, setDeleteUnusedError] = useState('');
 
   const refreshSummary = useCallback(() => {
     api.questions.summary()
@@ -322,6 +356,7 @@ export default function QuestionBank() {
     const params = { limit: PAGE_SIZE, offset: 0 };
     if (selectedLevels.length > 0) params.level = selectedLevels;
     if (flaggedOnly) params.check = 'flagged';
+    if (sourceFilter) params.source = sourceFilter;
     if (debouncedTopic) params.topic = debouncedTopic;
 
     api.questions.list(params)
@@ -340,7 +375,7 @@ export default function QuestionBank() {
     return () => {
       cancelled = true;
     };
-  }, [selectedLevels, flaggedOnly, debouncedTopic]);
+  }, [selectedLevels, flaggedOnly, sourceFilter, debouncedTopic]);
 
   const handleLoadMore = async () => {
     setLoadingMore(true);
@@ -349,6 +384,7 @@ export default function QuestionBank() {
       const params = { limit: PAGE_SIZE, offset: items.length };
       if (selectedLevels.length > 0) params.level = selectedLevels;
       if (flaggedOnly) params.check = 'flagged';
+      if (sourceFilter) params.source = sourceFilter;
       if (debouncedTopic) params.topic = debouncedTopic;
       const data = await api.questions.list(params);
       setItems((prev) => [...prev, ...data.items]);
@@ -364,6 +400,37 @@ export default function QuestionBank() {
     setSelectedLevels((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
     setLoading(true);
     setError('');
+  };
+
+  const toggleSourceFilter = (key) => {
+    setSourceFilter((prev) => (prev === key ? '' : key));
+    setLoading(true);
+    setError('');
+  };
+
+  const handleDeleteUnused = async () => {
+    if (!window.confirm('Delete every question not currently used in a paper? This cannot be undone.')) return;
+    setDeletingUnused(true);
+    setDeleteUnusedError('');
+    try {
+      const { deleted } = await api.questions.deleteUnused();
+      setLoading(true);
+      const params = { limit: PAGE_SIZE, offset: 0 };
+      if (selectedLevels.length > 0) params.level = selectedLevels;
+      if (flaggedOnly) params.check = 'flagged';
+      if (sourceFilter) params.source = sourceFilter;
+      if (debouncedTopic) params.topic = debouncedTopic;
+      const data = await api.questions.list(params);
+      setItems(data.items);
+      setTotal(data.total);
+      refreshSummary();
+      setDeleteUnusedError(deleted === 0 ? 'Nothing to delete -- every question is currently used in a paper.' : '');
+    } catch (err) {
+      setDeleteUnusedError(err.message || 'Could not delete unused questions.');
+    } finally {
+      setDeletingUnused(false);
+      setLoading(false);
+    }
   };
 
   const handleFlaggedOnlyToggle = () => {
@@ -477,16 +544,47 @@ export default function QuestionBank() {
           </button>
         </div>
 
-        <div className="relative max-w-sm">
-          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input
-            type="text"
-            placeholder="Search by topic..."
-            value={topicInput}
-            onChange={handleTopicInputChange}
-            className="w-full pl-9 pr-4 py-2.5 rounded-xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
-          />
+        <div className="flex flex-wrap gap-2">
+          {SOURCE_FILTERS.map((f) => (
+            <button
+              key={f.key}
+              type="button"
+              onClick={() => toggleSourceFilter(f.key)}
+              className={`px-3 py-1.5 rounded-full text-[10px] font-bold border transition-all ${
+                sourceFilter === f.key
+                  ? 'bg-violet-600 text-white border-violet-600'
+                  : 'border-slate-200 dark:border-slate-800 text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/30'
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
         </div>
+
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="relative max-w-sm flex-1 min-w-50">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Search by topic..."
+              value={topicInput}
+              onChange={handleTopicInputChange}
+              className="w-full pl-9 pr-4 py-2.5 rounded-xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={handleDeleteUnused}
+            disabled={deletingUnused}
+            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-[10px] font-bold bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors disabled:opacity-50"
+          >
+            {deletingUnused ? <Loader2 size={12} className="animate-spin" /> : <Eraser size={12} />}
+            {deletingUnused ? 'Deleting...' : 'Delete unused questions'}
+          </button>
+        </div>
+        {deleteUnusedError && (
+          <p className="text-[10px] font-semibold text-rose-500">{deleteUnusedError}</p>
+        )}
       </div>
 
       {error && (

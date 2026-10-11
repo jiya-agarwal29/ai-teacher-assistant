@@ -2613,6 +2613,70 @@ def _make_paper_llm_fake():
     return fake
 
 
+def test_verb_guard_regenerates_a_question_opened_with_the_wrong_levels_verb(monkeypatch):
+    # Phase 5 fixes from browser testing, item 5: "Propose a..." is a
+    # Create verb (bloom.py), so writing it for an Apply slot should trip
+    # the cheap lexical guard and trigger exactly one regeneration call
+    # that explicitly asks the model to avoid "propose" this time.
+    from types import SimpleNamespace
+    import bloom as bloom_module
+
+    window = SimpleNamespace(content="Congestion control adjusts the sender's rate based on feedback from the network.")
+    top_pages = [(1.0, window)]
+    drop_log = []
+    questions = [{
+        "id": 1, "type": "short_answer", "bloom_level": "apply",
+        "question": "Propose a new congestion-control scheme for this network.",
+        "correctAnswer": "A sample answer.", "explanation": "A sample explanation.",
+        "marks": 5, "marking_scheme": [{"point": "Correctness", "marks": 5}], "source_index": 1,
+    }]
+
+    verb_hit = bloom_module.classify_by_verbs(questions[0]["question"])
+    assert verb_hit["level"] == "create" and verb_hit["matched"] == "propose"
+
+    captured_prompts = []
+
+    def fake_generate_json(prompt, schema=None, system=None):
+        captured_prompts.append(prompt)
+        return {"questions": [{
+            "id": 1, "type": "short_answer", "bloom_level": "apply",
+            "question": "How would you use the sliding window technique to manage flow on this link?",
+            "correctAnswer": "A sample answer.", "explanation": "A sample explanation.",
+            "marks": 5, "marking_scheme": [{"point": "Correctness", "marks": 5}], "source_index": 1,
+        }]}
+
+    monkeypatch.setattr(main.llm, "generate_json", fake_generate_json)
+
+    result = main._apply_verb_guard(questions, "Networking", top_pages, drop_log, [], {"apply": 5}, "written")
+
+    assert len(captured_prompts) == 1
+    assert "propose" in captured_prompts[0].lower()
+    assert "avoid" in captured_prompts[0].lower()
+    assert result[0]["question"] != "Propose a new congestion-control scheme for this network."
+    assert bloom_module.classify_by_verbs(result[0]["question"])["level"] in (None, "apply")
+
+
+def test_verb_guard_leaves_questions_alone_when_verbs_match_their_level(monkeypatch):
+    from types import SimpleNamespace
+
+    window = SimpleNamespace(content="Some source text.")
+    top_pages = [(1.0, window)]
+    questions = [{
+        "id": 1, "type": "short_answer", "bloom_level": "remember",
+        "question": "Define the term 'checksum' as used in this chapter.",
+        "correctAnswer": "A.", "explanation": "E.", "marks": 2,
+        "marking_scheme": [{"point": "x", "marks": 2}], "source_index": 1,
+    }]
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("verb guard should not regenerate a correctly-leveled question")
+
+    monkeypatch.setattr(main.llm, "generate_json", fail_if_called)
+
+    result = main._apply_verb_guard(questions, "Networking", top_pages, [], [], {"remember": 2}, "written")
+    assert result[0]["question"] == "Define the term 'checksum' as used in this chapter."
+
+
 def test_create_paper_builds_plan_without_any_llm_call(client, phase5b_headers, monkeypatch):
     import llm as llm_module
 
@@ -2647,6 +2711,29 @@ def test_create_paper_rejects_invalid_pattern(client, phase5b_headers):
     )
     assert res.status_code == 422
     assert isinstance(res.json()["detail"], list) and res.json()["detail"]
+
+
+def test_create_paper_rejects_attempt_count_exceeding_num_questions(client, phase5b_headers):
+    # Phase 5 fixes from browser testing, item 4: "attempt any 6 of 5" is
+    # structurally impossible (there aren't 6 questions to pick from) and
+    # must 422, matching the frontend's live "attempt > num_questions"
+    # validation that disables "Preview plan" for the same input.
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_bad_attempt.txt")
+    bad_pattern = dict(
+        SMALL_PATTERN,
+        sections=[dict(SMALL_PATTERN["sections"][0], choice="any_n", attempt=6, num_questions=5)]
+    )
+
+    res = client.post(
+        "/papers", headers=headers,
+        json={
+            "title": "Attempt Exceeds Count", "pattern": bad_pattern,
+            "bloom_targets": SMALL_BLOOM_TARGETS, "book_ids": [book_id]
+        }
+    )
+    assert res.status_code == 422
+    assert any("exceeds" in detail for detail in res.json()["detail"])
 
 
 def test_create_paper_rejects_invalid_bloom_targets(client, phase5b_headers):
@@ -2787,6 +2874,40 @@ def test_generate_fills_all_slots_and_blueprint_actual_matches_plan(client, phas
         assert sum(p["marks"] for p in q["marking_scheme"]) == slot["marks"]
 
     assert detail["blueprint_actual"]["by_level"] == detail["blueprint_planned"]["by_level"]
+
+
+def test_blueprint_actual_counts_flagged_question_at_detected_level(client, phase5b_headers, monkeypatch):
+    # Phase 5 fixes from browser testing, item 3: blueprint_actual must
+    # reflect the REAL mix on the paper, so a flagged question's marks
+    # move to its detected level, not the intended one it was planned at
+    # (blueprint_planned keeps using the intended level, unchanged).
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "paper_blueprint_actual.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Blueprint Actual Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    slot = next(s for s in detail["slots"] if s["marks"] == 2 and s["bloom_level"] == "remember")
+
+    db = TestSessionLocal()
+    try:
+        question = db.query(main.Question).filter(main.Question.id == slot["question"]["question_id"]).first()
+        question.bloom_check = "flagged"
+        question.detected_level = "apply"
+        db.commit()
+    finally:
+        db.close()
+
+    detail2 = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    # Planned (the plan's intended level) is untouched by the flag...
+    assert detail2["blueprint_planned"]["by_level"]["remember"] == detail["blueprint_planned"]["by_level"]["remember"]
+    # ...but actual moves this slot's 2 marks from remember to apply.
+    assert detail2["blueprint_actual"]["by_level"]["remember"] == detail["blueprint_actual"]["by_level"]["remember"] - 2
+    assert detail2["blueprint_actual"]["by_level"]["apply"] == detail["blueprint_actual"]["by_level"]["apply"] + 2
 
 
 def test_generate_with_no_usable_questions_leaves_warnings_but_stays_ready(client, phase5b_headers, monkeypatch):
@@ -3427,6 +3548,103 @@ def test_delete_paper_keeps_bank_questions(client, phase5b_headers, monkeypatch)
         assert db.query(main.PaperQuestion).filter(main.PaperQuestion.paper_id == paper_data["id"]).count() == 0
     finally:
         db.close()
+
+
+def test_question_bank_origin_usage_filter_and_delete_unused(client, phase5b_headers, monkeypatch):
+    # Phase 5 fixes from browser testing, item 9: origin ("quiz" vs
+    # "paper"), used_in_papers, the source filter, and the "delete unused
+    # questions" cleanup endpoint.
+    import llm as llm_module
+
+    headers = phase5b_headers
+    book_id = _upload_paper_doc(client, headers, "qbank_origin.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="QBank Origin Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    slot = next(s for s in detail["slots"] if s["marks"] == 2)
+    used_paper_question_id = slot["question"]["question_id"]
+
+    db = TestSessionLocal()
+    try:
+        user_id = db.query(main.User).filter(main.User.username == "phase5b_test_user").first().id
+        # A plain quiz-origin question for the same user (never part of any paper).
+        quiz_q = main.Question(
+            user_id=user_id, topic="quiz bank", type="short_answer", bloom_level="remember",
+            bloom_check="unchecked", question="A plain quiz question.",
+            correct_answer="A.", explanation="E.",
+        )
+        db.add(quiz_q)
+        db.commit()
+        db.refresh(quiz_q)
+        quiz_question_id = quiz_q.id
+    finally:
+        db.close()
+
+    def _list(params=None):
+        return client.get("/questions", headers=headers, params={"limit": 200, **(params or {})}).json()
+
+    items_by_id = {item["question_id"]: item for item in _list()["items"]}
+    assert items_by_id[used_paper_question_id]["origin"] == "paper"
+    assert items_by_id[used_paper_question_id]["used_in_papers"] == [
+        {"paper_id": paper_data["id"], "title": "QBank Origin Paper"}
+    ]
+    assert items_by_id[quiz_question_id]["origin"] == "quiz"
+    assert items_by_id[quiz_question_id]["used_in_papers"] == []
+
+    paper_ids = {i["question_id"] for i in _list({"source": "paper"})["items"]}
+    assert used_paper_question_id in paper_ids and quiz_question_id not in paper_ids
+
+    quiz_ids = {i["question_id"] for i in _list({"source": "quiz"})["items"]}
+    assert quiz_question_id in quiz_ids and used_paper_question_id not in quiz_ids
+
+    unused_before = {i["question_id"] for i in _list({"source": "unused"})["items"]}
+    assert quiz_question_id in unused_before
+    assert used_paper_question_id not in unused_before  # currently filling a slot
+
+    assert client.get("/questions", headers=headers, params={"source": "bogus"}).status_code == 422
+
+    # Swap in a fresh bank question built to fit the slot -- the old one
+    # should stay in the bank but drop out of "used" (item 9b).
+    allowed_types = main.paper.allowed_types_for_slot(slot["bloom_level"], 2, "written") or ["short_answer"]
+    db = TestSessionLocal()
+    try:
+        replacement = main.Question(
+            user_id=user_id, book_id=book_id, topic="bank", type=allowed_types[0],
+            bloom_level=slot["bloom_level"], bloom_check="verified",
+            question="A replacement bank question for swapping in.",
+            correct_answer="A", explanation="Explanation.",
+            marks=2, marking_scheme=json.dumps([{"point": "x", "marks": 2}]),
+        )
+        db.add(replacement)
+        db.commit()
+        db.refresh(replacement)
+        replacement_id = replacement.id
+    finally:
+        db.close()
+
+    res = client.patch(
+        f"/papers/{paper_data['id']}/slots/{slot['id']}", headers=headers,
+        json={"question_id": replacement_id}
+    )
+    assert res.status_code == 200, res.text
+
+    unused_after = {i["question_id"] for i in _list({"source": "unused"})["items"]}
+    assert used_paper_question_id in unused_after  # swapped out -- unused, but still in the bank
+    assert used_paper_question_id in {i["question_id"] for i in _list()["items"]}
+
+    # Delete-unused removes the quiz question and the swapped-out paper
+    # question, but never the replacement that's now actually in the slot.
+    res = client.delete("/questions/unused", headers=headers)
+    assert res.status_code == 200
+    assert res.json()["deleted"] >= 2
+
+    remaining_ids = {i["question_id"] for i in _list()["items"]}
+    assert replacement_id in remaining_ids
+    assert quiz_question_id not in remaining_ids
+    assert used_paper_question_id not in remaining_ids
 
 
 def test_delete_book_empties_paper_slots(client, phase5b_headers, monkeypatch):

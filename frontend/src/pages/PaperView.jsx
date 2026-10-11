@@ -20,6 +20,7 @@ import { api } from '../services/api';
 import useBloomLevels from '../hooks/useBloomLevels';
 import BloomBadge from '../components/BloomBadge';
 import BlueprintPanel from '../components/BlueprintPanel';
+import QuestionsToReview from '../components/QuestionsToReview';
 import PaperPlanPreview from '../components/PaperPlanPreview';
 
 const STATUS_POLL_INTERVAL_MS = 3000;
@@ -36,6 +37,15 @@ const TYPE_LABELS = {
 };
 
 const inputClass = 'w-full px-3 py-2 rounded-xl text-[11px] bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all';
+
+// A dedicated class for the marking-scheme point's marks box, not just
+// `${inputClass} w-16` -- that combined `w-full` (from inputClass) with
+// `w-16` and no `shrink-0`, so flexbox could shrink it below its own
+// width next to the point text's `flex-1` box, cramming its digits
+// (Phase 5 fixes from browser testing, item 7). Fixed min-width (~4rem)
+// and shrink-0 keep it a clear, consistently-sized number box, with the
+// same explicit light/dark text colour as every other input here.
+const marksInputClass = 'shrink-0 min-w-[4rem] w-20 px-2 py-2 rounded-xl text-[11px] font-semibold text-center bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all';
 
 function isProblemSlot(slot) {
   return !slot.question || slot.question.bloom_check === 'flagged';
@@ -272,7 +282,10 @@ function QuestionSlot({ slot, option, paperId, teacherView, bloomLevelsByKey, on
 
   if (!q) {
     return (
-      <div className="p-4 rounded-2xl border-2 border-rose-300 dark:border-rose-800/60 bg-rose-50/60 dark:bg-rose-950/20">
+      <div
+        id={`paper-slot-${slot.id}`}
+        className="p-4 rounded-2xl border-2 border-rose-300 dark:border-rose-800/60 bg-rose-50/60 dark:bg-rose-950/20 scroll-mt-24"
+      >
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             {label && <span className="text-xs font-bold text-slate-500 dark:text-slate-400">{label}</span>}
@@ -309,7 +322,7 @@ function QuestionSlot({ slot, option, paperId, teacherView, bloomLevelsByKey, on
   }
 
   return (
-    <div className="space-y-2">
+    <div id={`paper-slot-${slot.id}`} className="space-y-2 scroll-mt-24">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
           <p className="text-sm text-slate-800 dark:text-slate-100 leading-relaxed">
@@ -444,12 +457,16 @@ function QuestionSlot({ slot, option, paperId, teacherView, bloomLevelsByKey, on
                   placeholder="Point"
                   className={`${inputClass} flex-1`}
                 />
-                <input
-                  type="number"
-                  value={pt.marks}
-                  onChange={(e) => updateSchemePoint(idx, 'marks', e.target.value)}
-                  className={`${inputClass} w-16`}
-                />
+                <div className="flex items-center gap-1 shrink-0">
+                  <input
+                    type="number"
+                    value={pt.marks}
+                    onChange={(e) => updateSchemePoint(idx, 'marks', e.target.value)}
+                    aria-label="marks"
+                    className={marksInputClass}
+                  />
+                  <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500">marks</span>
+                </div>
                 <button type="button" onClick={() => removeSchemePoint(idx)} className="p-1.5 text-slate-400 hover:text-rose-500">
                   <Trash2 size={12} />
                 </button>
@@ -949,15 +966,15 @@ export default function PaperView() {
           </div>
         </div>
 
-        <div className="print:hidden">
+        <div className="print:hidden space-y-6">
           <BlueprintPanel
             target={paper.blueprint_target}
-            comparison={paper.blueprint_actual?.by_level}
-            comparisonLabel="Actual"
+            planned={paper.blueprint_planned?.by_level}
+            actual={paper.blueprint_actual?.by_level}
             byUnit={paper.blueprint_actual?.by_unit}
             documentNames={documentNames}
-            warnings={paper.warnings}
           />
+          <QuestionsToReview warnings={paper.warnings} slots={paper.slots || []} />
         </div>
       </div>
     </div>

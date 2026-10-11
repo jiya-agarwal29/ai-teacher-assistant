@@ -46,6 +46,10 @@ def _mock_paper():
         "blueprint_target": {
             "remember": 2.0, "understand": 2.0, "apply": 0, "analyze": 10.0, "evaluate": 0, "create": 0
         },
+        "blueprint_planned": {
+            "by_level": {"remember": 2, "understand": 2, "apply": 0, "analyze": 10, "evaluate": 0, "create": 0},
+            "by_unit": {"1": 2, "2": 12},
+        },
         "blueprint_actual": {
             "by_level": {"remember": 2, "understand": 0, "apply": 0, "analyze": 10, "evaluate": 0, "create": 0},
             "by_unit": {"1": 2, "2": 10},
@@ -222,9 +226,10 @@ def test_header_shows_total_marks_not_marks_on_paper_for_any_n_sections():
     assert "Max Marks: 10" in text  # attempt(2) * marks_each(5), not 3 * 5 = 15
 
     # The teacher copy's blueprint page may still show the 15-mark
-    # "marks on paper" figure, explicitly labelled as such.
+    # "marks on paper" figure, explicitly labelled against the 10 a
+    # student actually answers (Phase 5 fixes from browser testing).
     teacher_text = _docx_text(paper_export.build_docx(paper, "teacher"))
-    assert "Marks on paper (all printed questions): 15" in teacher_text
+    assert "Marks printed on paper: 15 (students answer 10)" in teacher_text
 
 
 @pytest.mark.parametrize("minutes,expected", [(120, "2 hours"), (90, "1 hour 30 minutes"), (60, "1 hour"), (45, "45 minutes")])
@@ -233,6 +238,20 @@ def test_duration_is_worded_not_raw_minutes(minutes, expected):
     paper["pattern"]["duration_minutes"] = minutes
     text = _docx_text(paper_export.build_docx(paper, "student"))
     assert f"Duration: {expected}" in text
+
+
+def test_teacher_blueprint_shows_target_planned_actual_percentages_and_caveat():
+    # Phase 5 fixes from browser testing, item 2: the blueprint's main
+    # numbers are target/planned/actual PERCENTAGES of the paper (marks
+    # on paper = 14 here), with the exact marks as secondary detail, plus
+    # a line explaining why an exact percentage match isn't always possible.
+    text = _docx_text(paper_export.build_docx(_mock_paper(), "teacher"))
+    assert "Target" in text and "Planned" in text and "Actual" in text
+    assert "14%" in text   # remember and understand: 2 of 14 marks each
+    assert "71%" in text   # analyze: 10 of 14 marks
+    assert "2 of 14 printed marks" in text
+    assert "10 of 14 printed marks" in text
+    assert "Exact match isn't always possible because each question is worth fixed marks" in text
 
 
 def test_teacher_tags_show_document_name_without_extension():

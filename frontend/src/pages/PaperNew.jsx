@@ -23,12 +23,25 @@ const CHOICE_LABELS = {
 
 const inputClass = 'w-full px-3 py-2 rounded-xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all';
 
+// What a student answering optimally actually scores -- matches
+// paper.total_marks(): an "any_n" section only counts `attempt` of its
+// num_questions, not every printed question (Phase 5 fixes from browser
+// testing, item 1 -- these used to show marks_on_paper, e.g. 55/110
+// instead of 50/100, for mid_sem_50/end_sem_100).
+function sectionTotalMarks(s) {
+  const marksEach = Number(s.marks_each) || 0;
+  if (s.choice === 'any_n') {
+    return (Number(s.attempt) || 0) * marksEach;
+  }
+  return (Number(s.num_questions) || 0) * marksEach;
+}
+
 function patternTotalMarks(pattern) {
-  return pattern.sections.reduce((sum, s) => sum + s.num_questions * s.marks_each, 0);
+  return pattern.sections.reduce((sum, s) => sum + sectionTotalMarks(s), 0);
 }
 
 function customSectionsTotalMarks(sections) {
-  return sections.reduce((sum, s) => sum + (Number(s.num_questions) || 0) * (Number(s.marks_each) || 0), 0);
+  return sections.reduce((sum, s) => sum + sectionTotalMarks(s), 0);
 }
 
 function sectionKeyFor(idx) {
@@ -49,6 +62,30 @@ function instructionsFor(section) {
     return 'Answer EITHER (a) OR (b) for each question.';
   }
   return 'Answer all questions.';
+}
+
+// Mirrors backend paper.validate_pattern()'s per-section rules, run live
+// as the teacher types instead of only after submitting (Phase 5 fixes
+// from browser testing, item 4). `paperKind` is always 'written' today --
+// the custom builder has no paper_kind picker yet -- but the MCQ check is
+// still here so it's ready and consistent with the backend the moment one
+// is added (e.g. via importing an MCQ old paper's layout).
+function validateCustomSection(s, paperKind = 'written') {
+  const numQuestions = Number(s.num_questions);
+  const marksEach = Number(s.marks_each);
+  if (!(numQuestions > 0)) return 'Needs at least one question.';
+  if (!(marksEach > 0)) return 'Marks each must be a positive number.';
+  if (s.choice === 'any_n') {
+    const attempt = Number(s.attempt);
+    if (!(attempt > 0)) return 'Attempt count must be at least 1.';
+    if (attempt > numQuestions) {
+      return `Attempt (${attempt}) can't exceed the number of questions (${numQuestions}).`;
+    }
+  }
+  if (paperKind === 'mcq' && marksEach > 2) {
+    return "MCQ papers can't have more than 2 marks per question.";
+  }
+  return null;
 }
 
 function defaultCustomSection(idx) {
@@ -168,6 +205,9 @@ export default function PaperNew() {
 
   const customBloomTotal = Object.values(customBloomTargets).reduce((sum, v) => sum + (Number(v) || 0), 0);
 
+  const customSectionErrors = customSections.map((s) => validateCustomSection(s));
+  const customPatternValid = customSections.length > 0 && customSectionErrors.every((e) => !e);
+
   const handlePreview = async (e) => {
     e.preventDefault();
     setFormError('');
@@ -185,15 +225,10 @@ export default function PaperNew() {
         setFormError('Add at least one section to your custom pattern.');
         return;
       }
-      for (const s of customSections) {
-        if (!(Number(s.num_questions) > 0) || !(Number(s.marks_each) > 0)) {
-          setFormError('Every section needs a positive number of questions and marks each.');
-          return;
-        }
-        if (s.choice === 'any_n' && !(Number(s.attempt) > 0)) {
-          setFormError('"Attempt N of" sections need a positive N.');
-          return;
-        }
+      const firstError = customSectionErrors.find(Boolean);
+      if (firstError) {
+        setFormError(firstError);
+        return;
       }
     }
     if (bloomChoice === 'custom' && Math.round(customBloomTotal) !== 100) {
@@ -487,6 +522,9 @@ export default function PaperNew() {
                     placeholder="Instructions (optional -- auto-generated if left blank)"
                     className={inputClass}
                   />
+                  {customSectionErrors[idx] && (
+                    <p className="text-[10px] font-semibold text-rose-500">{customSectionErrors[idx]}</p>
+                  )}
                 </div>
               ))}
               <div className="flex items-center justify-between">
@@ -635,7 +673,7 @@ export default function PaperNew() {
         <div className="flex justify-end">
           <button
             type="submit"
-            disabled={creating}
+            disabled={creating || (patternChoice === 'custom' && !customPatternValid)}
             className="flex items-center gap-2 px-6 py-3 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-500 text-white font-semibold text-xs tracking-tight hover:scale-[1.01] transition-all disabled:opacity-50"
           >
             {creating && <Loader2 size={14} className="animate-spin" />}

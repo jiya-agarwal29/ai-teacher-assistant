@@ -7,7 +7,8 @@ three flavours:
     Bloom's level, no document tags, no answers.
   - "teacher": the student copy plus a small grey tag line under each
     question ("[10 marks - Evaluate - <document>]") and a final page with
-    the blueprint (marks per level target vs actual, marks per document).
+    the blueprint (target/planned/actual % per Bloom level, marks per
+    document).
   - "answer_key": each question's number, correct answer (MCQ: letter +
     option text), and marking scheme points with their marks.
 
@@ -350,6 +351,22 @@ def _answer_text(question: dict) -> str:
 # -----------------------------
 # Blueprint page (teacher only)
 # -----------------------------
+def _pct(marks, total) -> str:
+    if not total:
+        return "0%"
+    return f"{round((marks or 0) / total * 100)}%"
+
+
+def _fill_blueprint_cell(cell, marks, total) -> None:
+    """Main number is the %-of-paper (what item 2 of the Phase 5 fixes asked to lead with); the exact
+    marks, which is what a fixed-size question bank can actually hit, sit underneath in small grey text."""
+    cell.text = ""
+    cell.paragraphs[0].add_run(_pct(marks, total)).bold = True
+    sub_run = cell.add_paragraph().add_run(f"{_fmt_marks(marks)} of {_fmt_marks(total)} printed marks")
+    sub_run.font.size = TAG_FONT_SIZE
+    sub_run.font.color.rgb = TAG_FONT_COLOR
+
+
 def _add_blueprint_page(doc: Document, paper: dict) -> None:
     doc.add_page_break()
     doc.add_heading("Blueprint", level=1)
@@ -359,22 +376,38 @@ def _add_blueprint_page(doc: Document, paper: dict) -> None:
     # actually answers) whenever any section offers a choice -- labelled
     # here so that distinction stays visible to the teacher.
     marks_on_paper = _marks_on_paper(paper)
-    if marks_on_paper != _total_marks(paper):
-        doc.add_paragraph().add_run(f"Marks on paper (all printed questions): {marks_on_paper}").italic = True
+    total_marks = _total_marks(paper)
+    if marks_on_paper != total_marks:
+        doc.add_paragraph().add_run(
+            f"Marks printed on paper: {marks_on_paper} (students answer {total_marks})"
+        ).italic = True
 
     doc.add_heading("Marks by Bloom's level", level=2)
     target = paper.get("blueprint_target") or {}
+    planned = (paper.get("blueprint_planned") or {}).get("by_level") or {}
     actual = (paper.get("blueprint_actual") or {}).get("by_level") or {}
+    level_total = sum(target.values()) or marks_on_paper or 1
 
-    level_table = doc.add_table(rows=1, cols=3)
+    level_table = doc.add_table(rows=1, cols=4)
     level_table.style = "Light Grid Accent 1"
     header_cells = level_table.rows[0].cells
-    header_cells[0].text, header_cells[1].text, header_cells[2].text = "Level", "Target", "Actual"
+    header_cells[0].text, header_cells[1].text, header_cells[2].text, header_cells[3].text = (
+        "Level", "Target", "Planned", "Actual"
+    )
     for level_key in bloom.level_keys():
         row = level_table.add_row().cells
         row[0].text = _level_label(level_key)
-        row[1].text = _fmt_marks(target.get(level_key))
-        row[2].text = _fmt_marks(actual.get(level_key))
+        _fill_blueprint_cell(row[1], target.get(level_key), level_total)
+        _fill_blueprint_cell(row[2], planned.get(level_key), level_total)
+        _fill_blueprint_cell(row[3], actual.get(level_key), level_total)
+
+    note = doc.add_paragraph()
+    note_run = note.add_run(
+        "Exact match isn't always possible because each question is worth fixed marks (2, 5 or 10)."
+    )
+    note_run.italic = True
+    note_run.font.size = TAG_FONT_SIZE
+    note_run.font.color.rgb = TAG_FONT_COLOR
 
     doc.add_paragraph()
     doc.add_heading("Marks by document", level=2)

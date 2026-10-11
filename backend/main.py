@@ -474,7 +474,9 @@ PATTERN_IMPORT_SCHEMA = {
 }
 
 
-def _bloom_level_prompt_block(level_counts: dict, marks_by_level: dict = None, paper_kind: str = "written") -> str:
+def _bloom_level_prompt_block(
+    level_counts: dict, marks_by_level: dict = None, paper_kind: str = "written", avoid_verbs: dict = None
+) -> str:
     """
     One bullet per requested level with a non-zero count: its label,
     description, prompt_rules, allowed question types and how many to
@@ -482,6 +484,13 @@ def _bloom_level_prompt_block(level_counts: dict, marks_by_level: dict = None, p
     this level must be worth exactly this many marks) swaps in
     paper.allowed_types_for_slot's marks-aware type list instead of the
     level's full type list, and adds the marks/marking_scheme instruction.
+
+    `avoid_verbs` (Phase 5 fixes from browser testing, item 5 -- exam
+    papers only, {level: [verb, ...]}): appends a line telling the model
+    not to open a question at that level with one of these verbs, because
+    an earlier attempt at this exact slot used one and read as a
+    different Bloom level (see _apply_verb_guard). Omitted entirely,
+    nothing changes here.
     """
     lines = []
     for key, count in level_counts.items():
@@ -501,25 +510,32 @@ def _bloom_level_prompt_block(level_counts: dict, marks_by_level: dict = None, p
                 "worth 1 each, or 1 point worth 2; an mcq always has exactly one point worth "
                 "all the marks)."
             )
-            continue
-        allowed = ", ".join(level.question_types)
-        lines.append(
-            f"- {level.label} -- write exactly {count} question(s) at this level. "
-            f"{level.description} {level.prompt_rules} Allowed question types: {allowed}."
-        )
+        else:
+            allowed = ", ".join(level.question_types)
+            lines.append(
+                f"- {level.label} -- write exactly {count} question(s) at this level. "
+                f"{level.description} {level.prompt_rules} Allowed question types: {allowed}."
+            )
+        avoid = (avoid_verbs or {}).get(key)
+        if avoid:
+            verb_list = ", ".join(f"'{v}'" for v in avoid)
+            lines[-1] += (
+                f" Avoid opening this question with {verb_list} -- a previous attempt at this "
+                f"slot used that wording and read as a different Bloom level, not {level.label}."
+            )
     return "\n".join(lines)
 
 
 def _build_quiz_prompt(
     topic: str, top_pages, level_counts: dict, recent_questions: list = None,
-    marks_by_level: dict = None, paper_kind: str = "written"
+    marks_by_level: dict = None, paper_kind: str = "written", avoid_verbs: dict = None
 ) -> str:
     """
     `recent_questions` (up to 15 of the user's own previously-saved question
     *texts* for this topic, newest first -- never another user's, and never
     answers/explanations) is handed to the model as extra context on what
     not to repeat; omitted entirely when there's no history yet.
-    `marks_by_level`/`paper_kind` -- see _bloom_level_prompt_block.
+    `marks_by_level`/`paper_kind`/`avoid_verbs` -- see _bloom_level_prompt_block.
     """
     numbered_sources = "\n\n".join(
         f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
@@ -537,7 +553,7 @@ def _build_quiz_prompt(
         f"Create a quiz about '{topic}' based on the numbered sources below.\n\n"
         f"{QUIZ_PROMPT_RULES}\n\n"
         f"Bloom's taxonomy levels to write:"
-        f"\n{_bloom_level_prompt_block(level_counts, marks_by_level, paper_kind)}"
+        f"\n{_bloom_level_prompt_block(level_counts, marks_by_level, paper_kind, avoid_verbs)}"
         f"{recent_block}\n\n"
         f"Sources:\n{numbered_sources}"
     )
@@ -610,7 +626,7 @@ def _classify_questions_with_gemini(question_texts: list, top_pages=None):
 
 def _generate_and_validate_questions(
     topic: str, top_pages, level_counts: dict, drop_log: list = None, recent_questions: list = None,
-    marks_by_level: dict = None, paper_kind: str = "written"
+    marks_by_level: dict = None, paper_kind: str = "written", avoid_verbs: dict = None
 ) -> list:
     """
     ONE generate_json call for exactly the levels/counts in `level_counts`
@@ -628,8 +644,11 @@ def _generate_and_validate_questions(
     _build_quiz_prompt/_validate_quiz_questions, and switch the structured-
     output schema to PAPER_QUIZ_SCHEMA (marks/marking_scheme required)
     instead of QUIZ_SCHEMA. Omitted entirely, this behaves exactly as before.
+    `avoid_verbs` -- see _bloom_level_prompt_block; forwarded as-is.
     """
-    prompt = _build_quiz_prompt(topic, top_pages, level_counts, recent_questions, marks_by_level, paper_kind)
+    prompt = _build_quiz_prompt(
+        topic, top_pages, level_counts, recent_questions, marks_by_level, paper_kind, avoid_verbs
+    )
     schema = PAPER_QUIZ_SCHEMA if marks_by_level else QUIZ_SCHEMA
     result = llm.generate_json(prompt, schema=schema)
     raw_questions = result.get("questions", []) if isinstance(result, dict) else []
@@ -732,6 +751,56 @@ def _check_and_fix_bloom_levels(
             else:
                 questions[i]["bloom_check"] = "flagged"
                 questions[i]["detected_level"] = detected
+
+    return questions
+
+
+def _apply_verb_guard(
+    questions: list, topic: str, top_pages, drop_log: list = None, recent_questions: list = None,
+    marks_by_level: dict = None, paper_kind: str = "written"
+) -> list:
+    """
+    Exam papers only (Phase 5 fixes from browser testing, item 5): a cheap
+    lexical sanity check run on every freshly-written paper question,
+    BEFORE the slower Gemini-based checker in _check_and_fix_bloom_levels
+    gets a turn. bloom.classify_by_verbs() catches the writer having
+    opened a question with a verb that unambiguously belongs to a
+    different level than the slot it was written for -- e.g. "Propose a
+    new scheme..." (a Create verb) landing in an Apply slot. A caught
+    question is regenerated ONCE, with an extra prompt instruction naming
+    the exact verb to avoid (see _bloom_level_prompt_block's avoid_verbs);
+    if nothing usable comes back (busy AI, or the replacement doesn't
+    survive validation), the original question is kept as-is -- the
+    Gemini-based checker downstream still gets a chance to catch/flag it.
+    Mutates and returns `questions`.
+    """
+    mismatches = {}
+    for i, q in enumerate(questions):
+        verb_hit = bloom.classify_by_verbs(q["question"])
+        if verb_hit["level"] and verb_hit["level"] != q["bloom_level"]:
+            mismatches.setdefault(q["bloom_level"], []).append((i, verb_hit["matched"]))
+
+    if not mismatches:
+        return questions
+
+    for level_key, entries in mismatches.items():
+        verbs_to_avoid = sorted({verb for _, verb in entries})
+        logger.info(
+            "Paper question verb guard: %d question(s) at level '%s' opened with verb(s) %s "
+            "typical of a different level -- regenerating once.",
+            len(entries), level_key, verbs_to_avoid
+        )
+        try:
+            replacements = _generate_and_validate_questions(
+                topic, top_pages, {level_key: len(entries)}, drop_log, recent_questions,
+                marks_by_level, paper_kind, avoid_verbs={level_key: verbs_to_avoid}
+            )
+        except llm.LLMUnavailableError:
+            replacements = []
+
+        for (i, _verb), replacement in zip(entries, replacements):
+            replacement["id"] = questions[i]["id"]
+            questions[i] = replacement
 
     return questions
 
@@ -2326,8 +2395,32 @@ def _question_source(db: Session, question: Question):
     return {"book_name": book.name, "page_number": page_number}
 
 
+def _question_papers_using(db: Session, question_id: int) -> list:
+    """
+    Papers that currently have a slot pointing at this question (Phase 5
+    fixes from browser testing, item 9a/9c) -- a question swapped or
+    regenerated out of every paper slot that once held it just comes back
+    empty here, it's never deleted or specially marked; a question used in
+    several papers at once (the same bank question swapped into more than
+    one) lists every one of them.
+    """
+    rows = (
+        db.query(Paper.id, Paper.title)
+        .join(PaperQuestion, PaperQuestion.paper_id == Paper.id)
+        .filter(PaperQuestion.question_id == question_id)
+        .distinct()
+        .all()
+    )
+    return [{"paper_id": pid, "title": title} for pid, title in rows]
+
+
 def _question_summary(db: Session, question: Question) -> dict:
     level = bloom.get_level(question.bloom_level)
+    # origin: a question written for a paper slot always carries `marks`
+    # (Phase 5B); a plain quiz question never does -- see Question's
+    # docstring in models.py. used_in_papers is about CURRENT usage, which
+    # can differ from origin (a paper-origin question swapped/regenerated
+    # out of every slot that held it is "paper"-origin but used nowhere).
     return {
         "question_id": question.id,
         "topic": question.topic,
@@ -2343,7 +2436,9 @@ def _question_summary(db: Session, question: Question) -> dict:
         "marks": question.marks,
         "marking_scheme": json.loads(question.marking_scheme) if question.marking_scheme else None,
         "created_at": question.created_at.isoformat(),
-        "source": _question_source(db, question)
+        "source": _question_source(db, question),
+        "origin": "paper" if question.marks is not None else "quiz",
+        "used_in_papers": _question_papers_using(db, question.id),
     }
 
 
@@ -2359,11 +2454,15 @@ def _get_owned_question_or_404(db: Session, question_id: int, user_id: int) -> Q
     return question
 
 
+QUESTION_SOURCE_FILTERS = ("quiz", "paper", "unused")
+
+
 @app.get("/questions")
 def list_questions(
     level: str | None = None,
     topic: str | None = None,
     check: str | None = None,
+    source: str | None = None,
     limit: int = 50,
     offset: int = 0,
     current_user: User = Depends(get_current_user),
@@ -2377,6 +2476,8 @@ def list_questions(
                 raise HTTPException(status_code=422, detail=f"Unknown Bloom's level: '{key}'")
     if check is not None and check not in QUESTION_CHECK_STATUSES:
         raise HTTPException(status_code=422, detail=f"Unknown check status: '{check}'")
+    if source is not None and source not in QUESTION_SOURCE_FILTERS:
+        raise HTTPException(status_code=422, detail=f"Unknown source filter: '{source}'")
     if not (1 <= limit <= 200):
         raise HTTPException(status_code=422, detail="limit must be between 1 and 200.")
     if offset < 0:
@@ -2389,6 +2490,19 @@ def list_questions(
         query = query.filter(Question.bloom_check == check)
     if topic is not None and topic.strip():
         query = query.filter(Question.topic.ilike(f"%{_escape_like(topic)}%", escape="\\"))
+    # source: "quiz"/"paper" is ORIGIN (whether this question was ever written
+    # for a paper slot, via the `marks` column -- see models.Question's
+    # docstring); "unused" is CURRENT usage (no paper_questions row points at
+    # it right now), which applies to quiz-origin questions too (never used
+    # in a paper to begin with) as well as a paper-origin one swapped out of
+    # every slot that held it (Phase 5 fixes from browser testing, item 9a).
+    if source == "quiz":
+        query = query.filter(Question.marks.is_(None))
+    elif source == "paper":
+        query = query.filter(Question.marks.isnot(None))
+    elif source == "unused":
+        used_subquery = db.query(PaperQuestion.question_id).filter(PaperQuestion.question_id.isnot(None))
+        query = query.filter(~Question.id.in_(used_subquery))
 
     total = query.count()
     rows = query.order_by(Question.created_at.desc()).offset(offset).limit(limit).all()
@@ -2514,6 +2628,32 @@ def update_question(
 
     db.commit()
     return _question_summary(db, question)
+
+
+@app.delete("/questions/unused")
+def delete_unused_questions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Deletes every one of the caller's bank questions not currently
+    referenced by any paper slot (Phase 5 fixes from browser testing, item
+    9b) -- the Question Bank's "Delete unused questions" cleanup button.
+    Quiz questions (never used in a paper to begin with) and a paper
+    question swapped/regenerated out of every slot that held it are both
+    "unused" by this definition; a question still used in even one paper
+    (including an old draft) is left untouched. Declared before
+    DELETE /questions/{question_id} so "unused" is never parsed as an id.
+    """
+    used_subquery = db.query(PaperQuestion.question_id).filter(PaperQuestion.question_id.isnot(None))
+    unused = db.query(Question).filter(
+        Question.user_id == current_user.id, ~Question.id.in_(used_subquery)
+    ).all()
+    deleted = len(unused)
+    for question in unused:
+        db.delete(question)
+    db.commit()
+    return {"deleted": deleted}
 
 
 @app.delete("/questions/{question_id}")
@@ -2830,11 +2970,15 @@ def _compute_blueprint_actual(db: Session, paper_row: Paper) -> dict:
     """
     Marks per level and per unit from the questions actually saved into
     this paper's slots so far. A flagged question (the independent
-    checker disagreed with its intended level) still counts at its
-    intended level here -- it's listed in `warnings` instead, matching
-    plan_paper's own "intended level" convention. Only one option of an
-    either_or pair is counted (marks_on_paper convention), same as
-    blueprint_target/blueprint_planned.
+    checker disagreed with its intended level) counts at its DETECTED
+    level here, not the intended one it was planned/written for -- unlike
+    blueprint_target/blueprint_planned, which both describe the PLAN and
+    so always use the intended level, "actual" is meant to show the real
+    mix of what's really on the paper right now (Phase 5 fixes from
+    browser testing, item 3); the mismatch itself is still listed in
+    `warnings` separately. Only one option of an either_or pair is
+    counted (marks_on_paper convention), same as blueprint_target/
+    blueprint_planned.
     """
     slots = (
         db.query(PaperQuestion)
@@ -2858,7 +3002,12 @@ def _compute_blueprint_actual(db: Session, paper_row: Paper) -> dict:
             question = questions_by_id.get(slot.question_id)
             if not question:
                 continue
-            by_level[question.bloom_level] = by_level.get(question.bloom_level, 0) + slot.marks
+            effective_level = (
+                question.detected_level
+                if question.bloom_check == "flagged" and question.detected_level
+                else question.bloom_level
+            )
+            by_level[effective_level] = by_level.get(effective_level, 0) + slot.marks
             if slot.book_id is not None:
                 by_unit[slot.book_id] = by_unit.get(slot.book_id, 0) + slot.marks
 
@@ -3456,6 +3605,9 @@ def _generate_one_question_for_slot(
     questions = _generate_and_validate_questions(
         topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
     )
+    questions = _apply_verb_guard(
+        questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+    )
     questions = _check_and_fix_bloom_levels(
         questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
     )
@@ -3533,6 +3685,9 @@ def generate_paper(db: Session, paper_row: Paper) -> None:
         questions = call_patiently(lambda: _generate_and_validate_questions(
             topic, top_pages, level_counts, drop_log, recent_questions, marks_by_level, pattern.paper_kind
         ))
+        questions = _apply_verb_guard(
+            questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
+        )
         questions = _check_and_fix_bloom_levels(
             questions, topic, top_pages, drop_log, recent_questions, marks_by_level, pattern.paper_kind
         )
