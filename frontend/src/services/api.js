@@ -150,15 +150,21 @@ async function request(endpoint, options = {}) {
     data = await response.json();
   } catch (jsonErr) {
     if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}`, { cause: jsonErr });
+      throw Object.assign(new Error(`Request failed with status ${response.status}`, { cause: jsonErr }), {
+        status: response.status
+      });
     }
     throw new Error('Failed to parse server response.', { cause: jsonErr });
   }
-  
+
   if (!response.ok) {
-    throw new Error(data.detail || `Request failed with status ${response.status}`);
+    // `status` lets a caller branch on a specific code (e.g. 409 "already
+    // done") without parsing the message text -- see analyticsImport.js.
+    throw Object.assign(new Error(data.detail || `Request failed with status ${response.status}`), {
+      status: response.status
+    });
   }
-  
+
   return data;
 }
 
@@ -660,6 +666,68 @@ export const api = {
       link.remove();
       URL.revokeObjectURL(url);
     },
+  },
+
+  analytics: {
+    /**
+     * GET /analytics/summary?days=7|30|90&tz=<IANA> -- totals, per-day
+     * query/active-time buckets, accuracy by Bloom's level, topics/weak
+     * topics, recent quiz attempts, and paper_coverage. `tz` defaults to
+     * the browser's own timezone so day buckets line up with the user's
+     * real calendar days, not UTC's.
+     */
+    summary: (days = 30, tz = Intl.DateTimeFormat().resolvedOptions().timeZone) => {
+      const params = new URLSearchParams({ days: String(days), tz });
+      return request(`/analytics/summary?${params.toString()}`);
+    },
+
+    /**
+     * POST /analytics/active-time {seconds} -- a heartbeat for real
+     * "actively using the app" time (1-120s per call); rate-limited
+     * 4/minute server-side.
+     */
+    activeTime: (seconds) => request('/analytics/active-time', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seconds }),
+    }),
+
+    /**
+     * POST /analytics/quiz-attempts {topic, answers: [{question_id?,
+     * bloom_level?, question_type, is_correct, self_graded}]} -- one
+     * entry per question; the server computes correct/total itself.
+     */
+    quizAttempt: (body) => request('/analytics/quiz-attempts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
+    /**
+     * POST /analytics/import?tz=<IANA> {queries_by_day, active_seconds_by_day,
+     * quiz_history} -- one-time migration of this browser's pre-Phase-6A
+     * localStorage history. 409s if this account already imported, from
+     * any browser -- see utils/analyticsImport.js, the only caller.
+     */
+    import: (body, tz = Intl.DateTimeFormat().resolvedOptions().timeZone) => {
+      const params = new URLSearchParams({ tz });
+      return request(`/analytics/import?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    },
+
+    /**
+     * GET /analytics/import-status -- {imported: bool}.
+     */
+    importStatus: () => request('/analytics/import-status'),
+
+    /**
+     * DELETE /analytics -- wipes this user's activity events and quiz
+     * attempts; documents, bank questions, and papers are untouched.
+     */
+    remove: () => request('/analytics', { method: 'DELETE' }),
   },
 
   tools: {

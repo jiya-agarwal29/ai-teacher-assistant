@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { api, userScopedKey } from '../services/api';
+import { api } from '../services/api';
 import { useAuth } from '../hooks/useAuth';
 import DocumentStatusBadge from '../components/DocumentStatusBadge';
 import {
@@ -47,21 +47,28 @@ export default function Home() {
       const data = await api.books.getAll();
       setBooks(data || []);
       setLoadError('');
-
-      // Load query/quiz count from localStorage to make stats interactive and persist
-      const queriesCount = parseInt(localStorage.getItem(userScopedKey('queries_count')) || '0');
-      const quizCount = parseInt(localStorage.getItem(userScopedKey('quiz_count')) || '0');
-
-      setStats({
-        documents: data ? data.length : 0,
-        queries: queriesCount,
-        quizzes: quizCount
-      });
+      setStats((prev) => ({ ...prev, documents: data ? data.length : 0 }));
     } catch (error) {
       console.error('Failed to load books for dashboard:', error);
       setLoadError(error.message || 'Could not reach the backend. Please make sure the server is running.');
     } finally {
       setIsLoading(false);
+    }
+  }, []);
+
+  // Real queries/quizzes-taken counts, from the server (Phase 6B) --
+  // never localStorage, which a client could edit and which never
+  // survived switching browsers anyway.
+  const loadStats = useCallback(async () => {
+    try {
+      const summary = await api.analytics.summary(7);
+      setStats((prev) => ({
+        ...prev,
+        queries: summary.totals.queries,
+        quizzes: summary.totals.quizzes_taken
+      }));
+    } catch (error) {
+      console.error('Failed to load analytics summary for dashboard:', error);
     }
   }, []);
 
@@ -71,12 +78,12 @@ export default function Home() {
     let ignore = false;
     (async () => {
       if (ignore) return;
-      await loadBooks();
+      await Promise.all([loadBooks(), loadStats()]);
     })();
     return () => {
       ignore = true;
     };
-  }, [loadBooks]);
+  }, [loadBooks, loadStats]);
 
   // Polls GET /books/{id}/status for every book still "processing", every
   // STATUS_POLL_INTERVAL_MS, until it reaches "ready"/"failed". Runs once

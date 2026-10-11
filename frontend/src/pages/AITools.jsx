@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
-import { recordQuizAttempt } from '../hooks/useQuizHistory';
 import useBloomLevels from '../hooks/useBloomLevels';
 import { getBloomColor } from '../utils/bloomColors';
 import MessageWithDocsLink from '../components/MessageWithDocsLink';
@@ -21,6 +20,11 @@ import {
   ChevronRight,
   BookMarked
 } from 'lucide-react';
+
+// Types the student grades themselves (no single correct letter/text to
+// compare against) -- shared by isCorrectAnswer() and the analytics
+// payload built on submit, so both agree on what "self_graded" means.
+const SELF_GRADED_TYPES = ['short_answer', 'long_answer', 'scenario', 'viva', 'interview'];
 
 // Shared by calculateScore() and the inline ✅/❌ display so both agree on
 // what counts as a correct fill-in-the-blank answer. Ignores a leading
@@ -205,7 +209,7 @@ export default function AITools() {
       return selectedAnswers[q.id] === q.correctAnswer;
     } else if (q.type === 'fill_blank') {
       return normalizeFillBlankAnswer(fillBlankAnswers[q.id]) === normalizeFillBlankAnswer(q.correctAnswer);
-    } else if (['short_answer', 'long_answer', 'scenario', 'viva', 'interview'].includes(q.type)) {
+    } else if (SELF_GRADED_TYPES.includes(q.type)) {
       return shortAnswerGrades[q.id] === 'correct';
     }
     return false;
@@ -339,11 +343,6 @@ export default function AITools() {
         const parsed = parseQuizText(res.quiz);
         setQuizQuestions(parsed);
       }
-
-      // Increment local stats count
-      const quizCountKey = userScopedKey('quiz_count');
-      const currentQuizCount = parseInt(localStorage.getItem(quizCountKey) || '0');
-      localStorage.setItem(quizCountKey, (currentQuizCount + 1).toString());
     } catch (err) {
       setError(err.message || 'Failed to generate quiz. Is the backend running?');
     } finally {
@@ -675,12 +674,18 @@ export default function AITools() {
                           onClick={() => {
                             const result = calculateScore();
                             if (result.totalCount > 0) {
-                              recordQuizAttempt({
+                              // Fire-and-forget -- a failed analytics call must
+                              // never block the student from seeing their score.
+                              api.analytics.quizAttempt({
                                 topic: quizTopic,
-                                correct: result.correctCount,
-                                total: result.totalCount,
-                                byLevel: getScoreByLevel()
-                              });
+                                answers: quizQuestions.map((q) => ({
+                                  question_id: q.question_id,
+                                  bloom_level: q.bloom_level || undefined,
+                                  question_type: q.type || 'unknown',
+                                  is_correct: isCorrectAnswer(q),
+                                  self_graded: SELF_GRADED_TYPES.includes(q.type)
+                                }))
+                              }).catch(() => {});
                             }
                             setSubmittedQuiz(true);
                           }}

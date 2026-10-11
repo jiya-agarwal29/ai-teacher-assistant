@@ -1,16 +1,21 @@
 import { Outlet } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import SessionExpiryModal from './SessionExpiryModal';
+import ImportedActivityToast from './ImportedActivityToast';
 import AnimatedBackground from '../AnimatedBackground';
 import { useActiveTimeTracker } from '../hooks/useActiveTime';
 import { useAuth } from '../hooks/useAuth';
 
 export default function PageLayout({ darkMode, setDarkMode }) {
-  // Accumulates real "study session" time — only while the tab is visible
-  // and the user has interacted recently, not just left the screen on.
+  // Reports real "study session" time to the server — only while the tab
+  // is visible and the user has interacted recently, not just left the
+  // screen on.
   useActiveTimeTracker();
 
-  const { showSessionWarning, sessionExpiresAt, refreshSession, logout } = useAuth();
+  const {
+    showSessionWarning, sessionExpiresAt, refreshSession, logout,
+    showImportedToast, dismissImportedToast
+  } = useAuth();
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-cyan-100 dark:bg-slate-950 text-slate-700 dark:text-slate-300 theme-transition print:h-auto print:w-auto print:overflow-visible print:bg-white">
@@ -32,6 +37,8 @@ export default function PageLayout({ darkMode, setDarkMode }) {
       {showSessionWarning && (
         <SessionExpiryModal expiresAt={sessionExpiresAt} onStayLoggedIn={refreshSession} onLogout={logout} />
       )}
+
+      {showImportedToast && <ImportedActivityToast onDismiss={dismissImportedToast} />}
     </div>
   );
 }

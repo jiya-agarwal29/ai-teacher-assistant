@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
-import { recordQuery } from '../hooks/useQueryHistory';
 import { useDraftPersistence } from '../hooks/useDraftPersistence';
 import MessageWithDocsLink from '../components/MessageWithDocsLink';
 import {
@@ -154,11 +153,9 @@ export default function Chat() {
     setError('');
 
     try {
-      // API call to backend /chat?question=...
+      // API call to backend /chat?question=... -- the server logs this
+      // query for Analytics itself now (Phase 6A), no client-side record.
       const res = await api.chat.send(queryText);
-
-      // Record real usage for Analytics (total + per-day breakdown)
-      recordQuery();
 
       // Add assistant response
       const finalMessages = [
