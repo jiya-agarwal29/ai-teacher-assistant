@@ -9,7 +9,9 @@ import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
@@ -43,7 +45,10 @@ from retrieval import retrieve, invalidate_cache, user_has_documents, user_has_a
 
 import database
 from database import engine, get_db
-from models import Base, Book, DocumentPage, Page, Question, Paper, PaperQuestion, User
+from models import (
+    Base, Book, DocumentPage, Page, Question, Paper, PaperQuestion, User,
+    ActivityEvent, QuizAttempt, QuizAnswer
+)
 
 from auth import (
     create_access_token,
@@ -1641,6 +1646,8 @@ def semantic_search(
 
     top_pages = _retrieve_or_503(db, current_user.id, query, top_k=3, apply_threshold=False)
 
+    _log_activity(db, current_user.id, "tool", meta={"tool": "semantic_search"})
+
     return [
         {
             "book_id": page.book_id,
@@ -1678,6 +1685,7 @@ def _answer_question(question: str, current_user: User, db: Session):
     # Relevance checking using both cosine similarity and lexical overlap
     temp_context = " ".join([page.content for _, page in top_pages])
     if not top_pages or not check_context_relevance(question, temp_context, top_pages[0][0]):
+        _log_activity(db, current_user.id, "query")
         return {
             "question": question,
             "answer": "The uploaded documents do not contain enough information for this question.",
@@ -1717,12 +1725,14 @@ def _answer_question(question: str, current_user: User, db: Session):
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
     if not answer or "do not contain enough information" in answer.lower():
+        _log_activity(db, current_user.id, "query")
         return {
             "question": question,
             "answer": "The uploaded documents do not contain enough information for this question.",
             "sources": []
         }
 
+    _log_activity(db, current_user.id, "query")
     return {
         "question": question,
         "answer": answer,
@@ -1749,7 +1759,8 @@ def chat_with_pdf(
 def summarize_notes(
     request: Request,
     payload: SummarizeRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
     text = payload.text.strip()
 
@@ -1777,6 +1788,7 @@ def summarize_notes(
     except llm.LLMUnavailableError:
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
+    _log_activity(db, current_user.id, "tool", meta={"tool": "summarize"})
     return {"bullets": bullets}
 
 
@@ -1875,6 +1887,8 @@ def generate_flashcards(
 
     except llm.LLMUnavailableError:
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+    _log_activity(db, current_user.id, "tool", meta={"tool": "flashcards"})
 
     if not cards:
         return {"cards": [], "message": "No relevant content found in your documents for this topic."}
@@ -2350,6 +2364,8 @@ def generate_ai_quiz(
     actual_level_counts = {}
     for q in questions:
         actual_level_counts[q["bloom_level"]] = actual_level_counts.get(q["bloom_level"], 0) + 1
+
+    _log_activity(db, current_user.id, "quiz_generated")
 
     return {
         "topic": topic,
@@ -3810,6 +3826,7 @@ def generate_paper(db: Session, paper_row: Paper) -> None:
     paper_row.status = "ready"
     paper_row.warnings = json.dumps(warnings)
     db.commit()
+    _log_activity(db, paper_row.user_id, "paper_generated")
 
 
 @app.patch("/papers/{paper_id}/slots/{slot_id}")
@@ -4005,3 +4022,536 @@ def export_paper(
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+
+# -----------------------------
+# PHASE 6A: ANALYTICS
+# -----------------------------
+def _log_activity(db: Session, user_id: int, kind: str, value: int = 1, meta: dict = None) -> None:
+    """
+    Records one ActivityEvent -- called only after the real work of a
+    request has already succeeded (see each call site below), so these
+    numbers reflect genuine usage and can't be inflated from the browser.
+    A logging failure must never take the response down with it: caught
+    here and logged as a warning instead of propagating, per the Phase 6A
+    spec ("Logging must never break the request").
+    """
+    try:
+        db.add(ActivityEvent(
+            user_id=user_id, kind=kind, value=value,
+            meta=json.dumps(meta) if meta else None,
+        ))
+        db.commit()
+    except Exception:
+        logger.warning("Failed to log activity event (kind=%s, user_id=%s)", kind, user_id, exc_info=True)
+
+
+DEFAULT_ANALYTICS_TZ = "Asia/Kolkata"
+ANALYTICS_SUMMARY_DAY_CHOICES = (7, 30, 90)
+ACTIVE_TIME_MIN_SECONDS = 1
+ACTIVE_TIME_MAX_SECONDS = 120
+MIN_QUIZ_ATTEMPT_ANSWERS = 1
+MAX_QUIZ_ATTEMPT_ANSWERS = 50
+MAX_IMPORT_DAYS = 400
+MAX_IMPORT_QUIZ_ENTRIES = 1000
+MAX_IMPORT_QUERIES_PER_DAY = 2000
+MAX_IMPORT_SECONDS_PER_DAY = 86400
+
+
+def _resolve_timezone(tz_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        raise HTTPException(status_code=422, detail=f"Unknown timezone: '{tz_name}'")
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """
+    A datetime read back from SQLite always comes back naive (tzinfo
+    stripped by the round-trip) even though every created_at default
+    saved it as datetime.now(timezone.utc) -- so "naive" here always
+    means "UTC wall-clock time", and this just reattaches that tzinfo so
+    it can be converted to a user's real timezone.
+    """
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=dt_timezone.utc)
+
+
+def _local_date_key(dt: datetime, tz: ZoneInfo) -> str:
+    return _as_utc(dt).astimezone(tz).date().isoformat()
+
+
+def _today_local(tz: ZoneInfo):
+    return datetime.now(dt_timezone.utc).astimezone(tz).date()
+
+
+def _day_keys(days: int, tz: ZoneInfo) -> list:
+    """Oldest-first list of local 'YYYY-MM-DD' date keys for the last `days` days, ending today."""
+    today = _today_local(tz)
+    return [(today - timedelta(days=offset)).isoformat() for offset in range(days - 1, -1, -1)]
+
+
+def _window_start_utc(days: int, tz: ZoneInfo) -> datetime:
+    """The naive-UTC instant of local midnight, `days - 1` days before today, in `tz` -- the inclusive start of the summary window."""
+    start_date = _today_local(tz) - timedelta(days=days - 1)
+    start_local = datetime(start_date.year, start_date.month, start_date.day, tzinfo=tz)
+    return start_local.astimezone(dt_timezone.utc).replace(tzinfo=None)
+
+
+def _noon_utc_naive(local_day, tz: ZoneInfo) -> datetime:
+    """
+    Noon local time on `local_day`, converted to naive UTC for storage --
+    used only by POST /analytics/import, which has no real time-of-day for
+    an old day-bucketed count, just a date. Noon (rather than midnight)
+    keeps it safely inside the same UTC calendar day across any realistic
+    timezone offset, so _local_date_key() always buckets it back onto the
+    same local day it was imported for.
+    """
+    local_noon = datetime(local_day.year, local_day.month, local_day.day, 12, 0, tzinfo=tz)
+    return local_noon.astimezone(dt_timezone.utc).replace(tzinfo=None)
+
+
+def _compute_paper_coverage(db: Session, user_id: int) -> dict:
+    """
+    Marks per Bloom level across every one of this user's READY papers
+    (not time-windowed -- a paper's coverage is a structural property of
+    the paper, not a recent-activity metric). A flagged question counts
+    at its detected level, not its intended one, matching main.
+    _compute_blueprint_actual's same "show the real mix" rule -- just
+    aggregated across every ready paper instead of just one. Only one
+    option of an either_or pair is counted (marks_on_paper convention).
+    """
+    ready_paper_ids = [
+        pid for (pid,) in
+        db.query(Paper.id).filter(Paper.user_id == user_id, Paper.status == "ready").all()
+    ]
+
+    by_level = {level: 0 for level in bloom.level_keys()}
+    if ready_paper_ids:
+        slots = (
+            db.query(PaperQuestion)
+            .filter(
+                PaperQuestion.paper_id.in_(ready_paper_ids),
+                PaperQuestion.question_id.isnot(None),
+                or_(PaperQuestion.option.is_(None), PaperQuestion.option == "a")
+            )
+            .all()
+        )
+        question_ids = [s.question_id for s in slots]
+        questions_by_id = {
+            q.id: q for q in db.query(Question).filter(Question.id.in_(question_ids)).all()
+        } if question_ids else {}
+        for slot in slots:
+            question = questions_by_id.get(slot.question_id)
+            if not question:
+                continue
+            effective_level = (
+                question.detected_level
+                if question.bloom_check == "flagged" and question.detected_level
+                else question.bloom_level
+            )
+            by_level[effective_level] = by_level.get(effective_level, 0) + slot.marks
+
+    return {"by_level": by_level, "papers": len(ready_paper_ids)}
+
+
+class ActiveTimeRequest(BaseModel):
+    seconds: int
+
+
+class QuizAnswerPayload(BaseModel):
+    question_id: int | None = None
+    bloom_level: str | None = None
+    question_type: str
+    is_correct: bool
+    self_graded: bool
+
+
+class QuizAttemptRequest(BaseModel):
+    topic: str
+    answers: list[QuizAnswerPayload]
+
+
+class ImportQuizHistoryEntry(BaseModel):
+    topic: str = "General"
+    correct: int
+    total: int
+    timestamp: float  # ms since epoch (JS Date.now()), per the old localStorage shape
+    byLevel: dict[str, dict] | None = None
+
+
+class AnalyticsImportRequest(BaseModel):
+    queries_by_day: dict[str, int] = {}
+    active_seconds_by_day: dict[str, int] = {}
+    quiz_history: list[ImportQuizHistoryEntry] = []
+
+
+@app.post("/analytics/active-time")
+@limiter.limit("4/minute", key_func=_user_rate_limit_key)
+def record_active_time(
+    request: Request,
+    payload: ActiveTimeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not (ACTIVE_TIME_MIN_SECONDS <= payload.seconds <= ACTIVE_TIME_MAX_SECONDS):
+        raise HTTPException(
+            status_code=422,
+            detail=f"seconds must be between {ACTIVE_TIME_MIN_SECONDS} and {ACTIVE_TIME_MAX_SECONDS}."
+        )
+    db.add(ActivityEvent(user_id=current_user.id, kind="active_seconds", value=payload.seconds))
+    db.commit()
+    return {"status": "recorded"}
+
+
+@app.post("/analytics/quiz-attempts")
+@limiter.limit("10/minute", key_func=_user_rate_limit_key)
+def record_quiz_attempt(
+    request: Request,
+    payload: QuizAttemptRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not (MIN_QUIZ_ATTEMPT_ANSWERS <= len(payload.answers) <= MAX_QUIZ_ATTEMPT_ANSWERS):
+        raise HTTPException(
+            status_code=422,
+            detail=f"answers must have between {MIN_QUIZ_ATTEMPT_ANSWERS} and {MAX_QUIZ_ATTEMPT_ANSWERS} entries."
+        )
+    for ans in payload.answers:
+        if ans.bloom_level is not None and not bloom.is_valid_level(ans.bloom_level):
+            raise HTTPException(status_code=422, detail=f"Unknown Bloom's level: '{ans.bloom_level}'")
+        if not ans.question_type or not ans.question_type.strip():
+            raise HTTPException(status_code=422, detail="question_type cannot be empty.")
+
+    topic = (payload.topic or "General").strip() or "General"
+    correct = sum(1 for ans in payload.answers if ans.is_correct)
+    total = len(payload.answers)
+
+    attempt = QuizAttempt(user_id=current_user.id, topic=topic, correct=correct, total=total)
+    db.add(attempt)
+    db.flush()
+
+    for ans in payload.answers:
+        question_id = ans.question_id
+        if question_id is not None:
+            owned = db.query(Question.id).filter(
+                Question.id == question_id, Question.user_id == current_user.id
+            ).first()
+            if not owned:
+                question_id = None  # not this user's question -- ignore it rather than 404
+        db.add(QuizAnswer(
+            attempt_id=attempt.id, question_id=question_id, bloom_level=ans.bloom_level,
+            question_type=ans.question_type.strip(), is_correct=ans.is_correct, self_graded=ans.self_graded,
+        ))
+
+    db.commit()
+    return {"attempt_id": attempt.id, "topic": topic, "correct": correct, "total": total}
+
+
+@app.get("/analytics/summary")
+def get_analytics_summary(
+    days: int = 30,
+    tz: str = DEFAULT_ANALYTICS_TZ,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if days not in ANALYTICS_SUMMARY_DAY_CHOICES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"days must be one of {ANALYTICS_SUMMARY_DAY_CHOICES} (got {days})."
+        )
+    user_tz = _resolve_timezone(tz)
+
+    window_start = _window_start_utc(days, user_tz)
+    day_keys = _day_keys(days, user_tz)
+
+    events = (
+        db.query(ActivityEvent)
+        .filter(ActivityEvent.user_id == current_user.id, ActivityEvent.created_at >= window_start)
+        .all()
+    )
+
+    queries_by_day = {key: 0 for key in day_keys}
+    active_seconds_by_day = {key: 0 for key in day_keys}
+    totals_queries = 0
+    totals_tools = 0
+    totals_quiz_generated = 0
+    totals_active_seconds = 0
+
+    for event in events:
+        if event.kind == "query":
+            totals_queries += event.value
+            day_key = _local_date_key(event.created_at, user_tz)
+            if day_key in queries_by_day:
+                queries_by_day[day_key] += event.value
+        elif event.kind == "tool":
+            totals_tools += event.value
+        elif event.kind == "quiz_generated":
+            totals_quiz_generated += event.value
+        elif event.kind == "active_seconds":
+            totals_active_seconds += event.value
+            day_key = _local_date_key(event.created_at, user_tz)
+            if day_key in active_seconds_by_day:
+                active_seconds_by_day[day_key] += event.value
+        # "paper_generated" isn't surfaced as its own total here -- it's
+        # recorded (item 4) for completeness/future use; paper_coverage
+        # below already reports on the user's ready papers directly.
+
+    # --- Quiz attempts in this window ---
+    attempts = (
+        db.query(QuizAttempt)
+        .filter(QuizAttempt.user_id == current_user.id, QuizAttempt.created_at >= window_start)
+        .all()
+    )
+    quizzes_taken = len(attempts)
+    average_score_pct = (
+        round(
+            sum((a.correct / a.total) * 100 for a in attempts if a.total > 0) / quizzes_taken, 1
+        ) if quizzes_taken > 0 else None
+    )
+
+    accuracy_by_level = {level: {"correct": 0, "total": 0, "pct": None} for level in bloom.level_keys()}
+    topics_map = {}
+    if attempts:
+        attempt_ids = [a.id for a in attempts]
+        answers = db.query(QuizAnswer).filter(QuizAnswer.attempt_id.in_(attempt_ids)).all()
+        for ans in answers:
+            if not ans.bloom_level or ans.bloom_level not in accuracy_by_level:
+                continue
+            accuracy_by_level[ans.bloom_level]["total"] += 1
+            if ans.is_correct:
+                accuracy_by_level[ans.bloom_level]["correct"] += 1
+        for level_stats in accuracy_by_level.values():
+            if level_stats["total"] > 0:
+                level_stats["pct"] = round(level_stats["correct"] / level_stats["total"] * 100, 1)
+
+        for a in attempts:
+            key = a.topic.strip().lower() or "general"
+            entry = topics_map.setdefault(
+                key, {"topic": a.topic, "attempts": 0, "_pct_sum": 0.0, "last_attempt_at": None}
+            )
+            entry["attempts"] += 1
+            # Mean of each attempt's own percentage (not a totals-weighted
+            # average), matching totals.average_score_pct's same "mean of
+            # attempt %" rule -- a 2-question quiz and a 20-question quiz
+            # count equally toward a topic's average either way.
+            entry["_pct_sum"] += (a.correct / a.total * 100) if a.total > 0 else 0.0
+            if entry["last_attempt_at"] is None or a.created_at > entry["last_attempt_at"]:
+                entry["last_attempt_at"] = a.created_at
+                entry["topic"] = a.topic  # keep the most recently-used casing/spelling
+
+    topics = []
+    for entry in topics_map.values():
+        average_pct = round(entry["_pct_sum"] / entry["attempts"], 1) if entry["attempts"] > 0 else 0.0
+        topics.append({
+            "topic": entry["topic"],
+            "attempts": entry["attempts"],
+            "average_pct": average_pct,
+            "last_attempt_at": _as_utc(entry["last_attempt_at"]).isoformat(),
+        })
+
+    weak_topics = sorted(
+        (t for t in topics if t["attempts"] >= 2 and t["average_pct"] < 60),
+        key=lambda t: t["average_pct"]
+    )[:5]
+
+    recent_rows = (
+        db.query(QuizAttempt)
+        .filter(QuizAttempt.user_id == current_user.id)
+        .order_by(QuizAttempt.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    recent_attempts = [
+        {
+            "topic": a.topic, "correct": a.correct, "total": a.total,
+            "pct": round(a.correct / a.total * 100, 1) if a.total > 0 else 0.0,
+            "created_at": _as_utc(a.created_at).isoformat(),
+        }
+        for a in recent_rows
+    ]
+
+    documents_ready = db.query(Book).filter(Book.user_id == current_user.id, Book.status == "ready").count()
+    questions_in_bank = db.query(Question).filter(Question.user_id == current_user.id).count()
+    papers_ready = db.query(Paper).filter(Paper.user_id == current_user.id, Paper.status == "ready").count()
+
+    return {
+        "days": days,
+        "tz": tz,
+        "totals": {
+            "queries": totals_queries,
+            "tools_used": totals_tools,
+            "quizzes_generated": totals_quiz_generated,
+            "quizzes_taken": quizzes_taken,
+            "average_score_pct": average_score_pct,
+            "active_seconds": totals_active_seconds,
+            "documents_ready": documents_ready,
+            "questions_in_bank": questions_in_bank,
+            "papers_ready": papers_ready,
+        },
+        "queries_by_day": [{"date": k, "count": queries_by_day[k]} for k in day_keys],
+        "active_seconds_by_day": [{"date": k, "seconds": active_seconds_by_day[k]} for k in day_keys],
+        "accuracy_by_level": accuracy_by_level,
+        "topics": topics,
+        "weak_topics": weak_topics,
+        "recent_attempts": recent_attempts,
+        "paper_coverage": _compute_paper_coverage(db, current_user.id),
+    }
+
+
+@app.get("/analytics/import-status")
+def get_analytics_import_status(current_user: User = Depends(get_current_user)):
+    return {"imported": current_user.analytics_imported_at is not None}
+
+
+@app.post("/analytics/import")
+def import_analytics(
+    payload: AnalyticsImportRequest,
+    tz: str = DEFAULT_ANALYTICS_TZ,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    One-time import of a user's pre-Phase-6A, browser-only (localStorage)
+    analytics history -- see hooks/useQueryHistory.js, useActiveTime.js,
+    and useQuizHistory.js on the frontend for the exact shape this mirrors.
+    Day-bucketed counts (no real time-of-day) are stored as one
+    ActivityEvent dated at local noon on that day, so _local_date_key()
+    always buckets them back onto the same day; quiz_history entries
+    already carry a real timestamp and keep it. 409s on a second attempt
+    -- analytics_imported_at is set here and never cleared by DELETE
+    /analytics, so the same old browser data can't be imported twice.
+    """
+    if current_user.analytics_imported_at is not None:
+        raise HTTPException(status_code=409, detail="Already imported")
+
+    user_tz = _resolve_timezone(tz)
+
+    if len(payload.queries_by_day) > MAX_IMPORT_DAYS:
+        raise HTTPException(status_code=422, detail=f"queries_by_day can have at most {MAX_IMPORT_DAYS} days.")
+    if len(payload.active_seconds_by_day) > MAX_IMPORT_DAYS:
+        raise HTTPException(
+            status_code=422, detail=f"active_seconds_by_day can have at most {MAX_IMPORT_DAYS} days."
+        )
+    if len(payload.quiz_history) > MAX_IMPORT_QUIZ_ENTRIES:
+        raise HTTPException(
+            status_code=422, detail=f"quiz_history can have at most {MAX_IMPORT_QUIZ_ENTRIES} entries."
+        )
+
+    today_local = _today_local(user_tz)
+    now_utc = datetime.now(dt_timezone.utc)
+
+    def _parse_day(date_str: str):
+        try:
+            parsed = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Invalid date '{date_str}' -- expected YYYY-MM-DD.")
+        if parsed > today_local:
+            raise HTTPException(status_code=422, detail=f"Date '{date_str}' is in the future.")
+        return parsed
+
+    events_to_add = []
+
+    for date_str, count in payload.queries_by_day.items():
+        if not isinstance(count, int) or not (0 <= count <= MAX_IMPORT_QUERIES_PER_DAY):
+            raise HTTPException(
+                status_code=422,
+                detail=f"queries_by_day['{date_str}'] must be between 0 and {MAX_IMPORT_QUERIES_PER_DAY}."
+            )
+        local_day = _parse_day(date_str)
+        if count > 0:
+            events_to_add.append(ActivityEvent(
+                user_id=current_user.id, kind="query", value=count,
+                created_at=_noon_utc_naive(local_day, user_tz),
+            ))
+
+    for date_str, seconds in payload.active_seconds_by_day.items():
+        if not isinstance(seconds, int) or not (0 <= seconds <= MAX_IMPORT_SECONDS_PER_DAY):
+            raise HTTPException(
+                status_code=422,
+                detail=f"active_seconds_by_day['{date_str}'] must be between 0 and {MAX_IMPORT_SECONDS_PER_DAY}."
+            )
+        local_day = _parse_day(date_str)
+        if seconds > 0:
+            events_to_add.append(ActivityEvent(
+                user_id=current_user.id, kind="active_seconds", value=seconds,
+                created_at=_noon_utc_naive(local_day, user_tz),
+            ))
+
+    attempts_to_add = []
+    for entry in payload.quiz_history:
+        if entry.total <= 0 or entry.correct < 0 or entry.correct > entry.total:
+            raise HTTPException(
+                status_code=422, detail="Each quiz_history entry needs total > 0 and 0 <= correct <= total."
+            )
+        try:
+            created_at_utc = datetime.fromtimestamp(entry.timestamp / 1000, tz=dt_timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            raise HTTPException(status_code=422, detail=f"Invalid timestamp {entry.timestamp!r}.")
+        if created_at_utc > now_utc:
+            raise HTTPException(status_code=422, detail="A quiz_history entry is dated in the future.")
+
+        attempt = QuizAttempt(
+            user_id=current_user.id, topic=(entry.topic or "General").strip() or "General",
+            correct=entry.correct, total=entry.total, created_at=created_at_utc.replace(tzinfo=None),
+        )
+        answers = []
+        if entry.byLevel:
+            for level, counts in entry.byLevel.items():
+                if not bloom.is_valid_level(level) or not isinstance(counts, dict):
+                    continue
+                level_correct = int(counts.get("correct") or 0)
+                level_total = int(counts.get("total") or 0)
+                # Only the aggregate (correct, total) survived in the old
+                # localStorage shape -- individual answers are
+                # reconstructed as `level_total` rows, the first
+                # `level_correct` of them marked correct. question_type
+                # is unknown for imported history, so it's recorded as
+                # "imported" rather than guessed.
+                for i in range(level_total):
+                    answers.append(QuizAnswer(
+                        bloom_level=level, question_type="imported",
+                        is_correct=(i < level_correct), self_graded=True,
+                    ))
+        attempts_to_add.append((attempt, answers))
+
+    for event in events_to_add:
+        db.add(event)
+    for attempt, answers in attempts_to_add:
+        attempt.answers = answers
+        db.add(attempt)
+
+    current_user.analytics_imported_at = datetime.now(dt_timezone.utc)
+    db.commit()
+
+    return {
+        "imported_days": len(set(payload.queries_by_day) | set(payload.active_seconds_by_day)),
+        "imported_quiz_attempts": len(attempts_to_add),
+    }
+
+
+@app.delete("/analytics")
+def delete_analytics(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Deletes this user's ActivityEvents and QuizAttempts (QuizAnswers
+    cascade with their attempt) -- documents, bank questions, and papers
+    are all left untouched. Deliberately does NOT clear
+    analytics_imported_at: that flag means "the one-time import already
+    happened", which stays true even after the imported data is wiped, so
+    the same old browser data can't be re-imported and double-counted.
+    Confirming with the user before calling this is the frontend's job.
+    """
+    db.query(ActivityEvent).filter(ActivityEvent.user_id == current_user.id).delete(synchronize_session=False)
+
+    attempt_ids = [
+        aid for (aid,) in
+        db.query(QuizAttempt.id).filter(QuizAttempt.user_id == current_user.id).all()
+    ]
+    if attempt_ids:
+        db.query(QuizAnswer).filter(QuizAnswer.attempt_id.in_(attempt_ids)).delete(synchronize_session=False)
+    db.query(QuizAttempt).filter(QuizAttempt.user_id == current_user.id).delete(synchronize_session=False)
+
+    db.commit()
+    return {"status": "Analytics data deleted successfully"}

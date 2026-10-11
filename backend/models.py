@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, Integer, String, Text, ForeignKey, DateTime
+from sqlalchemy import Boolean, Column, Index, Integer, String, Text, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -102,6 +102,12 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True)
     password = Column(String)
+
+    # Phase 6A: set the one time this user's old browser-only (localStorage)
+    # analytics history was imported via POST /analytics/import -- null
+    # means it never has been, and that endpoint is still available; a
+    # second import attempt 409s instead of double-counting old history.
+    analytics_imported_at = Column(DateTime, nullable=True)
 
 
 class Question(Base):
@@ -233,3 +239,76 @@ class PaperQuestion(Base):
 
     question_id = Column(Integer, ForeignKey("questions.id"), nullable=True)
     position = Column(Integer, nullable=False)  # the slot's order in the plan, for display
+
+
+class ActivityEvent(Base):
+    """
+    One recorded unit of real usage (Phase 6A), logged server-side only
+    (see main._log_activity) -- never accepted directly from a client
+    request body -- so a user can't inflate their own analytics. `kind`:
+      - "query": a /chat or /tools/tutor answer.
+      - "tool": /tools/summarize, /tools/flashcards, or /semantic-search;
+        `meta` is {"tool": "summarize" | "flashcards" | "semantic_search"}.
+      - "quiz_generated": a successful /generate-quiz call.
+      - "paper_generated": a paper's background generation job reaching
+        status "ready" (not "failed").
+      - "active_seconds": a POST /analytics/active-time heartbeat, or an
+        imported day-bucket from POST /analytics/import -- `value` is the
+        number of seconds, not 1.
+    `value` defaults to 1 so a plain SUM (not COUNT) works uniformly across
+    every kind -- "how many" for a count-like kind, "how many seconds" for
+    active_seconds.
+    """
+    __tablename__ = "activity_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    kind = Column(String, nullable=False)
+    value = Column(Integer, default=1, nullable=False)
+    meta = Column(Text, nullable=True)  # small JSON object, e.g. {"tool": "summarize"}
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_activity_events_user_created", "user_id", "created_at"),
+    )
+
+
+class QuizAttempt(Base):
+    """
+    One graded quiz result (Phase 6A): either a real submission (POST
+    /analytics/quiz-attempts, called once per quiz taken) or reconstructed
+    from a one-time import of old localStorage quiz history (POST
+    /analytics/import). correct/total are always computed server-side from
+    the submitted per-question answers, never trusted directly from the
+    client.
+    """
+    __tablename__ = "quiz_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    topic = Column(String, nullable=False)
+    correct = Column(Integer, nullable=False)
+    total = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+
+    answers = relationship("QuizAnswer", cascade="all, delete-orphan")
+
+
+class QuizAnswer(Base):
+    """
+    One answered question within a QuizAttempt. question_id points back at
+    the Question bank row when the quiz was a real AI-generated one (null
+    for an imported/legacy attempt, or any quiz with no tracked question
+    id); bloom_level is stored redundantly even when question_id is set,
+    since an imported attempt has a level (from the old byLevel breakdown)
+    but no question row to look it up from at all.
+    """
+    __tablename__ = "quiz_answers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    attempt_id = Column(Integer, ForeignKey("quiz_attempts.id"), index=True, nullable=False)
+    question_id = Column(Integer, ForeignKey("questions.id"), nullable=True)
+    bloom_level = Column(String, nullable=True)
+    question_type = Column(String, nullable=False)
+    is_correct = Column(Boolean, nullable=False)
+    self_graded = Column(Boolean, default=False, nullable=False)

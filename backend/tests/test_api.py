@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Dummy SECRET_KEY / GEMINI_API_KEY are set in tests/conftest.py (loaded
@@ -3950,3 +3951,624 @@ def test_import_paper_pattern_file_not_added_to_documents_and_deleted(client, ph
 
     assert "path" in captured
     assert not os.path.exists(captured["path"])  # deleted once the request finished
+
+
+# =============================
+# PHASE 6A: ANALYTICS
+# =============================
+@pytest.fixture(scope="session")
+def phase6a_headers(client):
+    main.limiter.reset()
+    _register(client, "phase6a_test_user", "phase6apass1")
+    return _auth_headers(client, "phase6a_test_user", "phase6apass1")
+
+
+@pytest.fixture(scope="session")
+def phase6a_other_headers(client):
+    main.limiter.reset()
+    _register(client, "phase6a_other_user", "phase6aopass1")
+    return _auth_headers(client, "phase6a_other_user", "phase6aopass1")
+
+
+_phase6a_fresh_user_counter = {"n": 0}
+
+
+def _fresh_phase6a_user(client):
+    """
+    A brand-new, never-touched account -- for any analytics test that
+    needs an exact/clean starting state (zero-day buckets, import's
+    one-time guard, paper_coverage, delete isolation) rather than relying
+    on before/after deltas against the shared phase6a_headers account.
+    """
+    _phase6a_fresh_user_counter["n"] += 1
+    username = f"phase6a_fresh_user_{_phase6a_fresh_user_counter['n']}"
+    password = "phase6afreshpass1"
+    main.limiter.reset()
+    _register(client, username, password)
+    return username, _auth_headers(client, username, password)
+
+
+def _user_id(username):
+    db = TestSessionLocal()
+    try:
+        return db.query(main.User).filter(main.User.username == username).first().id
+    finally:
+        db.close()
+
+
+def _count_events(user_id, kind):
+    db = TestSessionLocal()
+    try:
+        return db.query(main.ActivityEvent).filter(
+            main.ActivityEvent.user_id == user_id, main.ActivityEvent.kind == kind
+        ).count()
+    finally:
+        db.close()
+
+
+def _insert_event(user_id, kind, value=1, created_at=None, meta=None):
+    db = TestSessionLocal()
+    try:
+        db.add(main.ActivityEvent(
+            user_id=user_id, kind=kind, value=value,
+            meta=json.dumps(meta) if meta else None,
+            created_at=(created_at or datetime.now(timezone.utc)),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _insert_quiz_attempt(user_id, topic, correct, total, created_at=None, answers=None):
+    db = TestSessionLocal()
+    try:
+        attempt = main.QuizAttempt(
+            user_id=user_id, topic=topic, correct=correct, total=total,
+            created_at=(created_at or datetime.now(timezone.utc)),
+        )
+        db.add(attempt)
+        db.flush()
+        for ans in (answers or []):
+            db.add(main.QuizAnswer(attempt_id=attempt.id, **ans))
+        db.commit()
+        return attempt.id
+    finally:
+        db.close()
+
+
+# --- Item 4: automatic server-side logging on success, never on failure ---
+def test_chat_logs_query_event_on_success_not_on_failure(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    book_id = _upload_bees_doc(client, headers, "analytics_chat_bees.txt")
+    before = _count_events(user_id, "query")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200
+    assert _count_events(user_id, "query") == before + 1
+
+    def raise_unavailable(*a, **kw):
+        raise llm_module.LLMUnavailableError("boom")
+    monkeypatch.setattr(llm_module, "generate", raise_unavailable)
+    res2 = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res2.status_code == 503
+    assert _count_events(user_id, "query") == before + 1  # unchanged on failure
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_not_enough_information_still_logs_a_query(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    book_id = _upload_bees_doc(client, headers, "analytics_chat_noinfo.txt")
+    before = _count_events(user_id, "query")
+
+    monkeypatch.setattr(
+        llm_module, "generate",
+        lambda *a, **kw: "The uploaded documents do not contain enough information for this question."
+    )
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200
+    assert _count_events(user_id, "query") == before + 1
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_tutor_logs_query_event_on_success(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    book_id = _upload_bees_doc(client, headers, "analytics_tutor_bees.txt")
+    before = _count_events(user_id, "query")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.post("/tools/tutor", headers=headers, json={"question": "What do bees do?"})
+    assert res.status_code == 200
+    assert _count_events(user_id, "query") == before + 1
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_summarize_logs_tool_event_on_success_not_on_failure(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    before = _count_events(user_id, "tool")
+
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {"bullets": ["Point one.", "Point two."]}
+    )
+    res = client.post("/tools/summarize", headers=headers, json={"text": "Some text about photosynthesis."})
+    assert res.status_code == 200
+    assert _count_events(user_id, "tool") == before + 1
+
+    def raise_unavailable(*a, **kw):
+        raise llm_module.LLMUnavailableError("boom")
+    monkeypatch.setattr(llm_module, "generate_json", raise_unavailable)
+    res2 = client.post("/tools/summarize", headers=headers, json={"text": "Some other text here."})
+    assert res2.status_code == 503
+    assert _count_events(user_id, "tool") == before + 1  # unchanged on failure
+
+
+def test_flashcards_logs_tool_event_with_meta_on_success_not_on_failure(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    book_id = _upload_bees_doc(client, headers, "analytics_flash_bees.txt")
+    before = _count_events(user_id, "tool")
+
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {
+            "cards": [{"term": "Pollination", "definition": "x", "source_index": 1}]
+        }
+    )
+    res = client.post("/tools/flashcards", headers=headers, json={"topic": "bees"})
+    assert res.status_code == 200
+    assert _count_events(user_id, "tool") == before + 1
+
+    db = TestSessionLocal()
+    try:
+        latest = (
+            db.query(main.ActivityEvent)
+            .filter(main.ActivityEvent.user_id == user_id, main.ActivityEvent.kind == "tool")
+            .order_by(main.ActivityEvent.id.desc()).first()
+        )
+        assert json.loads(latest.meta) == {"tool": "flashcards"}
+    finally:
+        db.close()
+
+    def raise_unavailable(*a, **kw):
+        raise llm_module.LLMUnavailableError("boom")
+    monkeypatch.setattr(llm_module, "generate_json", raise_unavailable)
+    res2 = client.post("/tools/flashcards", headers=headers, json={"topic": "bees"})
+    assert res2.status_code == 503
+    assert _count_events(user_id, "tool") == before + 1  # unchanged on failure
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_semantic_search_logs_tool_event_on_success_not_on_failure(
+    client, llm_mock_headers, monkeypatch, real_embed_query
+):
+    import embeddings
+    import llm as llm_module
+    from google.genai import errors as genai_errors
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    book_id = _upload_bees_doc(client, headers, "analytics_search_bees.txt")
+    before = _count_events(user_id, "tool")
+
+    res = client.get("/semantic-search", headers=headers, params={"query": "bees"})
+    assert res.status_code == 200
+    assert _count_events(user_id, "tool") == before + 1
+
+    class _AlwaysRateLimitedModels:
+        def embed_content(self, **kwargs):
+            raise genai_errors.APIError(code=429, response_json={"message": "rate limited"}, response=None)
+
+    class _AlwaysRateLimitedClient:
+        models = _AlwaysRateLimitedModels()
+
+    monkeypatch.setattr(llm_module, "get_client", lambda: _AlwaysRateLimitedClient())
+    monkeypatch.setattr(embeddings, "embed_query", real_embed_query)
+    monkeypatch.setattr(embeddings.time, "sleep", lambda seconds: None)
+
+    res2 = client.get("/semantic-search", headers=headers, params={"query": "bees"})
+    assert res2.status_code == 503
+    assert _count_events(user_id, "tool") == before + 1  # unchanged on failure
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_logs_event_on_success_not_on_failure(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase4b_headers
+    user_id = _user_id("phase4b_test_user")
+    before = _count_events(user_id, "quiz_generated")
+
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "analytics_quiz_success.txt")
+    monkeypatch.setattr(llm_module, "generate_json", lambda prompt, schema, system=None: {"questions": []})
+    res = client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+    assert res.status_code == 200
+    assert len(res.json()["questions"]) > 0  # local hybrid fallback produced real questions
+    assert _count_events(user_id, "quiz_generated") == before + 1
+
+    main.limiter.reset()
+
+    def raise_unavailable(prompt, schema, system=None):
+        raise llm_module.LLMUnavailableError("boom")
+    monkeypatch.setattr(llm_module, "generate_json", raise_unavailable)
+    res2 = client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+    assert res2.status_code == 503
+    assert _count_events(user_id, "quiz_generated") == before + 1  # unchanged on failure
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_paper_generate_logs_event_only_when_it_reaches_ready(client, phase5b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase5b_headers
+    user_id = _user_id("phase5b_test_user")
+    before = _count_events(user_id, "paper_generated")
+
+    book_id = _upload_paper_doc(client, headers, "analytics_paper_generated.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Analytics Paper Generated")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    res = client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    assert res.status_code == 202
+    assert client.get(f"/papers/{paper_data['id']}", headers=headers).json()["status"] == "ready"
+    assert _count_events(user_id, "paper_generated") == before + 1
+
+
+def test_log_activity_failure_does_not_raise_and_logs_warning(monkeypatch, caplog):
+    db = TestSessionLocal()
+    try:
+        def raise_on_add(*a, **kw):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(db, "add", raise_on_add)
+        with caplog.at_level("WARNING"):
+            main._log_activity(db, 1, "query")  # must not raise
+        assert any("Failed to log activity event" in r.message for r in caplog.records)
+    finally:
+        db.close()
+
+
+# --- Item 5: heartbeat validation/rate limit ---
+def test_active_time_validates_seconds_and_rate_limits(client, phase6a_headers):
+    headers = phase6a_headers
+    main.limiter.reset()
+
+    assert client.post("/analytics/active-time", headers=headers, json={"seconds": 0}).status_code == 422
+    assert client.post("/analytics/active-time", headers=headers, json={"seconds": 121}).status_code == 422
+    assert client.post("/analytics/active-time", headers=headers, json={"seconds": 1}).status_code == 200
+    assert client.post("/analytics/active-time", headers=headers, json={"seconds": 120}).status_code == 200
+    # 4 requests already made this minute (2 rejected, 2 accepted -- both count) -- the 5th is rate-limited.
+    res = client.post("/analytics/active-time", headers=headers, json={"seconds": 30})
+    assert res.status_code == 429
+
+
+# --- Item 6: quiz-attempt totals computed server-side, foreign question_id ignored ---
+def test_quiz_attempt_computes_totals_and_ignores_foreign_question_id(
+    client, phase6a_headers, phase6a_other_headers
+):
+    headers = phase6a_headers
+    other_user_id = _user_id("phase6a_other_user")
+
+    db = TestSessionLocal()
+    try:
+        foreign_q = main.Question(
+            user_id=other_user_id, topic="x", type="short_answer", bloom_level="remember",
+            question="Foreign question?", correct_answer="A", explanation="E",
+        )
+        db.add(foreign_q)
+        db.commit()
+        db.refresh(foreign_q)
+        foreign_q_id = foreign_q.id
+    finally:
+        db.close()
+
+    main.limiter.reset()
+    res = client.post(
+        "/analytics/quiz-attempts", headers=headers,
+        json={
+            "topic": "Networking",
+            "answers": [
+                {"question_type": "mcq", "is_correct": True, "self_graded": False},
+                {"question_type": "mcq", "is_correct": False, "self_graded": False},
+                {
+                    "question_id": foreign_q_id, "bloom_level": "remember",
+                    "question_type": "short_answer", "is_correct": True, "self_graded": True
+                },
+            ]
+        }
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["correct"] == 2  # server-computed, not trusted from the client
+    assert data["total"] == 3
+
+    db = TestSessionLocal()
+    try:
+        answer = (
+            db.query(main.QuizAnswer)
+            .filter(main.QuizAnswer.attempt_id == data["attempt_id"], main.QuizAnswer.bloom_level == "remember")
+            .first()
+        )
+        assert answer.question_id is None  # a foreign question_id is ignored, not 404'd
+    finally:
+        db.close()
+
+
+def test_quiz_attempt_validates_answer_count_and_fields(client, phase6a_headers):
+    headers = phase6a_headers
+    main.limiter.reset()
+
+    assert client.post(
+        "/analytics/quiz-attempts", headers=headers, json={"topic": "x", "answers": []}
+    ).status_code == 422
+
+    too_many = [{"question_type": "mcq", "is_correct": True, "self_graded": False} for _ in range(51)]
+    assert client.post(
+        "/analytics/quiz-attempts", headers=headers, json={"topic": "x", "answers": too_many}
+    ).status_code == 422
+
+    bad_level = [{"bloom_level": "not_a_real_level", "question_type": "mcq", "is_correct": True, "self_graded": False}]
+    assert client.post(
+        "/analytics/quiz-attempts", headers=headers, json={"topic": "x", "answers": bad_level}
+    ).status_code == 422
+
+
+# --- Item 7: summary day-bucketing, timezone boundary, zero-fill ---
+def test_summary_includes_every_day_with_zeros_oldest_first_for_a_fresh_user(client):
+    _, headers = _fresh_phase6a_user(client)
+
+    res = client.get("/analytics/summary", headers=headers, params={"days": 7})
+    assert res.status_code == 200
+    data = res.json()
+
+    assert len(data["queries_by_day"]) == 7
+    assert all(d["count"] == 0 for d in data["queries_by_day"])
+    assert len(data["active_seconds_by_day"]) == 7
+    assert all(d["seconds"] == 0 for d in data["active_seconds_by_day"])
+
+    dates = [d["date"] for d in data["queries_by_day"]]
+    assert dates == sorted(dates)  # oldest first
+    assert dates[-1] == datetime.now(timezone.utc).astimezone(main.ZoneInfo("Asia/Kolkata")).date().isoformat()
+
+    assert data["totals"]["queries"] == 0
+    assert data["totals"]["average_score_pct"] is None
+    assert data["recent_attempts"] == []
+
+
+def test_summary_rejects_bad_days_and_bad_timezone(client, phase6a_headers):
+    headers = phase6a_headers
+    assert client.get("/analytics/summary", headers=headers, params={"days": 10}).status_code == 422
+    assert client.get("/analytics/summary", headers=headers, params={"tz": "Not/AZone"}).status_code == 422
+
+
+def test_summary_buckets_utc_evening_event_into_next_ist_calendar_day(client):
+    username, headers = _fresh_phase6a_user(client)
+    user_id = _user_id(username)
+
+    now_utc = datetime.now(timezone.utc)
+    base_date = (now_utc - timedelta(days=1)).date()
+    event_time_utc = datetime(base_date.year, base_date.month, base_date.day, 20, 0, 0, tzinfo=timezone.utc)
+
+    ist = main.ZoneInfo("Asia/Kolkata")
+    expected_local_date = event_time_utc.astimezone(ist).date()
+    assert expected_local_date == base_date + timedelta(days=1)  # confirms the boundary actually crosses
+
+    _insert_event(user_id, "query", value=1, created_at=event_time_utc.replace(tzinfo=None))
+
+    res = client.get("/analytics/summary", headers=headers, params={"days": 7, "tz": "Asia/Kolkata"})
+    assert res.status_code == 200
+    by_day = {d["date"]: d["count"] for d in res.json()["queries_by_day"]}
+    assert by_day.get(expected_local_date.isoformat()) == 1
+
+
+# --- Item 7 (continued): accuracy_by_level / weak_topics maths ---
+def test_summary_accuracy_by_level_and_weak_topics_maths(client):
+    username, headers = _fresh_phase6a_user(client)
+    user_id = _user_id(username)
+
+    _insert_quiz_attempt(
+        user_id, "Strong Topic", correct=9, total=10,
+        answers=[
+            {"bloom_level": "remember", "question_type": "mcq", "is_correct": i < 9, "self_graded": False}
+            for i in range(10)
+        ]
+    )
+    # Two attempts, unequal sizes, so "mean of attempt %" (31.25%) differs
+    # from a totals-weighted average (20%) -- proves which one is used.
+    _insert_quiz_attempt(
+        user_id, "Weak Topic", correct=1, total=2,
+        answers=[
+            {"bloom_level": "apply", "question_type": "scenario", "is_correct": i < 1, "self_graded": True}
+            for i in range(2)
+        ]
+    )
+    _insert_quiz_attempt(
+        user_id, "Weak Topic", correct=1, total=8,
+        answers=[
+            {"bloom_level": "apply", "question_type": "scenario", "is_correct": i < 1, "self_graded": True}
+            for i in range(8)
+        ]
+    )
+
+    res = client.get("/analytics/summary", headers=headers, params={"days": 30})
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["accuracy_by_level"]["remember"] == {"correct": 9, "total": 10, "pct": 90.0}
+    assert data["accuracy_by_level"]["apply"] == {"correct": 2, "total": 10, "pct": 20.0}
+    assert data["accuracy_by_level"]["evaluate"] == {"correct": 0, "total": 0, "pct": None}
+
+    weak = next(t for t in data["topics"] if t["topic"] == "Weak Topic")
+    assert weak["attempts"] == 2
+    assert weak["average_pct"] == 31.2  # mean of 50% and 12.5%, not the 20% totals-weighted figure
+
+    assert any(t["topic"] == "Weak Topic" for t in data["weak_topics"])
+    assert not any(t["topic"] == "Strong Topic" for t in data["weak_topics"])  # only 1 attempt and 90%
+    assert data["weak_topics"] == sorted(data["weak_topics"], key=lambda t: t["average_pct"])
+
+
+# --- Item 8: paper_coverage uses detected (not intended) levels ---
+def test_summary_paper_coverage_uses_detected_level_for_a_flagged_question(client, monkeypatch):
+    import llm as llm_module
+
+    username, headers = _fresh_phase6a_user(client)
+    book_id = _upload_paper_doc(client, headers, "analytics_paper_coverage.txt")
+    paper_data = _create_paper(client, headers, [book_id], title="Analytics Coverage Paper")
+
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers)
+    detail = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+    slot = next(s for s in detail["slots"] if s["marks"] == 2 and s["bloom_level"] == "remember")
+
+    db = TestSessionLocal()
+    try:
+        question = db.query(main.Question).filter(main.Question.id == slot["question"]["question_id"]).first()
+        question.bloom_check = "flagged"
+        question.detected_level = "apply"
+        db.commit()
+    finally:
+        db.close()
+
+    detail_after = client.get(f"/papers/{paper_data['id']}", headers=headers).json()
+
+    res = client.get("/analytics/summary", headers=headers, params={"days": 30})
+    assert res.status_code == 200
+    coverage = res.json()["paper_coverage"]
+    assert coverage["papers"] == 1
+    assert coverage["by_level"] == detail_after["blueprint_actual"]["by_level"]
+    assert coverage["by_level"]["apply"] >= 2  # the flagged slot's marks counted here, not under remember
+
+
+# --- Item 9: import works once then 409, bad sizes/future dates rejected ---
+def test_import_analytics_works_once_then_409s(client):
+    username, headers = _fresh_phase6a_user(client)
+
+    assert client.get("/analytics/import-status", headers=headers).json() == {"imported": False}
+
+    today = datetime.now(timezone.utc).date()
+    yesterday = today - timedelta(days=1)
+    old_timestamp_ms = (datetime.now(timezone.utc) - timedelta(days=2)).timestamp() * 1000
+
+    payload = {
+        "queries_by_day": {yesterday.isoformat(): 5, today.isoformat(): 3},
+        "active_seconds_by_day": {yesterday.isoformat(): 600},
+        "quiz_history": [{
+            "topic": "Imported Topic", "correct": 7, "total": 10, "timestamp": old_timestamp_ms,
+            "byLevel": {"remember": {"correct": 4, "total": 5}, "apply": {"correct": 3, "total": 5}},
+        }],
+    }
+    res = client.post("/analytics/import", headers=headers, json=payload)
+    assert res.status_code == 200, res.text
+    assert res.json() == {"imported_days": 2, "imported_quiz_attempts": 1}
+
+    assert client.get("/analytics/import-status", headers=headers).json() == {"imported": True}
+
+    res2 = client.post("/analytics/import", headers=headers, json=payload)
+    assert res2.status_code == 409
+
+    summary = client.get("/analytics/summary", headers=headers, params={"days": 30}).json()
+    assert summary["totals"]["queries"] == 8
+    assert summary["totals"]["active_seconds"] == 600
+    assert summary["totals"]["quizzes_taken"] == 1
+    assert summary["accuracy_by_level"]["remember"]["total"] == 5
+    assert summary["accuracy_by_level"]["remember"]["correct"] == 4
+    assert summary["accuracy_by_level"]["apply"]["total"] == 5
+    assert summary["accuracy_by_level"]["apply"]["correct"] == 3
+
+
+def test_import_analytics_rejects_bad_sizes_and_future_dates(client):
+    username, headers = _fresh_phase6a_user(client)
+
+    future_date = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+    res = client.post("/analytics/import", headers=headers, json={"queries_by_day": {future_date: 1}})
+    assert res.status_code == 422
+
+    base = datetime(2015, 1, 1).date()
+    too_many_days = {(base + timedelta(days=i)).isoformat(): 1 for i in range(401)}
+    res2 = client.post("/analytics/import", headers=headers, json={"queries_by_day": too_many_days})
+    assert res2.status_code == 422
+
+    too_many_quiz = [
+        {"topic": "x", "correct": 1, "total": 1, "timestamp": datetime.now(timezone.utc).timestamp() * 1000}
+        for _ in range(1001)
+    ]
+    res3 = client.post("/analytics/import", headers=headers, json={"quiz_history": too_many_quiz})
+    assert res3.status_code == 422
+
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    res4 = client.post("/analytics/import", headers=headers, json={"queries_by_day": {today_str: 2001}})
+    assert res4.status_code == 422
+
+    # None of the above should have actually imported anything.
+    assert client.get("/analytics/import-status", headers=headers).json() == {"imported": False}
+
+
+# --- Item 10: DELETE clears only analytics; cross-user isolation ---
+def test_delete_analytics_clears_only_analytics_and_users_are_isolated(client, monkeypatch):
+    import llm as llm_module
+
+    username_a, headers_a = _fresh_phase6a_user(client)
+    _, headers_b = _fresh_phase6a_user(client)
+
+    book_id = _upload_paper_doc(client, headers_a, "analytics_delete_doc.txt")
+    main.limiter.reset()
+    assert client.post("/analytics/active-time", headers=headers_a, json={"seconds": 30}).status_code == 200
+    main.limiter.reset()
+    assert client.post(
+        "/analytics/quiz-attempts", headers=headers_a,
+        json={"topic": "Delete Test", "answers": [{"question_type": "mcq", "is_correct": True, "self_graded": False}]}
+    ).status_code == 200
+    paper_data = _create_paper(client, headers_a, [book_id], title="Delete Test Paper")
+    monkeypatch.setattr(llm_module, "generate_json", _make_paper_llm_fake())
+    main.limiter.reset()
+    client.post(f"/papers/{paper_data['id']}/generate", headers=headers_a)
+
+    before = client.get("/analytics/summary", headers=headers_a, params={"days": 30}).json()
+    assert before["totals"]["active_seconds"] >= 30
+    assert before["totals"]["quizzes_taken"] >= 1
+    assert before["totals"]["documents_ready"] >= 1
+    assert before["totals"]["papers_ready"] >= 1
+
+    res = client.delete("/analytics", headers=headers_a)
+    assert res.status_code == 200
+
+    after = client.get("/analytics/summary", headers=headers_a, params={"days": 30}).json()
+    assert after["totals"]["active_seconds"] == 0
+    assert after["totals"]["quizzes_taken"] == 0
+    assert after["recent_attempts"] == []
+    # Documents, bank questions, and papers are untouched.
+    assert after["totals"]["documents_ready"] == before["totals"]["documents_ready"]
+    assert after["totals"]["questions_in_bank"] == before["totals"]["questions_in_bank"]
+    assert after["totals"]["papers_ready"] == before["totals"]["papers_ready"]
+    assert client.get(f"/papers/{paper_data['id']}", headers=headers_a).status_code == 200
+
+    # User B, who did nothing, sees none of user A's data -- before or after the delete.
+    b_summary = client.get("/analytics/summary", headers=headers_b, params={"days": 30}).json()
+    assert b_summary["totals"]["active_seconds"] == 0
+    assert b_summary["totals"]["quizzes_taken"] == 0
+    assert b_summary["totals"]["documents_ready"] == 0
+    assert b_summary["totals"]["papers_ready"] == 0
+
+    client.delete(f"/books/{book_id}", headers=headers_a)

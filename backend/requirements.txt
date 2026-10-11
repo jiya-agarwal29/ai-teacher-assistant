@@ -21,3 +21,8 @@ Pillow==12.3.0
 pillow-heif==1.8.0
 
 numpy==2.4.3
+
+# zoneinfo (stdlib) needs this on Windows, which doesn't ship the IANA tz
+# database itself -- Phase 6A's per-user timezone handling (analytics
+# day-bucketing) is the first thing here that needs real IANA zones.
+tzdata==2026.5
