@@ -2,7 +2,10 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, getToken, getUsername, setToken as persistToken, isTokenExpired, decodeJwtPayload } from '../services/api';
 import { startActivityTracking, getLastActivityAt, subscribeToActivity } from '../utils/activity';
 import { runOneTimeAnalyticsImport } from '../utils/analyticsImport';
+import { runOneTimeChatImport } from '../utils/chatImport';
 import { AuthContext } from './authContext';
+
+let nextImportToastId = 0;
 
 const DEFAULT_SESSION_WARNING_MINUTES = 5;
 const SESSION_WARNING_MINUTES = Number(import.meta.env.VITE_SESSION_WARNING_MINUTES) || DEFAULT_SESSION_WARNING_MINUTES;
@@ -30,9 +33,17 @@ export function AuthProvider({ children }) {
   const [showSessionWarning, setShowSessionWarning] = useState(false);
   const [sessionExpiresAt, setSessionExpiresAt] = useState(null);
 
-  // One-time "your old activity was moved" toast -- see
-  // utils/analyticsImport.js and components/ImportedActivityToast.
-  const [showImportedToast, setShowImportedToast] = useState(false);
+  // One-time "your old data was moved" toasts -- one entry per import
+  // that actually fired (activity, chats, ...) -- see utils/
+  // analyticsImport.js, utils/chatImport.js, components/ImportedDataToast.
+  const [importToasts, setImportToasts] = useState([]);
+  const pushImportToast = useCallback((message) => {
+    const id = nextImportToastId++;
+    setImportToasts((prev) => [...prev, { id, message }]);
+  }, []);
+  const dismissImportToast = useCallback((id) => {
+    setImportToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
 
   const sessionCheckIntervalRef = useRef(null);
   const logoutTimerRef = useRef(null);
@@ -206,7 +217,12 @@ export function AuthProvider({ children }) {
       setUser(username);
       // Fire-and-forget -- never blocks login; see utils/analyticsImport.js
       // for why a failure here is just retried on the next login instead.
-      runOneTimeAnalyticsImport({ onImported: () => setShowImportedToast(true) });
+      runOneTimeAnalyticsImport({
+        onImported: () => pushImportToast('Your earlier activity was moved to your account.')
+      });
+      runOneTimeChatImport({
+        onImported: () => pushImportToast('Your earlier chats were moved to your account.')
+      });
       return true;
     } catch (err) {
       setError(err.message || 'Login failed. Please check your credentials.');
@@ -248,8 +264,8 @@ export function AuthProvider({ children }) {
     showSessionWarning,
     sessionExpiresAt,
     refreshSession,
-    showImportedToast,
-    dismissImportedToast: () => setShowImportedToast(false),
+    importToasts,
+    dismissImportToast,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -1,7 +1,7 @@
 import { Outlet } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import SessionExpiryModal from './SessionExpiryModal';
-import ImportedActivityToast from './ImportedActivityToast';
+import ImportedDataToast from './ImportedDataToast';
 import AnimatedBackground from '../AnimatedBackground';
 import { useActiveTimeTracker } from '../hooks/useActiveTime';
 import { useAuth } from '../hooks/useAuth';
@@ -14,7 +14,7 @@ export default function PageLayout({ darkMode, setDarkMode }) {
 
   const {
     showSessionWarning, sessionExpiresAt, refreshSession, logout,
-    showImportedToast, dismissImportedToast
+    importToasts, dismissImportToast
   } = useAuth();
 
   return (
@@ -38,7 +38,15 @@ export default function PageLayout({ darkMode, setDarkMode }) {
         <SessionExpiryModal expiresAt={sessionExpiresAt} onStayLoggedIn={refreshSession} onLogout={logout} />
       )}
 
-      {showImportedToast && <ImportedActivityToast onDismiss={dismissImportedToast} />}
+      {importToasts.map((t, idx) => (
+        <ImportedDataToast
+          key={t.id}
+          heading="Data moved"
+          message={t.message}
+          offset={idx}
+          onDismiss={() => dismissImportToast(t.id)}
+        />
+      ))}
     </div>
   );
 }

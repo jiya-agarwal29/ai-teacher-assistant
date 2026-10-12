@@ -20,10 +20,11 @@ creates the Phase 4B questions table if missing. Also adds the Phase 5B
 questions.marks/marking_scheme columns and the papers/paper_questions
 tables, plus the Phase 5B fix columns papers.unit_weights/waiting_for_ai,
 if missing. Also adds the Phase 6A users.analytics_imported_at column and
-the activity_events/quiz_attempts/quiz_answers tables, if missing. Safe
-to run more than once: every ALTER TABLE / CREATE TABLE / CREATE INDEX is
-skipped once it already exists, and every UPDATE only ever touches rows
-that still need it.
+the activity_events/quiz_attempts/quiz_answers tables, plus the Phase 6C
+users.chats_imported_at column and the conversations/chat_messages
+tables, if missing. Safe to run more than once: every ALTER TABLE /
+CREATE TABLE / CREATE INDEX is skipped once it already exists, and every
+UPDATE only ever touches rows that still need it.
 
 Usage:
     python migrate.py <username>
@@ -221,6 +222,19 @@ def main():
         and table_exists(cursor, "quiz_answers")
     )
 
+    # Phase 6C: users.chats_imported_at (null means that user's old
+    # localStorage chat history was never imported).
+    if column_exists(cursor, "users", "chats_imported_at"):
+        logger.info("users.chats_imported_at column already exists, skipping ALTER TABLE.")
+    else:
+        cursor.execute("ALTER TABLE users ADD COLUMN chats_imported_at TIMESTAMP")
+        conn.commit()
+        logger.info("Added users.chats_imported_at column.")
+
+    chat_tables_already_existed = (
+        table_exists(cursor, "conversations") and table_exists(cursor, "chat_messages")
+    )
+
     cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()
 
@@ -238,8 +252,11 @@ def main():
     conn.commit()
     conn.close()
 
-    if questions_table_already_existed and papers_tables_already_existed and analytics_tables_already_existed:
-        logger.info("questions/papers/paper_questions/analytics tables already exist, skipping create_all.")
+    if (
+        questions_table_already_existed and papers_tables_already_existed
+        and analytics_tables_already_existed and chat_tables_already_existed
+    ):
+        logger.info("questions/papers/paper_questions/analytics/chat tables already exist, skipping create_all.")
     else:
         Base.metadata.create_all(bind=engine)
         if not questions_table_already_existed:
@@ -248,6 +265,8 @@ def main():
             logger.info("Created papers and paper_questions tables.")
         if not analytics_tables_already_existed:
             logger.info("Created activity_events, quiz_attempts, and quiz_answers tables.")
+        if not chat_tables_already_existed:
+            logger.info("Created conversations and chat_messages tables.")
 
     logger.info("Assigned %d previously-unowned book(s) to '%s' (user_id=%d).", unowned_count, username, user_id)
 

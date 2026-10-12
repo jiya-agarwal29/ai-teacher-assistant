@@ -402,14 +402,76 @@ export const api = {
 
   chat: {
     /**
-     * GET /chat?question=...
+     * GET /chat?question=...&conversation_id=... -- conversationId is
+     * optional; when given (and owned), the server saves this question
+     * and the answer into that conversation itself (Phase 6C).
      */
-    send: (question) => {
+    send: (question, conversationId) => {
       const queryParams = new URLSearchParams({ question });
+      if (conversationId !== undefined && conversationId !== null) {
+        queryParams.append('conversation_id', String(conversationId));
+      }
       return request(`/chat?${queryParams.toString()}`);
     }
   },
-  
+
+  conversations: {
+    /**
+     * GET /conversations -- [{id, title, updated_at, message_count}, ...],
+     * newest-first.
+     */
+    list: () => request('/conversations'),
+
+    /**
+     * POST /conversations {title?} -- returns the full (empty) detail
+     * shape, same as get(id), so the caller can switch straight to it.
+     */
+    create: (title) => request('/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(title ? { title } : {}),
+    }),
+
+    /**
+     * GET /conversations/{id} -- {id, title, created_at, updated_at,
+     * messages: [{id, role, content, sources, created_at}]}.
+     */
+    get: (id) => request(`/conversations/${id}`),
+
+    /**
+     * PATCH /conversations/{id} {title} -- rename.
+     */
+    rename: (id, title) => request(`/conversations/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    }),
+
+    /**
+     * DELETE /conversations/{id}
+     */
+    remove: (id) => request(`/conversations/${id}`, {
+      method: 'DELETE',
+    }),
+
+    /**
+     * GET /conversations/import-status -- {imported: bool}.
+     */
+    importStatus: () => request('/conversations/import-status'),
+
+    /**
+     * POST /conversations/import [{title?, messages: [{role, content,
+     * sources?}]}] -- one-time migration of this browser's pre-Phase-6C
+     * localStorage chat history. 409s if this account already imported,
+     * from any browser -- see utils/chatImport.js, the only caller.
+     */
+    import: (conversations) => request('/conversations/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(conversations),
+    }),
+  },
+
   search: {
     /**
      * GET /search?query=... (Normal exact text search)

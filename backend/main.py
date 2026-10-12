@@ -47,7 +47,7 @@ import database
 from database import engine, get_db
 from models import (
     Base, Book, DocumentPage, Page, Question, Paper, PaperQuestion, User,
-    ActivityEvent, QuizAttempt, QuizAnswer
+    ActivityEvent, QuizAttempt, QuizAnswer, Conversation, ChatMessage
 )
 
 from auth import (
@@ -1664,11 +1664,18 @@ def semantic_search(
 # -----------------------------
 # AI CHAT
 # -----------------------------
-def _answer_question(question: str, current_user: User, db: Session):
+def _answer_question(question: str, current_user: User, db: Session, conversation_id: int = None):
     """
     Shared retrieval + grounded-answer pipeline used by both /chat and
     /tools/tutor — same behaviour, just two different entry points for the
     same plain question (no prefix is added anywhere in this pipeline).
+
+    `conversation_id` (Phase 6C, /chat only -- /tools/tutor never passes
+    one) saves this question and the answer into that conversation, same
+    boundary as _log_activity just below it: only once a real retrieval
+    attempt happened, never on the "no documents"/"needs re-indexing"
+    bounce-backs (there's no real answer to save yet), and never on a 503 --
+    _save_chat_turn is only ever called right alongside _log_activity.
     """
     if not user_has_documents(db, current_user.id):
         return {
@@ -1686,9 +1693,11 @@ def _answer_question(question: str, current_user: User, db: Session):
     temp_context = " ".join([page.content for _, page in top_pages])
     if not top_pages or not check_context_relevance(question, temp_context, top_pages[0][0]):
         _log_activity(db, current_user.id, "query")
+        no_info_answer = "The uploaded documents do not contain enough information for this question."
+        _save_chat_turn(db, current_user.id, conversation_id, question, no_info_answer, [])
         return {
             "question": question,
-            "answer": "The uploaded documents do not contain enough information for this question.",
+            "answer": no_info_answer,
             "sources": []
         }
 
@@ -1726,13 +1735,16 @@ def _answer_question(question: str, current_user: User, db: Session):
 
     if not answer or "do not contain enough information" in answer.lower():
         _log_activity(db, current_user.id, "query")
+        no_info_answer = "The uploaded documents do not contain enough information for this question."
+        _save_chat_turn(db, current_user.id, conversation_id, question, no_info_answer, [])
         return {
             "question": question,
-            "answer": "The uploaded documents do not contain enough information for this question.",
+            "answer": no_info_answer,
             "sources": []
         }
 
     _log_activity(db, current_user.id, "query")
+    _save_chat_turn(db, current_user.id, conversation_id, question, answer, sources)
     return {
         "question": question,
         "answer": answer,
@@ -1745,10 +1757,11 @@ def _answer_question(question: str, current_user: User, db: Session):
 def chat_with_pdf(
     request: Request,
     question: str,
+    conversation_id: int | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    return _answer_question(question, current_user, db)
+    return _answer_question(question, current_user, db, conversation_id)
 
 
 # -----------------------------
@@ -4555,3 +4568,264 @@ def delete_analytics(
 
     db.commit()
     return {"status": "Analytics data deleted successfully"}
+
+
+# -----------------------------
+# PHASE 6C: CHAT CONVERSATIONS
+# -----------------------------
+DEFAULT_CONVERSATION_TITLE = "New chat"
+MAX_CONVERSATION_TITLE_CHARS = 40
+MAX_IMPORT_CONVERSATIONS = 200
+MAX_IMPORT_MESSAGES_PER_CONVERSATION = 500
+MAX_IMPORT_MESSAGE_CONTENT_CHARS = 20000
+
+
+def _auto_title_from_question(question: str) -> str:
+    text = question.strip()
+    if not text:
+        return DEFAULT_CONVERSATION_TITLE
+    if len(text) <= MAX_CONVERSATION_TITLE_CHARS:
+        return text
+    return text[:MAX_CONVERSATION_TITLE_CHARS - 1].rstrip() + "…"
+
+
+def _save_chat_turn(
+    db: Session, user_id: int, conversation_id, question: str, answer: str, sources: list
+) -> None:
+    """
+    Persists one question+answer exchange into `conversation_id` (Phase
+    6C) -- does nothing if conversation_id is None (the caller didn't ask
+    for this question to be saved anywhere -- /tools/tutor never passes
+    one) or if it doesn't exist or belong to `user_id` (a stale tab, or a
+    race with a delete -- never worth failing the chat response over).
+    Auto-renames a still-default "New chat" from this question (the first
+    one saved into it) and always bumps updated_at. Wrapped so a
+    logging-adjacent DB hiccup here can never break the chat response
+    itself, the same guarantee _log_activity makes.
+    """
+    if conversation_id is None:
+        return
+    try:
+        conversation = db.query(Conversation).filter(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        ).first()
+        if not conversation:
+            return
+
+        db.add(ChatMessage(conversation_id=conversation.id, role="user", content=question))
+        db.add(ChatMessage(
+            conversation_id=conversation.id, role="assistant", content=answer,
+            sources=json.dumps(sources) if sources else None,
+        ))
+        if conversation.title == DEFAULT_CONVERSATION_TITLE:
+            conversation.title = _auto_title_from_question(question)
+        conversation.updated_at = datetime.now(dt_timezone.utc)
+        db.commit()
+    except Exception:
+        logger.warning(
+            "Failed to save chat turn (conversation_id=%s, user_id=%s)", conversation_id, user_id, exc_info=True
+        )
+
+
+class ConversationCreateRequest(BaseModel):
+    title: str | None = None
+
+
+class ConversationUpdateRequest(BaseModel):
+    title: str
+
+
+class ImportChatMessageEntry(BaseModel):
+    role: str
+    content: str
+    sources: list | None = None
+
+
+class ImportConversationEntry(BaseModel):
+    title: str | None = None
+    messages: list[ImportChatMessageEntry] = []
+
+
+def _get_owned_conversation_or_404(db: Session, conversation_id: int, user_id: int) -> Conversation:
+    conversation = db.query(Conversation).filter(
+        Conversation.id == conversation_id, Conversation.user_id == user_id
+    ).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conversation
+
+
+def _conversation_summary(db: Session, conversation: Conversation) -> dict:
+    message_count = db.query(ChatMessage).filter(ChatMessage.conversation_id == conversation.id).count()
+    return {
+        "id": conversation.id,
+        "title": conversation.title,
+        "updated_at": conversation.updated_at.isoformat(),
+        "message_count": message_count,
+    }
+
+
+def _chat_message_dict(message: ChatMessage) -> dict:
+    return {
+        "id": message.id,
+        "role": message.role,
+        "content": message.content,
+        "sources": json.loads(message.sources) if message.sources else None,
+        "created_at": message.created_at.isoformat(),
+    }
+
+
+def _conversation_detail(db: Session, conversation: Conversation) -> dict:
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.conversation_id == conversation.id)
+        .order_by(ChatMessage.id)
+        .all()
+    )
+    return {
+        "id": conversation.id,
+        "title": conversation.title,
+        "created_at": conversation.created_at.isoformat(),
+        "updated_at": conversation.updated_at.isoformat(),
+        "messages": [_chat_message_dict(m) for m in messages],
+    }
+
+
+@app.get("/conversations")
+def list_conversations(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    conversations = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == current_user.id)
+        .order_by(Conversation.updated_at.desc())
+        .all()
+    )
+    return [_conversation_summary(db, c) for c in conversations]
+
+
+@app.post("/conversations")
+def create_conversation(
+    payload: ConversationCreateRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    title = (payload.title if payload else None) or DEFAULT_CONVERSATION_TITLE
+    title = title.strip() or DEFAULT_CONVERSATION_TITLE
+    conversation = Conversation(user_id=current_user.id, title=title)
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return _conversation_detail(db, conversation)
+
+
+@app.get("/conversations/import-status")
+def get_chat_import_status(current_user: User = Depends(get_current_user)):
+    return {"imported": current_user.chats_imported_at is not None}
+
+
+@app.post("/conversations/import")
+def import_conversations(
+    payload: list[ImportConversationEntry],
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    One-time import of a user's pre-Phase-6C, browser-only (localStorage)
+    chat history -- see Chat.jsx's old `chat_conversations` shape, which
+    this mirrors exactly: a plain list of {title, messages: [{role,
+    content, sources?}]}. 409s on a second attempt -- chats_imported_at
+    is set here and never cleared, so the same old browser data can't be
+    imported twice. Validates everything before writing anything, so a
+    rejected import never leaves a partial one behind. Declared before
+    GET/PATCH/DELETE /conversations/{conversation_id} so "import-status"
+    and "import" are never parsed as an id.
+    """
+    if current_user.chats_imported_at is not None:
+        raise HTTPException(status_code=409, detail="Already imported")
+
+    if len(payload) > MAX_IMPORT_CONVERSATIONS:
+        raise HTTPException(
+            status_code=422, detail=f"Can import at most {MAX_IMPORT_CONVERSATIONS} conversations."
+        )
+
+    conversations_to_add = []
+    for conv in payload:
+        if len(conv.messages) > MAX_IMPORT_MESSAGES_PER_CONVERSATION:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Each conversation can have at most {MAX_IMPORT_MESSAGES_PER_CONVERSATION} messages."
+            )
+
+        messages_to_add = []
+        for msg in conv.messages:
+            if msg.role not in ("user", "assistant"):
+                raise HTTPException(status_code=422, detail=f"Unknown message role: '{msg.role}'")
+            content = (msg.content or "").strip()
+            if not content:
+                raise HTTPException(status_code=422, detail="Message content cannot be empty.")
+            if len(content) > MAX_IMPORT_MESSAGE_CONTENT_CHARS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Message content exceeds {MAX_IMPORT_MESSAGE_CONTENT_CHARS} characters."
+                )
+            messages_to_add.append(ChatMessage(
+                role=msg.role, content=content,
+                sources=json.dumps(msg.sources) if msg.sources else None,
+            ))
+
+        title = (conv.title or "").strip() or DEFAULT_CONVERSATION_TITLE
+        conversations_to_add.append((title, messages_to_add))
+
+    for title, messages_to_add in conversations_to_add:
+        conversation = Conversation(user_id=current_user.id, title=title)
+        conversation.messages = messages_to_add
+        db.add(conversation)
+
+    current_user.chats_imported_at = datetime.now(dt_timezone.utc)
+    db.commit()
+
+    return {
+        "imported_conversations": len(conversations_to_add),
+        "imported_messages": sum(len(m) for _, m in conversations_to_add),
+    }
+
+
+@app.get("/conversations/{conversation_id}")
+def get_conversation(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    conversation = _get_owned_conversation_or_404(db, conversation_id, current_user.id)
+    return _conversation_detail(db, conversation)
+
+
+@app.patch("/conversations/{conversation_id}")
+def update_conversation(
+    conversation_id: int,
+    payload: ConversationUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    conversation = _get_owned_conversation_or_404(db, conversation_id, current_user.id)
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title cannot be empty.")
+    conversation.title = title
+    db.commit()
+    return _conversation_detail(db, conversation)
+
+
+@app.delete("/conversations/{conversation_id}")
+def delete_conversation(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    conversation = _get_owned_conversation_or_404(db, conversation_id, current_user.id)
+    db.delete(conversation)
+    db.commit()
+    return {"status": "Conversation deleted successfully"}
+

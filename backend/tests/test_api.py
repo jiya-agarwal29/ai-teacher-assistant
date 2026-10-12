@@ -4572,3 +4572,286 @@ def test_delete_analytics_clears_only_analytics_and_users_are_isolated(client, m
     assert b_summary["totals"]["papers_ready"] == 0
 
     client.delete(f"/books/{book_id}", headers=headers_a)
+
+
+# =============================
+# PHASE 6C: CHAT CONVERSATIONS
+# =============================
+_phase6c_fresh_user_counter = {"n": 0}
+
+
+def _fresh_phase6c_user(client):
+    """A brand-new account, for any conversation test that needs a clean, isolated starting state."""
+    _phase6c_fresh_user_counter["n"] += 1
+    username = f"phase6c_fresh_user_{_phase6c_fresh_user_counter['n']}"
+    password = "phase6cfreshpass1"
+    main.limiter.reset()
+    _register(client, username, password)
+    return username, _auth_headers(client, username, password)
+
+
+def test_create_conversation_default_and_custom_title(client):
+    _, headers = _fresh_phase6c_user(client)
+
+    res = client.post("/conversations", headers=headers)
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["title"] == "New chat"
+    assert data["messages"] == []
+
+    res2 = client.post("/conversations", headers=headers, json={"title": "CN notes"})
+    assert res2.status_code == 200
+    assert res2.json()["title"] == "CN notes"
+
+    listing = client.get("/conversations", headers=headers).json()
+    assert len(listing) == 2
+    assert all("message_count" in c and c["message_count"] == 0 for c in listing)
+
+
+def test_chat_with_conversation_id_saves_round_trip_and_auto_titles(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_conv_bees.txt")
+
+    conv = client.post("/conversations", headers=headers).json()
+    assert conv["title"] == "New chat"
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.get(
+        "/chat", headers=headers,
+        params={"question": "What do bees do for plants?", "conversation_id": conv["id"]}
+    )
+    assert res.status_code == 200, res.text
+
+    detail = client.get(f"/conversations/{conv['id']}", headers=headers).json()
+    assert detail["title"] == "What do bees do for plants?"  # auto-titled from the first question
+    assert len(detail["messages"]) == 2
+    assert detail["messages"][0]["role"] == "user"
+    assert detail["messages"][0]["content"] == "What do bees do for plants?"
+    assert detail["messages"][1]["role"] == "assistant"
+    assert detail["messages"][1]["content"] == "Bees pollinate plants [1]."
+    assert detail["messages"][1]["sources"][0]["book_name"] == "chat_conv_bees.txt"
+
+    # A second question in the same conversation must NOT re-title it.
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees also make honey [1].")
+    client.get("/chat", headers=headers, params={"question": "What else do bees do?", "conversation_id": conv["id"]})
+    detail2 = client.get(f"/conversations/{conv['id']}", headers=headers).json()
+    assert detail2["title"] == "What do bees do for plants?"  # unchanged
+    assert len(detail2["messages"]) == 4
+
+    listing = client.get("/conversations", headers=headers).json()
+    this_conv = next(c for c in listing if c["id"] == conv["id"])
+    assert this_conv["message_count"] == 4
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_auto_title_truncates_long_question(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_conv_long_title.txt")
+    conv = client.post("/conversations", headers=headers).json()
+
+    long_question = "What do bees do for plants and flowers in a typical summer garden season?"
+    assert len(long_question) > 40
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    client.get("/chat", headers=headers, params={"question": long_question, "conversation_id": conv["id"]})
+
+    detail = client.get(f"/conversations/{conv['id']}", headers=headers).json()
+    assert len(detail["title"]) <= 40
+    assert detail["title"].endswith("…")
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_without_conversation_id_is_backward_compatible(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_no_conv_bees.txt")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["answer"] == "Bees pollinate plants [1]."
+    assert "sources" in data
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_with_foreign_conversation_id_still_answers_but_does_not_save(
+    client, llm_mock_headers, monkeypatch
+):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_foreign_conv_bees.txt")
+
+    _, other_headers = _fresh_phase6c_user(client)
+    foreign_conv = client.post("/conversations", headers=other_headers).json()
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.get(
+        "/chat", headers=headers,
+        params={"question": "What do bees do?", "conversation_id": foreign_conv["id"]}
+    )
+    assert res.status_code == 200, res.text  # answers normally, not a 404
+
+    # Nothing was saved into the other user's conversation.
+    foreign_detail = client.get(f"/conversations/{foreign_conv['id']}", headers=other_headers).json()
+    assert foreign_detail["messages"] == []
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_llm_error_saves_nothing(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_error_bees.txt")
+    conv = client.post("/conversations", headers=headers).json()
+
+    def raise_unavailable(*a, **kw):
+        raise llm_module.LLMUnavailableError("boom")
+    monkeypatch.setattr(llm_module, "generate", raise_unavailable)
+
+    res = client.get(
+        "/chat", headers=headers, params={"question": "What do bees do?", "conversation_id": conv["id"]}
+    )
+    assert res.status_code == 503
+
+    detail = client.get(f"/conversations/{conv['id']}", headers=headers).json()
+    assert detail["messages"] == []
+    assert detail["title"] == "New chat"
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_conversation_owner_isolation(client):
+    _, headers_a = _fresh_phase6c_user(client)
+    _, headers_b = _fresh_phase6c_user(client)
+
+    conv = client.post("/conversations", headers=headers_a, json={"title": "User A's chat"}).json()
+
+    assert client.get(f"/conversations/{conv['id']}", headers=headers_b).status_code == 404
+    assert client.patch(
+        f"/conversations/{conv['id']}", headers=headers_b, json={"title": "Hijacked"}
+    ).status_code == 404
+    assert client.delete(f"/conversations/{conv['id']}", headers=headers_b).status_code == 404
+
+    b_listing = client.get("/conversations", headers=headers_b).json()
+    assert all(c["id"] != conv["id"] for c in b_listing)
+
+    # User A still has it, untouched.
+    assert client.get(f"/conversations/{conv['id']}", headers=headers_a).json()["title"] == "User A's chat"
+
+
+def test_rename_conversation(client):
+    _, headers = _fresh_phase6c_user(client)
+    conv = client.post("/conversations", headers=headers).json()
+
+    res = client.patch(f"/conversations/{conv['id']}", headers=headers, json={"title": "Renamed chat"})
+    assert res.status_code == 200
+    assert res.json()["title"] == "Renamed chat"
+
+    assert client.patch(f"/conversations/{conv['id']}", headers=headers, json={"title": "   "}).status_code == 400
+
+
+def test_delete_conversation_cascades_messages(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_cascade_bees.txt")
+    conv = client.post("/conversations", headers=headers).json()
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    client.get("/chat", headers=headers, params={"question": "What do bees do?", "conversation_id": conv["id"]})
+
+    db = TestSessionLocal()
+    try:
+        message_count_before = db.query(main.ChatMessage).filter(
+            main.ChatMessage.conversation_id == conv["id"]
+        ).count()
+    finally:
+        db.close()
+    assert message_count_before == 2
+
+    res = client.delete(f"/conversations/{conv['id']}", headers=headers)
+    assert res.status_code == 200
+
+    db = TestSessionLocal()
+    try:
+        remaining = db.query(main.ChatMessage).filter(main.ChatMessage.conversation_id == conv["id"]).count()
+        assert remaining == 0
+    finally:
+        db.close()
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_import_conversations_works_once_then_409s(client):
+    username, headers = _fresh_phase6c_user(client)
+
+    assert client.get("/conversations/import-status", headers=headers).json() == {"imported": False}
+
+    payload = [
+        {
+            "title": "Imported DBMS Chat",
+            "messages": [
+                {"role": "user", "content": "What is normalization?"},
+                {
+                    "role": "assistant", "content": "It reduces redundancy.",
+                    "sources": [{"book_name": "DBMS Notes.pdf", "page_number": 3}]
+                },
+            ],
+        },
+        {"title": None, "messages": [{"role": "user", "content": "Hello?"}]},
+    ]
+    res = client.post("/conversations/import", headers=headers, json=payload)
+    assert res.status_code == 200, res.text
+    assert res.json() == {"imported_conversations": 2, "imported_messages": 3}
+
+    assert client.get("/conversations/import-status", headers=headers).json() == {"imported": True}
+
+    res2 = client.post("/conversations/import", headers=headers, json=payload)
+    assert res2.status_code == 409
+
+    listing = client.get("/conversations", headers=headers).json()
+    titles = {c["title"] for c in listing}
+    assert "Imported DBMS Chat" in titles
+    assert "New chat" in titles  # the entry with title=None defaulted
+
+    imported_conv = next(c for c in listing if c["title"] == "Imported DBMS Chat")
+    detail = client.get(f"/conversations/{imported_conv['id']}", headers=headers).json()
+    assert detail["messages"][1]["sources"][0]["book_name"] == "DBMS Notes.pdf"
+
+
+def test_import_conversations_rejects_bad_sizes_and_roles(client):
+    _, headers = _fresh_phase6c_user(client)
+
+    too_many_conversations = [{"title": "x", "messages": []} for _ in range(201)]
+    res = client.post("/conversations/import", headers=headers, json=too_many_conversations)
+    assert res.status_code == 422
+
+    too_many_messages = [{
+        "title": "x",
+        "messages": [{"role": "user", "content": "hi"} for _ in range(501)],
+    }]
+    res2 = client.post("/conversations/import", headers=headers, json=too_many_messages)
+    assert res2.status_code == 422
+
+    bad_role = [{"title": "x", "messages": [{"role": "system", "content": "hi"}]}]
+    res3 = client.post("/conversations/import", headers=headers, json=bad_role)
+    assert res3.status_code == 422
+
+    too_long_content = [{"title": "x", "messages": [{"role": "user", "content": "a" * 20001}]}]
+    res4 = client.post("/conversations/import", headers=headers, json=too_long_content)
+    assert res4.status_code == 422
+
+    # None of the above should have actually imported anything.
+    assert client.get("/conversations/import-status", headers=headers).json() == {"imported": False}
+    assert client.get("/conversations", headers=headers).json() == []

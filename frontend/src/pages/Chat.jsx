@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
+import { api, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
 import { useDraftPersistence } from '../hooks/useDraftPersistence';
 import MessageWithDocsLink from '../components/MessageWithDocsLink';
 import {
@@ -9,22 +9,36 @@ import {
   MessageSquare,
   BookOpen,
   Trash2,
-  Sparkles
+  Pencil,
+  Sparkles,
+  Loader2,
+  AlertCircle
 } from 'lucide-react';
 
+const MAX_TITLE_CHARS = 40;
+
+// Mirrors main._auto_title_from_question() exactly, so the sidebar/header
+// show the right title immediately instead of waiting on a refetch.
+function autoTitleFromQuestion(question) {
+  const text = question.trim();
+  if (!text) return 'New chat';
+  if (text.length <= MAX_TITLE_CHARS) return text;
+  return `${text.slice(0, MAX_TITLE_CHARS - 1).trimEnd()}…`;
+}
+
 export default function Chat() {
-  const [conversations, setConversations] = useState(() => {
-    const saved = localStorage.getItem(userScopedKey('chat_conversations'));
-    return saved ? JSON.parse(saved) : [
-      { id: '1', title: 'DBMS Fundamentals Chat', messages: [
-        { role: 'user', content: 'What is database normalization?' },
-        { role: 'assistant', content: 'Database normalization is the process of structuring a relational database in accordance with a series of normal forms (e.g., 1NF, 2NF, 3NF, BCNF) to reduce data redundancy and improve data integrity. It involves organizing tables to ensure dependencies are properly enforced.', sources: [] }
-      ]}
-    ];
-  });
-  const [activeConvId, setActiveConvId] = useState(() => {
-    return conversations[0]?.id || '';
-  });
+  const [conversations, setConversations] = useState([]);
+  const [conversationsLoading, setConversationsLoading] = useState(true);
+  const [conversationsError, setConversationsError] = useState('');
+
+  const [activeConvId, setActiveConvId] = useState(null);
+  const [activeTitle, setActiveTitle] = useState('New chat');
+  const [messages, setMessages] = useState([]);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameValue, setRenameValue] = useState('');
+
   const [question, setQuestion] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [error, setError] = useState('');
@@ -50,148 +64,163 @@ export default function Chat() {
   }, []);
 
   // Don't lose an unsent question to a session-expiry (or manual) logout --
-  // saved right before the token is cleared, restored once on the next visit.
+  // saved right before the token is cleared, restored once on the next
+  // visit. Phase 6C: the conversations themselves now live on the server;
+  // only this in-progress draft stays in localStorage.
   useDraftPersistence('chat_draft_input', question, setQuestion);
 
   const messagesEndRef = useRef(null);
 
-  // Monotonic id source for new chats, seeded above any id already loaded
-  // from localStorage so a fresh chat never collides with a saved one.
-  const nextChatIdRef = useRef(
-    1 + conversations.reduce((max, c) => {
-      const n = Number(c.id);
-      return Number.isFinite(n) && n > max ? n : max;
-    }, 0)
-  );
-  const generateChatId = () => {
-    const id = String(nextChatIdRef.current);
-    nextChatIdRef.current += 1;
-    return id;
-  };
+  const refreshConversations = useCallback(() => (
+    api.conversations.list()
+      .then((data) => {
+        setConversations(data);
+        setConversationsError('');
+        return data;
+      })
+      .catch((err) => {
+        setConversationsError(err.message || 'Could not load your conversations.');
+        return [];
+      })
+  ), []);
 
-  // Save conversations to localStorage
+  const openConversation = useCallback(async (id) => {
+    setActiveConvId(id);
+    setError('');
+    setLoadingMessages(true);
+    try {
+      const detail = await api.conversations.get(id);
+      setMessages(detail.messages);
+      setActiveTitle(detail.title);
+    } catch (err) {
+      setError(err.message || 'Could not load this conversation.');
+      setMessages([]);
+    } finally {
+      setLoadingMessages(false);
+    }
+  }, []);
+
+  // Load the conversation list once, from the server -- and open the most
+  // recently active one automatically, the same "always something on
+  // screen" feel the old localStorage version had.
   useEffect(() => {
-    localStorage.setItem(userScopedKey('chat_conversations'), JSON.stringify(conversations));
-  }, [conversations]);
+    let ignore = false;
+    (async () => {
+      const data = await refreshConversations();
+      if (!ignore) {
+        setConversationsLoading(false);
+        if (data.length > 0) {
+          openConversation(data[0].id);
+        }
+      }
+    })();
+    return () => { ignore = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const activeConv = conversations.find(c => c.id === activeConvId);
-
-  // Scroll to bottom
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
   useEffect(() => {
     scrollToBottom();
-  }, [activeConv?.messages, isTyping]);
+  }, [messages, isTyping]);
 
   const handleNewChat = () => {
-    const newId = generateChatId();
-    const newChat = {
-      id: newId,
-      title: `New Chat Session`,
-      messages: [
-        { 
-          role: 'assistant', 
-          content: 'Hello! I am your AI Assistant. Ask me anything about your uploaded study materials, and I will reference the exact pages.' 
-        }
-      ]
-    };
-    setConversations([newChat, ...conversations]);
-    setActiveConvId(newId);
+    setActiveConvId(null);
+    setActiveTitle('New chat');
+    setMessages([]);
+    setError('');
   };
 
-  const handleDeleteChat = (e, id) => {
+  const handleDeleteChat = async (e, id) => {
     e.stopPropagation();
-    const updated = conversations.filter(c => c.id !== id);
-    setConversations(updated);
-    if (activeConvId === id) {
-      if (updated.length > 0) {
-        setActiveConvId(updated[0].id);
-      } else {
-        const newId = generateChatId();
-        const newChat = {
-          id: newId,
-          title: `New Chat Session`,
-          messages: [{ role: 'assistant', content: 'Hello! Ask me anything about your documents.' }]
-        };
-        setConversations([newChat]);
-        setActiveConvId(newId);
+    if (!window.confirm('Delete this conversation? This cannot be undone.')) return;
+    try {
+      await api.conversations.remove(id);
+      const remaining = conversations.filter((c) => c.id !== id);
+      setConversations(remaining);
+      if (activeConvId === id) {
+        if (remaining.length > 0) {
+          openConversation(remaining[0].id);
+        } else {
+          handleNewChat();
+        }
       }
+    } catch (err) {
+      setError(err.message || 'Could not delete this conversation.');
+    }
+  };
+
+  const startRename = (e, conv) => {
+    e.stopPropagation();
+    setRenamingId(conv.id);
+    setRenameValue(conv.title);
+  };
+
+  const commitRename = async (id) => {
+    const title = renameValue.trim();
+    setRenamingId(null);
+    if (!title) return;
+    try {
+      await api.conversations.rename(id, title);
+      setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, title } : c)));
+      if (activeConvId === id) setActiveTitle(title);
+    } catch (err) {
+      setError(err.message || 'Could not rename this conversation.');
     }
   };
 
   const handleSendMessage = async (textToSend) => {
-    const queryText = textToSend || question;
-    if (!queryText.trim() || isTyping) return;
+    const queryText = (textToSend || question).trim();
+    if (!queryText || isTyping) return;
 
-    // Add user message
-    const updatedMessages = [
-      ...activeConv.messages,
-      { role: 'user', content: queryText }
-    ];
+    const isFirstMessage = messages.length === 0;
+    const optimisticUserMessage = { role: 'user', content: queryText };
 
-    // Update active conversation locally
-    const currentConvIndex = conversations.findIndex(c => c.id === activeConvId);
-    const updatedConversations = [...conversations];
-    
-    // Auto-rename chat title if it's the first query
-    let title = activeConv.title;
-    if (activeConv.title === 'New Chat Session' && updatedMessages.length <= 3) {
-      title = queryText.length > 28 ? queryText.substring(0, 25) + '...' : queryText;
-    }
-
-    updatedConversations[currentConvIndex] = {
-      ...activeConv,
-      title,
-      messages: updatedMessages
-    };
-    
-    setConversations(updatedConversations);
     setQuestion('');
-    setIsTyping(true);
     setError('');
+    setIsTyping(true);
+    setMessages((prev) => [...prev, optimisticUserMessage]);
+
+    let convId = activeConvId;
+    let justCreated = false;
 
     try {
-      // API call to backend /chat?question=... -- the server logs this
-      // query for Analytics itself now (Phase 6A), no client-side record.
-      const res = await api.chat.send(queryText);
+      // Conversations are created lazily, on the first message sent while
+      // none is selected -- never on a plain page visit, so "New Chat"
+      // never litters the account with empty conversations.
+      if (convId == null) {
+        const created = await api.conversations.create();
+        convId = created.id;
+        justCreated = true;
+        setActiveConvId(convId);
+      }
 
-      // Add assistant response
-      const finalMessages = [
-        ...updatedMessages,
-        { 
-          role: 'assistant', 
-          content: res.answer || res.message || 'No response returned.', 
-          sources: res.sources || [] 
-        }
-      ];
+      const res = await api.chat.send(queryText, convId);
 
-      const refreshedConversations = [...conversations];
-      refreshedConversations[currentConvIndex] = {
-        ...activeConv,
-        title,
-        messages: finalMessages
+      const assistantMessage = {
+        role: 'assistant',
+        content: res.answer || res.message || 'No response returned.',
+        sources: res.sources || []
       };
-      setConversations(refreshedConversations);
+      setMessages((prev) => [...prev, assistantMessage]);
+
+      if (isFirstMessage) {
+        setActiveTitle(autoTitleFromQuestion(queryText));
+      }
+      refreshConversations();
     } catch (err) {
       setError(err.message || 'Failed to get response from AI. Please make sure the backend is active.');
-      // Add error placeholder message
-      const finalMessages = [
-        ...updatedMessages,
-        { 
-          role: 'assistant', 
-          content: 'Sorry, I encountered an issue connecting to the RAG pipeline. Please verify that you have uploaded documents and the backend is running.', 
-          isError: true 
-        }
-      ];
-      const refreshedConversations = [...conversations];
-      refreshedConversations[currentConvIndex] = {
-        ...activeConv,
-        title,
-        messages: finalMessages
-      };
-      setConversations(refreshedConversations);
+      // Roll back the optimistic message -- the server saved nothing
+      // either, on any answer error -- and hand the question back so it
+      // isn't lost.
+      setMessages((prev) => prev.filter((m) => m !== optimisticUserMessage));
+      setQuestion(queryText);
+      if (justCreated) {
+        setActiveConvId(null);
+        api.conversations.remove(convId).catch(() => {});
+      }
     } finally {
       setIsTyping(false);
     }
@@ -207,7 +236,7 @@ export default function Chat() {
   const renderMessageContent = (content) => {
     // 1. Split code blocks (which should remain preformatted blocks)
     const blocks = content.split(/(```[\s\S]*?```)/g);
-    
+
     return blocks.map((block, blockIdx) => {
       if (block.startsWith('```')) {
         // Code Block
@@ -371,11 +400,11 @@ export default function Chat() {
     ];
   }).slice(0, 4);
 
-  const showWelcome = (activeConv?.messages.length ?? 0) <= 1;
+  const showWelcome = messages.length === 0;
 
   return (
     <div className="flex h-[calc(100vh-80px)] md:h-[calc(100vh-80px)] rounded-[32px] overflow-hidden border border-slate-200 dark:border-slate-800/80 bg-white/40 dark:bg-slate-900/30 backdrop-blur-md relative z-10">
-      
+
       {/* Chats Sidebar */}
       <div className="hidden md:flex flex-col w-64 bg-white/60 dark:bg-slate-900/40 border-r border-slate-200 dark:border-slate-800/50 p-4">
         <button
@@ -386,31 +415,61 @@ export default function Chat() {
           New Chat
         </button>
 
+        {conversationsError && (
+          <p className="text-[9px] font-semibold text-rose-500 mt-3">{conversationsError}</p>
+        )}
+
         <div className="flex-1 overflow-y-auto mt-4 space-y-1.5 no-scrollbar">
-          {conversations.map((conv) => (
-            <button
-              key={conv.id}
-              onClick={() => {
-                setActiveConvId(conv.id);
-                setError('');
-              }}
-              className={`flex items-center justify-between w-full p-3 rounded-xl text-left text-[11px] font-semibold tracking-tight transition-all duration-200 group
-                ${activeConvId === conv.id 
-                  ? 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-white border-l-2 border-violet-600' 
-                  : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/20'}`}
-            >
-              <div className="flex items-center gap-2 truncate">
-                <MessageSquare size={14} className="shrink-0 text-slate-400" />
-                <span className="truncate">{conv.title}</span>
+          {conversationsLoading ? (
+            <div className="flex justify-center py-6">
+              <Loader2 size={16} className="animate-spin text-slate-400" />
+            </div>
+          ) : (
+            conversations.map((conv) => (
+              <div key={conv.id} className="group relative">
+                {renamingId === conv.id ? (
+                  <input
+                    autoFocus
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitRename(conv.id);
+                      if (e.key === 'Escape') setRenamingId(null);
+                    }}
+                    onBlur={() => commitRename(conv.id)}
+                    className="w-full px-3 py-3 rounded-xl text-[11px] font-semibold bg-white dark:bg-slate-800 border border-violet-500 outline-none text-slate-800 dark:text-white"
+                  />
+                ) : (
+                  <button
+                    onClick={() => openConversation(conv.id)}
+                    className={`flex items-center justify-between w-full p-3 rounded-xl text-left text-[11px] font-semibold tracking-tight transition-all duration-200
+                      ${activeConvId === conv.id
+                        ? 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-white border-l-2 border-violet-600'
+                        : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/20'}`}
+                  >
+                    <div className="flex items-center gap-2 truncate min-w-0">
+                      <MessageSquare size={14} className="shrink-0 text-slate-400" />
+                      <span className="truncate">{conv.title}</span>
+                    </div>
+                    <span className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 shrink-0">
+                      <span
+                        onClick={(e) => startRename(e, conv)}
+                        className="p-1 rounded-md text-slate-400 hover:text-violet-500 hover:bg-violet-500/10 transition-all duration-150"
+                      >
+                        <Pencil size={11} />
+                      </span>
+                      <span
+                        onClick={(e) => handleDeleteChat(e, conv.id)}
+                        className="p-1 rounded-md text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition-all duration-150"
+                      >
+                        <Trash2 size={12} />
+                      </span>
+                    </span>
+                  </button>
+                )}
               </div>
-              <span
-                onClick={(e) => handleDeleteChat(e, conv.id)}
-                className="opacity-0 group-hover:opacity-100 p-1 rounded-md text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition-all duration-150 shrink-0"
-              >
-                <Trash2 size={12} />
-              </span>
-            </button>
-          ))}
+            ))
+          )}
         </div>
       </div>
 
@@ -421,10 +480,10 @@ export default function Chat() {
           <div className="flex items-center gap-2">
             <Sparkles size={16} className="text-violet-500" />
             <h2 className="text-xs font-bold text-slate-800 dark:text-white truncate max-w-sm">
-              {activeConv?.title}
+              {activeTitle}
             </h2>
           </div>
-          <button 
+          <button
             onClick={handleNewChat}
             className="md:hidden p-1.5 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"
           >
@@ -434,7 +493,11 @@ export default function Chat() {
 
         {/* Chat Bubbles */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
-          {showWelcome ? (
+          {loadingMessages ? (
+            <div className="flex justify-center items-center h-full">
+              <Loader2 size={24} className="animate-spin text-violet-400" />
+            </div>
+          ) : showWelcome ? (
             <div className="flex flex-col items-center justify-center h-full text-center max-w-lg mx-auto py-10 space-y-6">
               <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-500 flex items-center justify-center text-white shadow-lg shadow-violet-500/10">
                 <Sparkles size={22} className="animate-pulse" />
@@ -474,17 +537,15 @@ export default function Chat() {
                 </p>
               )}
             </div>
-          ) : activeConv?.messages.map((msg, index) => (
+          ) : messages.map((msg, index) => (
             <div
-              key={index}
+              key={msg.id ?? index}
               className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}
             >
               <div className={`max-w-[85%] rounded-[24px] px-5 py-4 text-xs leading-relaxed border shadow-sm
-                ${msg.role === 'user' 
-                  ? 'bg-gradient-to-r from-violet-600 to-indigo-500 border-violet-500 text-white shadow-violet-500/5' 
-                  : msg.isError 
-                    ? 'bg-rose-500/10 border-rose-500/20 text-rose-600 dark:text-rose-400' 
-                    : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200'}`}
+                ${msg.role === 'user'
+                  ? 'bg-gradient-to-r from-violet-600 to-indigo-500 border-violet-500 text-white shadow-violet-500/5'
+                  : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200'}`}
               >
                 {/* Message Text */}
                 <div className="space-y-2">
@@ -509,9 +570,11 @@ export default function Chat() {
                           <BookOpen size={10} className="text-slate-400" />
                           <span className="truncate max-w-[120px]">{src.book_name}</span>
                           <span className="text-slate-400 font-normal">p. {src.page_number}</span>
-                          <span className="text-green-500 text-[8px] ml-1 bg-green-500/10 px-1 rounded">
-                            {Math.round(src.similarity_score * 100)}%
-                          </span>
+                          {src.similarity_score != null && (
+                            <span className="text-green-500 text-[8px] ml-1 bg-green-500/10 px-1 rounded">
+                              {Math.round(src.similarity_score * 100)}%
+                            </span>
+                          )}
                         </button>
                       ))}
                     </div>
@@ -533,8 +596,9 @@ export default function Chat() {
           )}
 
           {error && (
-            <div className="p-3 text-[10px] bg-rose-500/10 border border-rose-500/20 text-rose-500 rounded-xl text-center">
-              {error}
+            <div className="flex items-start gap-2 p-3 text-[10px] bg-rose-500/10 border border-rose-500/20 text-rose-500 rounded-xl">
+              <AlertCircle size={13} className="shrink-0 mt-0.5" />
+              <span>{error}</span>
             </div>
           )}
 
@@ -543,7 +607,7 @@ export default function Chat() {
 
         {/* Input Bar */}
         <div className="p-4 border-t border-slate-200 dark:border-slate-800/50 bg-white/40 dark:bg-slate-900/20 backdrop-blur-md">
-          <form 
+          <form
             onSubmit={(e) => {
               e.preventDefault();
               handleSendMessage();
@@ -577,14 +641,14 @@ export default function Chat() {
               <BookOpen size={16} className="text-violet-500" />
               <span className="text-xs font-bold text-slate-800 dark:text-white">Citation Detail</span>
             </div>
-            <button 
+            <button
               onClick={() => setSelectedCitation(null)}
               className="text-xs font-semibold text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800"
             >
               Close
             </button>
           </div>
-          
+
           <div className="p-5 flex-1 overflow-y-auto space-y-4 text-xs no-scrollbar">
             <div className="p-3.5 bg-slate-50 dark:bg-slate-800/40 rounded-xl space-y-2 border border-slate-100 dark:border-slate-800">
               <div className="flex justify-between text-[10px] text-slate-400 dark:text-slate-500 font-semibold">
@@ -600,7 +664,7 @@ export default function Chat() {
 
             <div className="space-y-2">
               <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider block">Cited Context Text Segment</span>
-              
+
               <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/30 text-[11px] leading-relaxed text-slate-600 dark:text-slate-300 whitespace-pre-wrap select-all border border-slate-200/30 dark:border-slate-800/50">
                 {selectedCitation?.content || "Exact context block could not be fetched, but the chunk reference is valid."}
               </div>

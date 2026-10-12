@@ -109,6 +109,10 @@ class User(Base):
     # second import attempt 409s instead of double-counting old history.
     analytics_imported_at = Column(DateTime, nullable=True)
 
+    # Phase 6C: the same one-time-import guard as analytics_imported_at,
+    # for POST /conversations/import (old browser-only chat history).
+    chats_imported_at = Column(DateTime, nullable=True)
+
 
 class Question(Base):
     """
@@ -312,3 +316,48 @@ class QuizAnswer(Base):
     question_type = Column(String, nullable=False)
     is_correct = Column(Boolean, nullable=False)
     self_graded = Column(Boolean, default=False, nullable=False)
+
+
+class Conversation(Base):
+    """
+    One chat conversation (Phase 6C), replacing the old browser-only
+    (localStorage) chat history so it follows the user to any browser.
+    title defaults to "New chat" and is auto-renamed from the first real
+    question saved into it (see main._save_chat_turn) unless the caller
+    gave POST /conversations its own title up front, or later renamed it
+    via PATCH. updated_at bumps on every saved message, so GET
+    /conversations (newest-first) reads like a normal chat app's list.
+    """
+    __tablename__ = "conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    title = Column(String, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False
+    )
+
+    messages = relationship("ChatMessage", cascade="all, delete-orphan", order_by="ChatMessage.id")
+
+
+class ChatMessage(Base):
+    """
+    One message within a Conversation. `sources` mirrors exactly what
+    /chat already returns for an assistant answer (book_name/page_number/
+    chunk_number/similarity_score/page_id/content per cited source), as a
+    JSON list -- always null for a "user" message, and null for an
+    "assistant" one with no sources (not enough information, or an
+    imported legacy message that never had any).
+    """
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), index=True, nullable=False)
+    role = Column(String, nullable=False)  # "user" | "assistant"
+    content = Column(Text, nullable=False)
+    sources = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
