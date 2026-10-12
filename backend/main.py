@@ -1752,6 +1752,30 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
     }
 
 
+class ChatRequest(BaseModel):
+    question: str
+    conversation_id: int | None = None
+
+
+@app.post("/chat")
+@limiter.limit("20/minute", key_func=_user_rate_limit_key)
+def chat_with_pdf_post(
+    request: Request,
+    payload: ChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Same question+answer pipeline as GET /chat below, just with the
+    question (and conversation_id) in a JSON body instead of the query
+    string, so a long or sensitive question never ends up sitting in a
+    URL -- server access logs, browser history, and any intermediate
+    proxy all see request bodies far less readily than URLs. This is the
+    one the frontend actually calls now; prefer it for anything new.
+    """
+    return _answer_question(payload.question, current_user, db, payload.conversation_id)
+
+
 @app.get("/chat")
 @limiter.limit("20/minute", key_func=_user_rate_limit_key)
 def chat_with_pdf(
@@ -1761,6 +1785,12 @@ def chat_with_pdf(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """
+    Deprecated (Phase 6D) -- prefer POST /chat, which keeps the question
+    out of the URL/query string entirely. Kept only for backward
+    compatibility with anything still calling it this way; behaves
+    identically to the POST version otherwise.
+    """
     return _answer_question(question, current_user, db, conversation_id)
 
 

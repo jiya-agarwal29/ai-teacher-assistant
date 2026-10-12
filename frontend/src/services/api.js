@@ -402,17 +402,19 @@ export const api = {
 
   chat: {
     /**
-     * GET /chat?question=...&conversation_id=... -- conversationId is
+     * POST /chat {question, conversation_id?} -- conversationId is
      * optional; when given (and owned), the server saves this question
-     * and the answer into that conversation itself (Phase 6C).
+     * and the answer into that conversation itself (Phase 6C). POST,
+     * not GET (Phase 6D), so the question never ends up sitting in a URL.
      */
-    send: (question, conversationId) => {
-      const queryParams = new URLSearchParams({ question });
-      if (conversationId !== undefined && conversationId !== null) {
-        queryParams.append('conversation_id', String(conversationId));
-      }
-      return request(`/chat?${queryParams.toString()}`);
-    }
+    send: (question, conversationId) => request('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question,
+        conversation_id: conversationId ?? null,
+      }),
+    })
   },
 
   conversations: {

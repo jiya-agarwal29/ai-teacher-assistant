@@ -4608,6 +4608,84 @@ def test_create_conversation_default_and_custom_title(client):
     assert all("message_count" in c and c["message_count"] == 0 for c in listing)
 
 
+# =============================
+# PHASE 6D EXTRA A: POST /chat
+# =============================
+def test_chat_post_returns_same_answer_shape_as_get(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_post_bees.txt")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.post("/chat", headers=headers, json={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["answer"] == "Bees pollinate plants [1]."
+    assert data["sources"][0]["book_name"] == "chat_post_bees.txt"
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_post_question_is_not_in_the_url(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_post_url_bees.txt")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    secret_looking_question = "What do bees do for a living and why does it matter"
+    res = client.post("/chat", headers=headers, json={"question": secret_looking_question})
+    assert res.status_code == 200, res.text
+
+    request_url = str(res.request.url)
+    assert request_url.endswith("/chat")  # no query string at all
+    assert secret_looking_question not in request_url
+    assert "question=" not in request_url
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_post_saves_into_conversation(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_post_conv_bees.txt")
+    conv = client.post("/conversations", headers=headers).json()
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.post(
+        "/chat", headers=headers, json={"question": "What do bees do?", "conversation_id": conv["id"]}
+    )
+    assert res.status_code == 200, res.text
+
+    detail = client.get(f"/conversations/{conv['id']}", headers=headers).json()
+    assert detail["title"] == "What do bees do?"
+    assert len(detail["messages"]) == 2
+    assert detail["messages"][0] == {
+        "id": detail["messages"][0]["id"], "role": "user", "content": "What do bees do?",
+        "sources": None, "created_at": detail["messages"][0]["created_at"],
+    }
+    assert detail["messages"][1]["role"] == "assistant"
+    assert detail["messages"][1]["content"] == "Bees pollinate plants [1]."
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_get_still_works_identically_backward_compatible(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_get_compat_bees.txt")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    assert res.json()["answer"] == "Bees pollinate plants [1]."
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
 def test_chat_with_conversation_id_saves_round_trip_and_auto_titles(client, llm_mock_headers, monkeypatch):
     import llm as llm_module
 
