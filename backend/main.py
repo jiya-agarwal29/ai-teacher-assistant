@@ -1,11 +1,9 @@
-import glob
+import io
 import json
 import logging
 import mimetypes
 import os
 import re
-import shutil
-import tempfile
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -33,6 +31,7 @@ import embeddings
 import jobs
 import llm
 import ocr
+import storage
 from rag import (
     generate_quiz,
     format_quiz_text,
@@ -240,32 +239,38 @@ ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
 MAX_IMAGE_MB = 15.0
 MAX_IMAGE_BYTES = int(MAX_IMAGE_MB * 1024 * 1024)
 
-# Absolute path next to this file by default, not a "./"-relative one, for
-# the same reason as database.py's DEFAULT_DB_PATH -- it must not depend on
-# the working directory the server happens to be launched from.
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR") or (Path(__file__).resolve().parent / "uploads"))
+def _book_key_prefix(user_id: int, book_id: int) -> str:
+    return f"users/{user_id}/books/{book_id}/"
 
 
-def _book_upload_dir(user_id: int, book_id: int) -> Path:
-    return UPLOAD_DIR / str(user_id) / str(book_id)
+def _original_document_key(user_id: int, book_id: int, ext: str) -> str:
+    return f"{_book_key_prefix(user_id, book_id)}original{ext}"
+
+
+def _original_image_key(user_id: int, book_id: int, index: int, ext: str) -> str:
+    return f"{_book_key_prefix(user_id, book_id)}original_images/{index:04d}{ext}"
+
+
+def _page_image_key(user_id: int, book_id: int, page_number: int) -> str:
+    return f"{_book_key_prefix(user_id, book_id)}pages/{page_number:04d}.jpg"
 
 
 def _find_original_sources(user_id: int, book_id: int):
     """
     Locates whatever was saved for /books/{id}/retry to re-process: either
     a single "original.<ext>" document, or one or more images under
-    "original_images/" (in upload order). Returns (kind, file_paths) or
-    None if nothing is saved (e.g. the upload folder was lost).
+    "original_images/" (in upload order). Returns (kind, storage_keys) or
+    None if nothing is saved (e.g. the storage backend lost the file(s)).
     """
-    book_dir = _book_upload_dir(user_id, book_id)
+    base = _book_key_prefix(user_id, book_id)
 
-    doc_matches = sorted(glob.glob(str(book_dir / "original.*")))
-    if doc_matches:
-        return "document", doc_matches
+    doc_keys = storage.storage.list_prefix(base + "original.")
+    if doc_keys:
+        return "document", doc_keys
 
-    image_matches = sorted(glob.glob(str(book_dir / "original_images" / "*")))
-    if image_matches:
-        return "images", image_matches
+    image_keys = storage.storage.list_prefix(base + "original_images/")
+    if image_keys:
+        return "images", image_keys
 
     return None
 
@@ -1171,39 +1176,31 @@ def upload_book(
 
     new_book = Book(name=book_name, user_id=current_user.id, status="processing", review_ocr=review_ocr)
     db.add(new_book)
-    db.flush()  # assigns new_book.id, needed for the upload folder name below
-
-    book_dir = _book_upload_dir(current_user.id, new_book.id)
+    db.flush()  # assigns new_book.id, needed for the storage keys below
 
     try:
-        book_dir.mkdir(parents=True, exist_ok=True)
-
         if kind == "images":
-            images_dir = book_dir / "original_images"
-            images_dir.mkdir(parents=True, exist_ok=True)
-            saved_paths = []
+            saved_keys = []
             for index, f in enumerate(image_files, start=1):
                 image_ext = os.path.splitext(f.filename or "")[1].lower()
-                dest = images_dir / f"{index:04d}{image_ext}"
+                key = _original_image_key(current_user.id, new_book.id, index, image_ext)
                 f.file.seek(0)
-                with open(dest, "wb") as out:
-                    shutil.copyfileobj(f.file, out)
-                saved_paths.append(str(dest))
+                storage.storage.save(key, f.file, content_type=mimetypes.guess_type(f.filename or "")[0])
+                saved_keys.append(key)
         else:
-            dest = book_dir / f"original{ext}"
+            key = _original_document_key(current_user.id, new_book.id, ext)
             file.file.seek(0)
-            with open(dest, "wb") as out:
-                shutil.copyfileobj(file.file, out)
-            saved_paths = [str(dest)]
+            storage.storage.save(key, file.file, content_type=_DOCUMENT_CONTENT_TYPES.get(ext))
+            saved_keys = [key]
     except Exception:
         db.rollback()
-        logger.exception("Failed to save uploaded file(s) for '%s' to disk", book_name)
+        logger.exception("Failed to save uploaded file(s) for '%s' to storage", book_name)
         raise HTTPException(status_code=500, detail="Failed to save the uploaded document.")
 
     db.commit()
     db.refresh(new_book)
 
-    jobs.submit_processing_job(new_book.id, kind, saved_paths, book_name, review_ocr)
+    jobs.submit_processing_job(new_book.id, kind, saved_keys, book_name, review_ocr)
 
     # In production this job runs on a worker thread and is still
     # "processing" by the time we get here. In tests (jobs.JOBS_SYNC=True)
@@ -1295,7 +1292,7 @@ def retry_book(
             status_code=400,
             detail="The original uploaded file is no longer available. Please upload it again."
         )
-    kind, file_paths = sources
+    kind, storage_keys = sources
 
     book.status = "processing"
     book.error = None
@@ -1307,7 +1304,7 @@ def retry_book(
     book.source_type = None
     db.commit()
 
-    jobs.submit_processing_job(book.id, kind, file_paths, book.name, book.review_ocr)
+    jobs.submit_processing_job(book.id, kind, storage_keys, book.name, book.review_ocr)
     db.refresh(book)
 
     return {"book_id": book.id, "status": book.status}
@@ -1331,39 +1328,31 @@ _DOCUMENT_CONTENT_TYPES = {
 _INLINE_FILE_EXTENSIONS = {".pdf"} | ALLOWED_IMAGE_EXTENSIONS
 
 
-def _resolve_original_file_path(user_id: int, book_id: int) -> Path:
+def _resolve_original_file_key(user_id: int, book_id: int) -> str:
     """
-    Locates the single original file to stream for GET /books/{id}/file,
-    raising a 404 for anything that isn't an actual, existing file strictly
-    inside this book's own upload folder -- defense in depth against a
-    tampered path, same as _resolve_page_image_path. A book uploaded as
-    several page images (a multi-photo scan) has no single "original file"
-    to serve, so that case 404s too -- its pages/text are still reachable
-    via GET /books/{id}/pages and /books/{id}/pages/{n}/image.
+    Locates the single original file's storage key to stream for GET
+    /books/{id}/file, 404ing if it isn't actually there -- _find_original_
+    sources only ever returns keys under this exact book's own prefix
+    (storage.list_prefix can't return anything else), so there's no
+    separate path-containment check needed here the way there was when
+    this read straight off disk. A book uploaded as several page images
+    (a multi-photo scan) has no single "original file" to serve, so that
+    case 404s too -- its pages/text are still reachable via GET
+    /books/{id}/pages and /books/{id}/pages/{n}/image.
     """
     sources = _find_original_sources(user_id, book_id)
     if not sources:
         raise HTTPException(status_code=404, detail="The original file is no longer available.")
 
-    kind, file_paths = sources
-    if kind == "images" and len(file_paths) != 1:
+    kind, keys = sources
+    if kind == "images" and len(keys) != 1:
         raise HTTPException(status_code=404, detail="This document has no single original file to open.")
 
-    book_dir = _book_upload_dir(user_id, book_id).resolve()
-    file_path = Path(file_paths[0]).resolve()
-    try:
-        file_path.relative_to(book_dir)
-    except ValueError:
-        logger.error(
-            "Refusing to serve an original file outside its book's upload folder (book_id=%d)",
-            book_id
-        )
+    key = keys[0]
+    if not storage.storage.exists(key):
         raise HTTPException(status_code=404, detail="File not found")
 
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return file_path
+    return key
 
 
 @app.get("/books/{book_id}/file")
@@ -1373,22 +1362,26 @@ def get_book_file(
     db: Session = Depends(get_db)
 ):
     book = _get_owned_book_or_404(db, book_id, current_user.id)
-    file_path = _resolve_original_file_path(current_user.id, book_id)
+    key = _resolve_original_file_key(current_user.id, book_id)
 
-    ext = file_path.suffix.lower()
+    ext = os.path.splitext(key)[1].lower()
     content_type = (
         _DOCUMENT_CONTENT_TYPES.get(ext)
-        or mimetypes.guess_type(file_path.name)[0]
+        or mimetypes.guess_type(key)[0]
         or "application/octet-stream"
     )
     disposition = "inline" if ext in _INLINE_FILE_EXTENSIONS else "attachment"
-    safe_name = re.sub(r"[^A-Za-z0-9 ._-]", "", book.name or file_path.name).strip() or file_path.name
+    default_name = os.path.basename(key)
+    safe_name = re.sub(r"[^A-Za-z0-9 ._-]", "", book.name or default_name).strip() or default_name
+    headers = {"Content-Disposition": f'{disposition}; filename="{safe_name}"'}
 
-    return FileResponse(
-        file_path,
-        media_type=content_type,
-        headers={"Content-Disposition": f'{disposition}; filename="{safe_name}"'}
-    )
+    # Local: a real path, so FileResponse (Range requests, conditional
+    # caching) -- same as before this moved behind the storage interface.
+    # S3: no such path, so stream the object body straight through.
+    local_path = storage.storage.local_path(key)
+    if local_path is not None:
+        return FileResponse(local_path, media_type=content_type, headers=headers)
+    return StreamingResponse(storage.storage.open(key), media_type=content_type, headers=headers)
 
 
 MAX_PAGE_TEXT_CHARS = 20000
@@ -1478,33 +1471,44 @@ def get_book_pages(
     ]
 
 
-def _resolve_page_image_path(user_id: int, book_id: int, page: DocumentPage) -> Path:
+def _resolve_page_image_key(user_id: int, book_id: int, page: DocumentPage) -> str:
     """
-    Validates and returns the on-disk path of a page's saved image, raising
-    a 404 for anything that isn't an actual, existing file strictly inside
-    this book's own upload folder. Used by both the image-serving route and
-    the rotate route, which are the only two things that ever touch a page
-    image file on disk -- defense in depth against a corrupted/tampered
-    image_path, regardless of what's stored in the database.
+    Validates and returns the storage key of a page's saved image, raising
+    a 404 for anything that isn't actually there, or that doesn't actually
+    belong to this book -- defense in depth against a corrupted/tampered
+    image_path, regardless of what's stored in the database. Used by both
+    the image-serving route and the rotate route, the only two things that
+    ever touch a page image. A row saved before storage.py existed has a
+    full absolute filesystem path here instead of a key (same backward-
+    compat case storage.LocalStorage itself handles) -- checked against
+    the local upload root directly, the same way this check always worked.
     """
     if not page.image_path:
         raise HTTPException(status_code=404, detail="This page has no saved image.")
 
-    book_dir = _book_upload_dir(user_id, book_id).resolve()
-    image_path = Path(page.image_path).resolve()
-    try:
-        image_path.relative_to(book_dir)
-    except ValueError:
+    key = page.image_path
+
+    if os.path.isabs(key):
+        book_dir = (storage.default_local_root() / str(user_id) / str(book_id)).resolve()
+        try:
+            Path(key).resolve().relative_to(book_dir)
+        except ValueError:
+            logger.error(
+                "Refusing to touch a page image outside its book's upload folder (book_id=%d, page=%d)",
+                book_id, page.page_number
+            )
+            raise HTTPException(status_code=404, detail="Image not found")
+    elif not key.startswith(_book_key_prefix(user_id, book_id)):
         logger.error(
-            "Refusing to touch a page image outside its book's upload folder (book_id=%d, page=%d)",
+            "Refusing to touch a page image outside its book's own key prefix (book_id=%d, page=%d)",
             book_id, page.page_number
         )
         raise HTTPException(status_code=404, detail="Image not found")
 
-    if not image_path.is_file():
+    if not storage.storage.exists(key):
         raise HTTPException(status_code=404, detail="Image not found")
 
-    return image_path
+    return key
 
 
 @app.get("/books/{book_id}/pages/{page_number}/image")
@@ -1516,9 +1520,12 @@ def get_page_image(
 ):
     _get_owned_book_or_404(db, book_id, current_user.id)
     page = _get_document_page_or_404(db, book_id, page_number)
-    image_path = _resolve_page_image_path(current_user.id, book_id, page)
+    key = _resolve_page_image_key(current_user.id, book_id, page)
 
-    return FileResponse(image_path, media_type="image/jpeg")
+    local_path = storage.storage.local_path(key)
+    if local_path is not None:
+        return FileResponse(local_path, media_type="image/jpeg")
+    return StreamingResponse(storage.storage.open(key), media_type="image/jpeg")
 
 
 @app.put("/books/{book_id}/pages/{page_number}")
@@ -1620,11 +1627,11 @@ def rotate_page_image(
     if payload.direction not in ROTATE_DIRECTIONS:
         raise HTTPException(status_code=400, detail="direction must be 'left' or 'right'.")
 
-    image_path = _resolve_page_image_path(current_user.id, book_id, page)
+    key = _resolve_page_image_key(current_user.id, book_id, page)
 
     try:
-        rotated_bytes = ocr.rotate_image(image_path.read_bytes(), payload.direction)
-        image_path.write_bytes(rotated_bytes)
+        rotated_bytes = ocr.rotate_image(storage.storage.read(key), payload.direction)
+        storage.storage.save(key, rotated_bytes, content_type="image/jpeg")
     except Exception:
         logger.exception("Failed to rotate page image for book_id=%d page=%d", book_id, page_number)
         raise HTTPException(status_code=500, detail="Failed to rotate this page's image.")
@@ -1672,7 +1679,7 @@ def delete_book(
     db.commit()
     invalidate_cache(current_user.id)
 
-    shutil.rmtree(_book_upload_dir(current_user.id, book_id), ignore_errors=True)
+    storage.storage.delete_prefix(_book_key_prefix(current_user.id, book_id))
 
     return {
         "status": "Book and associated chunks deleted successfully"
@@ -3272,13 +3279,16 @@ def _paper_detail(db: Session, paper_row: Paper) -> dict:
     }
 
 
-def _extract_text_for_pattern_import(file_path: str, filename: str) -> str:
+def _extract_text_for_pattern_import(file_bytes: bytes, filename: str) -> str:
     """
     Extracts plain text from an uploaded file for POST /papers/import-
     pattern -- never creates a Book/DocumentPage/Page row (this file is
-    never added to the user's documents or search index), just returns
-    the combined text so it can be handed to Gemini and the temp file
-    deleted right after. Reuses document_parsers.py for text extraction
+    never added to the user's documents or search index) and never
+    touches the storage layer at all, since nothing here ever needs to be
+    read again after this one request -- just works directly off the
+    upload's own bytes in memory (document_parsers' parsers all take a
+    file-like object, and pypdfium2 accepts raw bytes directly, so no temp
+    file is needed either). Reuses document_parsers.py for text extraction
     and the same Gemini-vision OCR fallback jobs.py's background pipeline
     uses for a low-text PDF page or a bare photo/scan -- run synchronously
     here (no Book to track progress against, and the whole import has to
@@ -3287,14 +3297,11 @@ def _extract_text_for_pattern_import(file_path: str, filename: str) -> str:
     ext = os.path.splitext(filename)[1].lower()
 
     if ext in ALLOWED_IMAGE_EXTENSIONS:
-        with open(file_path, "rb") as f:
-            raw_bytes = f.read()
-        prepared = ocr.prepare_image_for_ocr(raw_bytes)
+        prepared = ocr.prepare_image_for_ocr(file_bytes)
         return llm.read_image(prepared, mime_type="image/jpeg")
 
     if ext == ".pdf":
-        with open(file_path, "rb") as f:
-            pages_data = document_parsers.parse_pdf(f)
+        pages_data = document_parsers.parse_pdf(io.BytesIO(file_bytes))
 
         low_text_pages = [p for p in pages_data if len(p["content"].strip()) < jobs.OCR_MIN_CHARS]
         if len(low_text_pages) > MAX_OCR_PAGES:
@@ -3309,13 +3316,12 @@ def _extract_text_for_pattern_import(file_path: str, filename: str) -> str:
             if len(content.strip()) >= jobs.OCR_MIN_CHARS:
                 texts.append(content)
                 continue
-            rendered = ocr.render_pdf_page_to_png(file_path, page_index=page["page_number"] - 1)
+            rendered = ocr.render_pdf_page_to_png(file_bytes, page_index=page["page_number"] - 1)
             prepared = ocr.prepare_image_for_ocr(rendered)
             texts.append(llm.read_image(prepared, mime_type="image/jpeg"))
         return "\n\n".join(texts)
 
-    with open(file_path, "rb") as f:
-        pages_data = document_parsers.parse_document(f, filename)
+    pages_data = document_parsers.parse_document(io.BytesIO(file_bytes), filename)
     return "\n\n".join(p["content"] for p in pages_data)
 
 
@@ -3425,9 +3431,10 @@ def import_paper_pattern(
     Reads an old/existing question paper (a document, or a single photo/
     scan) and extracts its section layout + questions with Gemini, for the
     "New paper" builder's custom pattern editor to start from. Never saved
-    as a Book or added to the user's documents/search index -- the
-    uploaded file is deleted again once its text has been read, whether
-    this succeeds or fails.
+    as a Book or added to the user's documents/search index, and never
+    written to storage at all -- read straight off the upload's own bytes
+    in memory and discarded once this request returns, whether it
+    succeeds or fails.
     """
     filename = file.filename or ""
     ext = os.path.splitext(filename)[1].lower()
@@ -3452,53 +3459,46 @@ def import_paper_pattern(
             )
         )
 
-    tmp_path = None
+    file.file.seek(0)
+    file_bytes = file.file.read()
+
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            file.file.seek(0)
-            shutil.copyfileobj(file.file, tmp)
-            tmp_path = tmp.name
+        text = _extract_text_for_pattern_import(file_bytes, filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
-        try:
-            text = _extract_text_for_pattern_import(tmp_path, filename)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        except llm.LLMUnavailableError:
-            raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+    if not text or not text.strip():
+        raise HTTPException(status_code=422, detail="Could not read any text from this file.")
 
-        if not text or not text.strip():
-            raise HTTPException(status_code=422, detail="Could not read any text from this file.")
+    try:
+        result = llm.generate_json(_build_pattern_import_prompt(text), schema=PATTERN_IMPORT_SCHEMA)
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
-        try:
-            result = llm.generate_json(_build_pattern_import_prompt(text), schema=PATTERN_IMPORT_SCHEMA)
-        except llm.LLMUnavailableError:
-            raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+    if not isinstance(result, dict) or not result.get("sections"):
+        raise HTTPException(
+            status_code=422,
+            detail="Couldn't find a question paper layout in this file. Try a clearer scan or a different file."
+        )
 
-        if not isinstance(result, dict) or not result.get("sections"):
-            raise HTTPException(
-                status_code=422,
-                detail="Couldn't find a question paper layout in this file. Try a clearer scan or a different file."
-            )
+    try:
+        pattern = _pattern_from_import_result(result)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Couldn't understand this paper's layout ({exc}).")
 
-        try:
-            pattern = _pattern_from_import_result(result)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=f"Couldn't understand this paper's layout ({exc}).")
+    pattern_errors = paper.validate_pattern(pattern)
+    if pattern_errors:
+        raise HTTPException(status_code=422, detail=pattern_errors)
 
-        pattern_errors = paper.validate_pattern(pattern)
-        if pattern_errors:
-            raise HTTPException(status_code=422, detail=pattern_errors)
+    raw_questions = result.get("questions") or []
 
-        raw_questions = result.get("questions") or []
-
-        return {
-            "pattern": _pattern_to_dict(pattern),
-            "questions": raw_questions,
-            "bloom_mix": _estimate_bloom_mix(raw_questions),
-        }
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    return {
+        "pattern": _pattern_to_dict(pattern),
+        "questions": raw_questions,
+        "bloom_mix": _estimate_bloom_mix(raw_questions),
+    }
 
 
 @app.get("/paper-patterns")

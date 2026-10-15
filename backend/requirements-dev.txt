@@ -1,3 +1,8 @@
 -r requirements.txt
 
 pytest==9.1.1
+
+# Test-only in-memory fake S3 (tests/test_storage.py, and the "PHASE 7B"
+# section of tests/test_api.py) -- lets the storage-layer tests exercise
+# S3Storage without a real bucket.
+moto[s3]==5.2.4

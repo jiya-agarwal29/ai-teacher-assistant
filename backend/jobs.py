@@ -1,7 +1,7 @@
 """
 Background document-processing worker.
 
-/upload-book only validates the file(s), saves them to disk, and creates a
+/upload-book only validates the file(s), saves them via storage.py, and creates a
 Book row with status="processing" before returning 202 -- everything slow
 (parsing/OCR, chunking, embedding, saving pages) runs here, off the request
 thread, in a small pool of worker threads. Each job opens its own DB session
@@ -21,6 +21,7 @@ re-approved after a post-approval edit, in which case it rebuilds -- see
 _chunk_embed_and_save) -- and submit_reread_job() re-runs OCR for a single
 already-saved page image.
 """
+import io
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +32,7 @@ import embeddings
 import json
 import llm
 import ocr
+import storage
 from document_parsers import chunk_parsed_document
 from models import Book, DocumentPage, Page
 from retrieval import invalidate_cache
@@ -65,17 +67,18 @@ _executor = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix="doc-
 JOBS_SYNC = os.getenv("JOBS_SYNC", "false").strip().lower() == "true"
 
 
-def submit_processing_job(book_id: int, kind: str, file_paths: list, filename: str, review_ocr: bool = True):
+def submit_processing_job(book_id: int, kind: str, storage_keys: list, filename: str, review_ocr: bool = True):
     """
     Queues background processing for an already-saved upload. Returns
-    immediately. `kind` is "document" (file_paths has exactly one path: a
+    immediately. `kind` is "document" (storage_keys has exactly one key: a
     pdf/docx/pptx/doc/ppt/txt/md file) or "images" (one or more page image
-    paths, in reading order).
+    keys, in reading order). The original bytes are read from storage.py's
+    storage backend, not straight off disk.
     """
     if JOBS_SYNC:
-        _process_book(book_id, kind, file_paths, filename, review_ocr)
+        _process_book(book_id, kind, storage_keys, filename, review_ocr)
     else:
-        _executor.submit(_process_book, book_id, kind, file_paths, filename, review_ocr)
+        _executor.submit(_process_book, book_id, kind, storage_keys, filename, review_ocr)
 
 
 def _mark_failed(db, book_id: int, error: str):
@@ -87,24 +90,20 @@ def _mark_failed(db, book_id: int, error: str):
     db.commit()
 
 
-def _save_page_image(book_dir, page_number: int, image_bytes: bytes) -> str:
-    pages_dir = os.path.join(book_dir, "pages")
-    os.makedirs(pages_dir, exist_ok=True)
-    path = os.path.join(pages_dir, f"{page_number:04d}.jpg")
-    with open(path, "wb") as f:
-        f.write(image_bytes)
-    return path
+def _save_page_image(user_id: int, book_id: int, page_number: int, image_bytes: bytes) -> str:
+    key = f"users/{user_id}/books/{book_id}/pages/{page_number:04d}.jpg"
+    storage.storage.save(key, image_bytes, content_type="image/jpeg")
+    return key
 
 
-def _extract_pdf_as_pages(db, book, file_path: str, book_dir: str, review_ocr: bool) -> list:
+def _extract_pdf_as_pages(db, book, pdf_bytes: bytes, review_ocr: bool) -> list:
     """
     Per-page decision for a PDF: pdfplumber text if the page has at least
     OCR_MIN_CHARS real (post-cleanup) characters, otherwise render that page
     with pypdfium2 and OCR it with Gemini vision. Returns a list of page
     records (page_number/extracted_text/method/review_status/image_path).
     """
-    with open(file_path, "rb") as f:
-        pages_data = document_parsers.parse_pdf(f)
+    pages_data = document_parsers.parse_pdf(io.BytesIO(pdf_bytes))
 
     ocr_page_numbers = [
         p["page_number"] for p in pages_data if len(p["content"].strip()) < OCR_MIN_CHARS
@@ -138,9 +137,11 @@ def _extract_pdf_as_pages(db, book, file_path: str, book_dir: str, review_ocr: b
             })
             continue
 
-        rendered = ocr.render_pdf_page_to_png(file_path, page_index=page_number - 1)
+        # pypdfium2.PdfDocument accepts raw bytes directly -- no need to
+        # round-trip this through a temp file on disk.
+        rendered = ocr.render_pdf_page_to_png(pdf_bytes, page_index=page_number - 1)
         prepared = ocr.prepare_image_for_ocr(rendered)
-        image_path = _save_page_image(book_dir, page_number, prepared)
+        image_path = _save_page_image(book.user_id, book.id, page_number, prepared)
 
         extracted_text = llm.read_image(
             prepared, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
@@ -161,25 +162,24 @@ def _extract_pdf_as_pages(db, book, file_path: str, book_dir: str, review_ocr: b
     return records
 
 
-def _extract_images_as_pages(db, book, file_paths: list, book_dir: str, review_ocr: bool) -> list:
+def _extract_images_as_pages(db, book, image_keys: list, review_ocr: bool) -> list:
     """Every image is its own page, always OCR'd, in the order given."""
-    if len(file_paths) > MAX_OCR_PAGES:
+    if len(image_keys) > MAX_OCR_PAGES:
         raise ValueError(
-            f"This document has {len(file_paths)} images, over the {MAX_OCR_PAGES}-page OCR limit."
+            f"This document has {len(image_keys)} images, over the {MAX_OCR_PAGES}-page OCR limit."
         )
 
-    book.pages_total = len(file_paths)
+    book.pages_total = len(image_keys)
     book.pages_done = 0
     db.commit()
 
     records = []
 
-    for index, path in enumerate(file_paths, start=1):
-        with open(path, "rb") as f:
-            raw_bytes = f.read()
+    for index, key in enumerate(image_keys, start=1):
+        raw_bytes = storage.storage.read(key)
 
         prepared = ocr.prepare_image_for_ocr(raw_bytes)
-        image_path = _save_page_image(book_dir, index, prepared)
+        image_path = _save_page_image(book.user_id, book.id, index, prepared)
 
         extracted_text = llm.read_image(
             prepared, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
@@ -199,15 +199,14 @@ def _extract_images_as_pages(db, book, file_paths: list, book_dir: str, review_o
     return records
 
 
-def _extract_document_as_pages(db, book, file_path: str, filename: str, book_dir: str, review_ocr: bool) -> list:
+def _extract_document_as_pages(db, book, document_bytes: bytes, filename: str, review_ocr: bool) -> list:
     """PDF gets the per-page OCR-aware treatment above; everything else is unchanged from Phase 3A (always method="text")."""
     ext = os.path.splitext(filename)[1].lower()
 
     if ext == ".pdf":
-        return _extract_pdf_as_pages(db, book, file_path, book_dir, review_ocr)
+        return _extract_pdf_as_pages(db, book, document_bytes, review_ocr)
 
-    with open(file_path, "rb") as f:
-        pages_data = document_parsers.parse_document(f, filename)
+    pages_data = document_parsers.parse_document(io.BytesIO(document_bytes), filename)
 
     return [
         {
@@ -221,13 +220,13 @@ def _extract_document_as_pages(db, book, file_path: str, filename: str, book_dir
     ]
 
 
-def _process_book(book_id: int, kind: str, file_paths: list, filename: str, review_ocr: bool):
+def _process_book(book_id: int, kind: str, storage_keys: list, filename: str, review_ocr: bool):
     # Looked up on the database module at call time (not imported by name)
     # so tests can redirect it to an isolated test database -- see
     # tests/test_api.py's `database.SessionLocal = TestSessionLocal`.
     db = database.SessionLocal()
     try:
-        _run_pipeline(db, book_id, kind, file_paths, filename, review_ocr)
+        _run_pipeline(db, book_id, kind, storage_keys, filename, review_ocr)
     except Exception:
         logger.exception("Unhandled error while processing book_id=%d ('%s')", book_id, filename)
         try:
@@ -238,7 +237,7 @@ def _process_book(book_id: int, kind: str, file_paths: list, filename: str, revi
         db.close()
 
 
-def _run_pipeline(db, book_id: int, kind: str, file_paths: list, filename: str, review_ocr: bool):
+def _run_pipeline(db, book_id: int, kind: str, storage_keys: list, filename: str, review_ocr: bool):
     book = db.query(Book).filter(Book.id == book_id).first()
     if not book:
         logger.error("Background job: book_id=%d no longer exists, skipping", book_id)
@@ -251,13 +250,12 @@ def _run_pipeline(db, book_id: int, kind: str, file_paths: list, filename: str, 
     db.query(DocumentPage).filter(DocumentPage.book_id == book_id).delete()
     db.commit()
 
-    book_dir = os.path.dirname(file_paths[0]) if kind == "document" else os.path.dirname(os.path.dirname(file_paths[0]))
-
     try:
         if kind == "images":
-            page_records = _extract_images_as_pages(db, book, file_paths, book_dir, review_ocr)
+            page_records = _extract_images_as_pages(db, book, storage_keys, review_ocr)
         else:
-            page_records = _extract_document_as_pages(db, book, file_paths[0], filename, book_dir, review_ocr)
+            document_bytes = storage.storage.read(storage_keys[0])
+            page_records = _extract_document_as_pages(db, book, document_bytes, filename, review_ocr)
     except NotImplementedError as e:
         _mark_failed(db, book_id, str(e))
         return
@@ -502,8 +500,7 @@ def _reread_page(book_id: int, page_number: int):
             return
 
         try:
-            with open(page.image_path, "rb") as f:
-                image_bytes = f.read()
+            image_bytes = storage.storage.read(page.image_path)
             page.extracted_text = llm.read_image(
                 image_bytes, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
             )

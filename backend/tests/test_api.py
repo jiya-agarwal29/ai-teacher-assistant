@@ -48,15 +48,19 @@ test_engine = database.make_engine(TEST_DATABASE_URL)
 TestSessionLocal = sessionmaker(bind=test_engine)
 
 import main
+import storage
 from database import get_db
 from models import Base, DocumentPage, Page
 
 # Redirect uploaded-file storage to a test-only folder -- otherwise uploads
 # made here would land in the same backend/uploads/ used by a real dev
 # server, where book ids from this throwaway test database could collide
-# with (and overwrite) a real book's saved file.
+# with (and overwrite) a real book's saved file. main.py/jobs.py both look
+# this up as `storage.storage` at call time (not imported by name), same
+# reasoning as database.SessionLocal/engine below, so reassigning the
+# module attribute here reaches them too.
 TEST_UPLOAD_DIR = Path(os.path.dirname(__file__)) / "test_uploads"
-main.UPLOAD_DIR = TEST_UPLOAD_DIR
+storage.storage = storage.LocalStorage(TEST_UPLOAD_DIR)
 
 # main.py's lifespan (interrupted-job cleanup) and jobs.py's background
 # worker each open their own session via `database.SessionLocal()` looked
@@ -734,7 +738,7 @@ def test_book_file_404_when_no_original_saved(client, phase3a_headers):
     finally:
         db.close()
 
-    for path in glob_module.glob(str(main.UPLOAD_DIR / str(user_id) / str(book_id) / "original.*")):
+    for path in glob_module.glob(str(TEST_UPLOAD_DIR / str(user_id) / str(book_id) / "original.*")):
         os.remove(path)
 
     res = client.get(f"/books/{book_id}/file", headers=headers)
@@ -836,7 +840,7 @@ def test_delete_book_removes_upload_folder(client, phase3a_headers):
 
     book_id = _upload_bees_doc(client, headers, "folder_bees.txt")
 
-    matching_dirs = list(Path(main.UPLOAD_DIR).glob(f"*/{book_id}"))
+    matching_dirs = list(Path(TEST_UPLOAD_DIR).glob(f"*/{book_id}"))
     assert len(matching_dirs) == 1
     book_dir = matching_dirs[0]
     assert list(book_dir.glob("original.*"))  # the saved original file is there
@@ -1534,6 +1538,199 @@ def test_upload_size_limit_boundary(client, phase3a_headers, monkeypatch):
     assert under_limit_res.status_code == 202
 
     client.delete(f"/books/{under_limit_res.json()['book_id']}", headers=headers)
+
+
+# -----------------------------
+# PHASE 7B: STORAGE LAYER -- same flows re-run against a moto-mocked
+# S3Storage instead of the default LocalStorage, so upload/retry/rotate/
+# delete and the owner checks are confirmed to work identically on both
+# backends, not just the one the rest of this file runs against by
+# default. See tests/test_storage.py for direct, lower-level
+# LocalStorage/S3Storage interface tests (save/read/exists/delete/
+# delete_prefix/list_prefix) with no HTTP or database involved at all.
+# -----------------------------
+@pytest.fixture
+def s3_storage_backend(monkeypatch):
+    """
+    Swaps storage.storage to a moto-mocked S3Storage for the duration of
+    one test, restored automatically afterward -- lets the exact same
+    upload/retry/rotate/delete flow run against S3Storage instead of
+    LocalStorage, without ever touching a real bucket.
+    """
+    import boto3
+    import moto
+
+    with moto.mock_aws():
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="test-bucket")
+        fake_s3 = storage.S3Storage(
+            endpoint_url=None, region="us-east-1", bucket="test-bucket",
+            access_key_id="testing", secret_access_key="testing",
+        )
+        monkeypatch.setattr(storage, "storage", fake_s3)
+        yield fake_s3
+
+
+_REAL_S3_SETTING_NAMES = [
+    "TEST_S3_ENDPOINT_URL", "TEST_S3_REGION", "TEST_S3_BUCKET",
+    "TEST_S3_ACCESS_KEY_ID", "TEST_S3_SECRET_ACCESS_KEY",
+]
+
+
+def _real_s3_settings():
+    """Same TEST_S3_* lookup as tests/test_storage.py's real_s3_settings() -- duplicated rather than cross-imported so this file has no import-order dependency on that one. Returns None if any of the five settings is missing."""
+    values = {name: os.getenv(name) or _env_file_values.get(name) for name in _REAL_S3_SETTING_NAMES}
+    return values if all(values.values()) else None
+
+
+@pytest.fixture
+def real_s3_storage_backend(monkeypatch):
+    """
+    Like s3_storage_backend above, but against a real (ideally dedicated
+    test-only) S3-compatible bucket via TEST_S3_* in backend/.env, instead
+    of the moto fake -- skips (doesn't fail) if those aren't fully set.
+    """
+    settings = _real_s3_settings()
+    if settings is None:
+        pytest.skip("TEST_S3_* not fully set in backend/.env -- skipping the real S3 round-trip check.")
+
+    real_s3 = storage.S3Storage(
+        endpoint_url=settings["TEST_S3_ENDPOINT_URL"],
+        region=settings["TEST_S3_REGION"],
+        bucket=settings["TEST_S3_BUCKET"],
+        access_key_id=settings["TEST_S3_ACCESS_KEY_ID"],
+        secret_access_key=settings["TEST_S3_SECRET_ACCESS_KEY"],
+    )
+    monkeypatch.setattr(storage, "storage", real_s3)
+    yield real_s3
+
+
+def test_upload_file_pages_retry_delete_round_trip_on_s3_backend(client, s3_storage_backend, monkeypatch):
+    import llm as llm_module
+
+    username, headers = _fresh_phase6a_user(client)
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("s3_bees.txt", BEES_CONTENT, "text/plain")}
+    )
+    assert res.status_code == 202, res.text
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "ready"
+
+    # Original file streams back correctly from S3, not just local disk.
+    file_res = client.get(f"/books/{book_id}/file", headers=headers)
+    assert file_res.status_code == 200
+    assert file_res.content == BEES_CONTENT
+
+    pages_res = client.get(f"/books/{book_id}/pages", headers=headers)
+    assert pages_res.status_code == 200
+    assert pages_res.json()[0]["extracted_text"]
+
+    # Retry re-reads the original straight from S3 and reprocesses it.
+    import embeddings
+    fake_embed_documents = embeddings.embed_documents
+    state = {"should_fail": True}
+
+    def flaky_embed_documents(texts, max_wait_seconds=None, on_batch_done=None):
+        if state["should_fail"]:
+            raise embeddings.EmbeddingServiceBusyError("busy")
+        return fake_embed_documents(texts, max_wait_seconds=max_wait_seconds, on_batch_done=on_batch_done)
+    monkeypatch.setattr(embeddings, "embed_documents", flaky_embed_documents)
+
+    res2 = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("s3_bees_retry.txt", BEES_CONTENT, "text/plain")}
+    )
+    retry_book_id = res2.json()["book_id"]
+    assert res2.json()["status"] == "failed"
+
+    state["should_fail"] = False
+    retry_res = client.post(f"/books/{retry_book_id}/retry", headers=headers)
+    assert retry_res.status_code == 202
+    assert retry_res.json()["status"] == "ready"
+
+    # delete_prefix actually removes every object this book saved to S3.
+    prefix = f"users/{_user_id(username)}/books/{book_id}/"
+    assert s3_storage_backend.list_prefix(prefix)  # something is there before delete
+
+    del_res = client.delete(f"/books/{book_id}", headers=headers)
+    assert del_res.status_code == 200
+    assert s3_storage_backend.list_prefix(prefix) == []
+
+    client.delete(f"/books/{retry_book_id}", headers=headers)
+
+
+def test_ocr_page_image_rotate_and_owner_check_on_s3_backend(client, s3_storage_backend, monkeypatch):
+    import io
+    import llm as llm_module
+    from PIL import Image
+
+    _, headers = _fresh_phase6a_user(client)
+    _, other_headers = _fresh_phase6a_user(client)
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Some note.")
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"files": ("s3_rotate.png", _make_test_image_bytes(size=(40, 20)), "image/png")},
+        data={"review_ocr": "true"}
+    )
+    assert res.status_code == 202, res.text
+    book_id = res.json()["book_id"]
+
+    # Owner can fetch the page image (streamed from S3, no local_path).
+    before_res = client.get(f"/books/{book_id}/pages/1/image", headers=headers)
+    assert before_res.status_code == 200
+    before_image = Image.open(io.BytesIO(before_res.content))
+    assert before_image.size == (40, 20)
+
+    # A non-owner still gets 404 -- the owner check is unchanged on S3.
+    other_res = client.get(f"/books/{book_id}/pages/1/image", headers=other_headers)
+    assert other_res.status_code == 404
+
+    # Rotate reads + rewrites the same S3 object.
+    rotate_res = client.post(f"/books/{book_id}/pages/1/rotate", headers=headers, json={"direction": "left"})
+    assert rotate_res.status_code == 200
+
+    after_res = client.get(f"/books/{book_id}/pages/1/image", headers=headers)
+    after_image = Image.open(io.BytesIO(after_res.content))
+    assert after_image.size == (20, 40)  # swapped -- genuinely rotated, not just a 200
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_upload_file_delete_round_trip_on_real_s3_bucket(client, real_s3_storage_backend):
+    """
+    Phase 7B item 5: if TEST_S3_* is fully set in backend/.env, run one
+    real upload -> GET /books/{id}/file -> delete through the actual API
+    against that bucket (not just moto), and confirm delete_prefix really
+    removed everything this test created. Skipped (not failed) otherwise
+    -- see real_s3_storage_backend above.
+    """
+    username, headers = _fresh_phase6a_user(client)
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("real_s3_bees.txt", BEES_CONTENT, "text/plain")}
+    )
+    assert res.status_code == 202, res.text
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "ready"
+    prefix = f"users/{_user_id(username)}/books/{book_id}/"
+
+    try:
+        file_res = client.get(f"/books/{book_id}/file", headers=headers)
+        assert file_res.status_code == 200
+        assert file_res.content == BEES_CONTENT
+        assert real_s3_storage_backend.list_prefix(prefix)  # something is really there
+    finally:
+        del_res = client.delete(f"/books/{book_id}", headers=headers)
+        assert del_res.status_code == 200
+
+    assert real_s3_storage_backend.list_prefix(prefix) == []
 
 
 # -----------------------------
@@ -4110,17 +4307,21 @@ def test_import_paper_pattern_structurally_invalid_section_returns_422(client, p
     assert res.status_code == 422
 
 
-def test_import_paper_pattern_file_not_added_to_documents_and_deleted(client, phase5b_headers, monkeypatch):
+def test_import_paper_pattern_file_not_added_to_documents_or_storage(client, phase5b_headers, monkeypatch):
     import llm as llm_module
 
     headers = phase5b_headers
     captured = {}
     real_extract = main._extract_text_for_pattern_import
 
-    def spy_extract(file_path, filename):
-        captured["path"] = file_path
-        assert os.path.exists(file_path)  # still there while the request is in flight
-        return real_extract(file_path, filename)
+    def spy_extract(file_bytes, filename):
+        captured["bytes"] = file_bytes
+        # Works straight off the upload's own bytes in memory -- no temp
+        # file, and never written to storage.py's storage backend either
+        # (Fix Phase 7B item 2: this content is never read again after
+        # this one request, so there's nothing worth persisting anywhere).
+        assert isinstance(file_bytes, bytes)
+        return real_extract(file_bytes, filename)
     monkeypatch.setattr(main, "_extract_text_for_pattern_import", spy_extract)
 
     def fake(prompt, schema, system=None):
@@ -4141,8 +4342,7 @@ def test_import_paper_pattern_file_not_added_to_documents_and_deleted(client, ph
     books_after = client.get("/books", headers=headers).json()
     assert len(books_after) == len(books_before)  # never added as a document
 
-    assert "path" in captured
-    assert not os.path.exists(captured["path"])  # deleted once the request finished
+    assert captured.get("bytes") == b"Some old paper text content."
 
 
 # =============================
