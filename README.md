@@ -64,6 +64,8 @@ source venv/bin/activate       # macOS/Linux
 pip install -r requirements.txt
 ```
 
+**Already have a `backend/venv` from before Phase 6?** Re-run `pip install -r requirements.txt` after every pull, not just the first time — it now includes `tzdata` (Windows ships no system IANA timezone database at all, which `zoneinfo`, used by [Analytics and history](#analytics-and-history), needs), and an existing venv won't pick up a newly-added dependency on its own.
+
 For running the test suite too, install the dev extras instead (installs `requirements.txt` plus `pytest`):
 
 ```

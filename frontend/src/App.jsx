@@ -10,6 +10,7 @@ import Login from './pages/Login';
 import Home from './pages/Home';
 import Chat from './pages/Chat';
 import Documents from './pages/Documents';
+import DocumentView from './pages/DocumentView';
 import DocumentReview from './pages/DocumentReview';
 import AITools from './pages/AITools';
 import QuestionBank from './pages/QuestionBank';
@@ -57,6 +58,7 @@ export default function App() {
               <Route path="/" element={<Home />} />
               <Route path="/chat" element={<Chat />} />
               <Route path="/documents" element={<Documents />} />
+              <Route path="/documents/:id" element={<DocumentView />} />
               <Route path="/documents/:id/review" element={<DocumentReview />} />
               <Route path="/tools" element={<AITools />} />
               <Route path="/question-bank" element={<QuestionBank />} />

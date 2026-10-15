@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../services/api';
 import { useAuth } from '../hooks/useAuth';
 import DocumentStatusBadge from '../components/DocumentStatusBadge';
@@ -23,6 +23,7 @@ const STATUS_POLL_INTERVAL_MS = 2000;
 export default function Home() {
   const { user } = useAuth();
 
+  const navigate = useNavigate();
   const [books, setBooks] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -381,9 +382,10 @@ export default function Home() {
             ) : (
               <div className="space-y-3">
                 {books.slice(0, 3).map((book) => (
-                  <div 
+                  <div
                     key={book.id}
-                    className="flex items-center justify-between p-4 rounded-2xl bg-slate-50/70 dark:bg-slate-800/20 border border-slate-100 dark:border-slate-800/30 group hover:border-slate-200 dark:hover:border-slate-800 transition-all"
+                    onClick={() => navigate(`/documents/${book.id}`)}
+                    className="flex items-center justify-between p-4 rounded-2xl bg-slate-50/70 dark:bg-slate-800/20 border border-slate-100 dark:border-slate-800/30 group hover:border-slate-200 dark:hover:border-slate-800 transition-all cursor-pointer"
                   >
                     <div className="flex items-center gap-3 min-w-0">
                       <div className="w-9 h-9 rounded-xl bg-violet-500/10 text-violet-600 dark:text-violet-400 flex items-center justify-center shrink-0">
@@ -398,7 +400,7 @@ export default function Home() {
                         </span>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex items-center gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
                       <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} bookId={book.id} />
                       {book.status === 'failed' && (
                         <button

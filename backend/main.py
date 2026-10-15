@@ -1,6 +1,7 @@
 import glob
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -1285,6 +1286,84 @@ def retry_book(
     db.refresh(book)
 
     return {"book_id": book.id, "status": book.status}
+
+
+# -----------------------------
+# ORIGINAL FILE DOWNLOAD/VIEW
+# -----------------------------
+_DOCUMENT_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+}
+# Browsers can render these inline (PDF in an <iframe>/<object>, images
+# directly); everything else (docx/pptx/doc/ppt/txt/md) can't be displayed
+# in-browser, so it's served as an attachment for a "Download original" button.
+_INLINE_FILE_EXTENSIONS = {".pdf"} | ALLOWED_IMAGE_EXTENSIONS
+
+
+def _resolve_original_file_path(user_id: int, book_id: int) -> Path:
+    """
+    Locates the single original file to stream for GET /books/{id}/file,
+    raising a 404 for anything that isn't an actual, existing file strictly
+    inside this book's own upload folder -- defense in depth against a
+    tampered path, same as _resolve_page_image_path. A book uploaded as
+    several page images (a multi-photo scan) has no single "original file"
+    to serve, so that case 404s too -- its pages/text are still reachable
+    via GET /books/{id}/pages and /books/{id}/pages/{n}/image.
+    """
+    sources = _find_original_sources(user_id, book_id)
+    if not sources:
+        raise HTTPException(status_code=404, detail="The original file is no longer available.")
+
+    kind, file_paths = sources
+    if kind == "images" and len(file_paths) != 1:
+        raise HTTPException(status_code=404, detail="This document has no single original file to open.")
+
+    book_dir = _book_upload_dir(user_id, book_id).resolve()
+    file_path = Path(file_paths[0]).resolve()
+    try:
+        file_path.relative_to(book_dir)
+    except ValueError:
+        logger.error(
+            "Refusing to serve an original file outside its book's upload folder (book_id=%d)",
+            book_id
+        )
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return file_path
+
+
+@app.get("/books/{book_id}/file")
+def get_book_file(
+    book_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
+    file_path = _resolve_original_file_path(current_user.id, book_id)
+
+    ext = file_path.suffix.lower()
+    content_type = (
+        _DOCUMENT_CONTENT_TYPES.get(ext)
+        or mimetypes.guess_type(file_path.name)[0]
+        or "application/octet-stream"
+    )
+    disposition = "inline" if ext in _INLINE_FILE_EXTENSIONS else "attachment"
+    safe_name = re.sub(r"[^A-Za-z0-9 ._-]", "", book.name or file_path.name).strip() or file_path.name
+
+    return FileResponse(
+        file_path,
+        media_type=content_type,
+        headers={"Content-Disposition": f'{disposition}; filename="{safe_name}"'}
+    )
 
 
 MAX_PAGE_TEXT_CHARS = 20000
@@ -4101,11 +4180,58 @@ MAX_IMPORT_QUERIES_PER_DAY = 2000
 MAX_IMPORT_SECONDS_PER_DAY = 86400
 
 
-def _resolve_timezone(tz_name: str) -> ZoneInfo:
+# A few legacy IANA zone names that some OS/browser Intl implementations
+# still hand back (Windows' own "Asia/Calcutta" among them) even though
+# the modern tzdata release they'd resolve to via its own "backward"
+# compatibility links uses the newer name -- normalized here first so
+# ZoneInfo (which also tries those backward links itself once tzdata is
+# actually installed) gets the best possible shot at either spelling.
+_LEGACY_TZ_ALIASES = {
+    "Asia/Calcutta": "Asia/Kolkata",
+    "Asia/Saigon": "Asia/Ho_Chi_Minh",
+    "Asia/Katmandu": "Asia/Kathmandu",
+}
+
+
+def _try_resolve_timezone(tz_name: str) -> ZoneInfo | None:
+    """Returns a ZoneInfo for `tz_name` (after normalizing a known legacy alias), or None if nothing resolves it at all."""
+    normalized = _LEGACY_TZ_ALIASES.get(tz_name, tz_name)
     try:
-        return ZoneInfo(tz_name)
+        return ZoneInfo(normalized)
     except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return None
+
+
+def _resolve_timezone(tz_name: str) -> ZoneInfo:
+    """
+    Strict resolution -- used only by the one-time import, where silently
+    substituting a different timezone could put old history on the wrong
+    day. 422s on a name nothing can resolve, same as before.
+    """
+    resolved = _try_resolve_timezone(tz_name)
+    if resolved is None:
         raise HTTPException(status_code=422, detail=f"Unknown timezone: '{tz_name}'")
+    return resolved
+
+
+def _resolve_timezone_with_fallback(tz_name: str) -> tuple:
+    """
+    Lenient resolution for GET /analytics/summary -- a timezone problem
+    must never fail the whole page (e.g. Windows with the `tzdata` pip
+    package missing, or a browser/OS Intl name tzdata's backward-
+    compatibility links don't cover). Returns (zone, used_fallback); on a
+    name nothing can resolve, logs a warning and falls back to
+    DEFAULT_ANALYTICS_TZ rather than raising.
+    """
+    resolved = _try_resolve_timezone(tz_name)
+    if resolved is not None:
+        return resolved, False
+    logger.warning(
+        "Unknown timezone '%s' in GET /analytics/summary -- falling back to %s. "
+        "If this keeps happening, confirm `tzdata` is installed (pip install -r requirements.txt).",
+        tz_name, DEFAULT_ANALYTICS_TZ
+    )
+    return ZoneInfo(DEFAULT_ANALYTICS_TZ), True
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -4302,7 +4428,7 @@ def get_analytics_summary(
             status_code=422,
             detail=f"days must be one of {ANALYTICS_SUMMARY_DAY_CHOICES} (got {days})."
         )
-    user_tz = _resolve_timezone(tz)
+    user_tz, tz_fallback = _resolve_timezone_with_fallback(tz)
 
     window_start = _window_start_utc(days, user_tz)
     day_keys = _day_keys(days, user_tz)
@@ -4419,7 +4545,8 @@ def get_analytics_summary(
 
     return {
         "days": days,
-        "tz": tz,
+        "tz": user_tz.key,
+        "tz_fallback": tz_fallback,
         "totals": {
             "queries": totals_queries,
             "tools_used": totals_tools,

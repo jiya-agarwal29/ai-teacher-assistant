@@ -259,6 +259,13 @@ export default function Analytics() {
         </div>
       </div>
 
+      {summary.tz_fallback && (
+        <div className="flex items-center gap-2 text-[10px] font-semibold text-amber-600 dark:text-amber-400">
+          <Clock size={12} />
+          <span>Your browser's timezone wasn't recognized — times shown in India time.</span>
+        </div>
+      )}
+
       {loading && (
         <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400 dark:text-slate-500">
           <Loader2 size={12} className="animate-spin" /> Refreshing…

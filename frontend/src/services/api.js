@@ -320,6 +320,39 @@ export const api = {
       });
     },
 
+    /**
+     * GET /books/{book_id}/file -- fetched manually (not through request(),
+     * which assumes a JSON body) since neither an <iframe>/<object> nor a
+     * download link can carry the Authorization header on its own. Returns
+     * {url, contentType, filename}; the caller must URL.revokeObjectURL(url)
+     * once done with it (e.g. on unmount), same as pages.getImageUrl below.
+     */
+    getFileUrl: async (bookId) => {
+      const token = getToken();
+      const headers = token ? { Authorization: `Bearer ${token}` } : {};
+      let response;
+      try {
+        response = await fetch(`${API_BASE_URL}/books/${bookId}/file`, { headers });
+      } catch (netError) {
+        throw new Error('Failed to connect to backend server. Please ensure the backend is running.', { cause: netError });
+      }
+      if (!response.ok) {
+        let detail = 'Failed to load the original file';
+        try {
+          detail = (await response.json()).detail || detail;
+        } catch {
+          // Response body wasn't JSON — keep the default detail above.
+        }
+        throw new Error(detail);
+      }
+      const contentType = response.headers.get('content-type') || 'application/octet-stream';
+      const disposition = response.headers.get('content-disposition') || '';
+      const filenameMatch = disposition.match(/filename="?([^"]+)"?/);
+      const filename = filenameMatch ? filenameMatch[1] : 'document';
+      const blob = await response.blob();
+      return { url: URL.createObjectURL(blob), contentType, filename };
+    },
+
     pages: {
       /**
        * GET /books/{book_id}/pages

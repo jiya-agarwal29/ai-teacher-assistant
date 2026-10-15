@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../services/api';
 import DocumentStatusBadge from '../components/DocumentStatusBadge';
 import {
@@ -21,6 +21,7 @@ const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.heic'];
 const getExtension = (name) => name.slice(name.lastIndexOf('.')).toLowerCase();
 
 export default function Documents() {
+  const navigate = useNavigate();
   const [books, setBooks] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -321,7 +322,8 @@ export default function Documents() {
           {filteredBooks.map((book) => (
             <div
               key={book.id}
-              className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm hover:scale-[1.02] hover:shadow-md hover:border-violet-500/30 dark:hover:border-violet-500/20 transition-all duration-300 flex flex-col h-48 group"
+              onClick={() => navigate(`/documents/${book.id}`)}
+              className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm hover:scale-[1.02] hover:shadow-md hover:border-violet-500/30 dark:hover:border-violet-500/20 transition-all duration-300 flex flex-col h-48 group cursor-pointer"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-start gap-4 min-w-0">
@@ -337,7 +339,9 @@ export default function Documents() {
                     </span>
                   </div>
                 </div>
-                <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} bookId={book.id} />
+                <div onClick={(e) => e.stopPropagation()}>
+                  <DocumentStatusBadge status={book.status} pagesTotal={book.pages_total} pagesDone={book.pages_done} sourceType={book.source_type} bookId={book.id} />
+                </div>
               </div>
 
               {book.status === 'failed' && book.error && (
@@ -346,7 +350,7 @@ export default function Documents() {
                 </p>
               )}
 
-              <div className="mt-auto pt-4 border-t border-slate-100 dark:border-slate-800/60 flex justify-between items-center text-[10px]">
+              <div className="mt-auto pt-4 border-t border-slate-100 dark:border-slate-800/60 flex justify-between items-center text-[10px]" onClick={(e) => e.stopPropagation()}>
                 <div className="flex items-center gap-1.5 text-slate-400 dark:text-slate-500 min-w-0">
                   {book.status === 'ready' ? (
                     <>

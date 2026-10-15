@@ -580,6 +580,107 @@ def test_book_status_and_retry_require_ownership(client, phase3a_headers, phase3
     client.delete(f"/books/{book_id}", headers=headers_owner)
 
 
+def test_book_file_streams_original_with_correct_content_type(client, phase3a_headers, phase3a_other_headers):
+    headers_owner = phase3a_headers
+    headers_other = phase3a_other_headers
+
+    book_id = _upload_bees_doc(client, headers_owner, "original_bees.txt")
+
+    # Owner can download -- correct content type, attachment (txt isn't
+    # browser-renderable inline).
+    res = client.get(f"/books/{book_id}/file", headers=headers_owner)
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/plain")
+    assert "attachment" in res.headers["content-disposition"]
+    assert res.content == BEES_CONTENT
+
+    # A non-owner gets 404 -- existence isn't leaked.
+    res = client.get(f"/books/{book_id}/file", headers=headers_other)
+    assert res.status_code == 404
+
+    client.delete(f"/books/{book_id}", headers=headers_owner)
+
+
+def test_book_file_inline_for_pdf(client, phase3a_headers, monkeypatch):
+    import document_parsers
+
+    headers = phase3a_headers
+    monkeypatch.setattr(document_parsers, "parse_pdf", lambda f: [
+        {"page_number": 1, "content": "Plenty of real extracted text so no OCR is needed here at all."},
+    ])
+
+    pdf_bytes = b"not a real pdf -- parse_pdf is mocked"
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("notes.pdf", pdf_bytes, "application/pdf")}
+    )
+    assert res.status_code == 202
+    data = res.json()
+    assert data["status"] == "ready"
+    book_id = data["book_id"]
+
+    res = client.get(f"/books/{book_id}/file", headers=headers)
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/pdf"
+    assert "inline" in res.headers["content-disposition"]
+    assert res.content == pdf_bytes
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_book_file_404_when_no_original_saved(client, phase3a_headers):
+    headers = phase3a_headers
+    book_id = _upload_bees_doc(client, headers, "nofile_bees.txt")
+
+    # Simplest reliable way to simulate "upload folder lost": delete the
+    # book's saved original file(s) straight off disk, then ask for /file.
+    import glob as glob_module
+    from models import Book as BookModel
+    db = TestSessionLocal()
+    try:
+        user_id = db.query(BookModel).filter(BookModel.id == book_id).first().user_id
+    finally:
+        db.close()
+
+    for path in glob_module.glob(str(main.UPLOAD_DIR / str(user_id) / str(book_id) / "original.*")):
+        os.remove(path)
+
+    res = client.get(f"/books/{book_id}/file", headers=headers)
+    assert res.status_code == 404
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_book_pages_endpoint_returns_pages_in_order(client, phase3a_headers, monkeypatch):
+    import document_parsers
+
+    headers = phase3a_headers
+    monkeypatch.setattr(document_parsers, "parse_pdf", lambda f: [
+        {"page_number": 1, "content": "First page has plenty of real extracted text, well past the OCR threshold."},
+        {"page_number": 2, "content": "Second page also has plenty of real extracted text, past that threshold."},
+        {"page_number": 3, "content": "Third page likewise has plenty of real extracted text, past the threshold."},
+    ])
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("ordered.pdf", b"mocked", "application/pdf")}
+    )
+    assert res.status_code == 202
+    book_id = res.json()["book_id"]
+
+    res = client.get(f"/books/{book_id}/pages", headers=headers)
+    assert res.status_code == 200
+    pages = res.json()
+    assert [p["page_number"] for p in pages] == [1, 2, 3]
+    assert pages[0]["extracted_text"].startswith("First page")
+    assert pages[1]["extracted_text"].startswith("Second page")
+    assert pages[2]["extracted_text"].startswith("Third page")
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
 def test_retry_reprocesses_failed_book_to_ready(client, phase3a_headers, monkeypatch):
     import embeddings
     import jobs
@@ -4334,6 +4435,45 @@ def test_quiz_attempt_validates_answer_count_and_fields(client, phase6a_headers)
     ).status_code == 422
 
 
+def test_quiz_attempt_accuracy_by_level_totals_include_unanswered_questions(client):
+    # Fix item 4 (Phase 6 B3 check): a quiz attempt must include EVERY
+    # question of the quiz, with unanswered ones sent as is_correct=false
+    # at their own Bloom level -- otherwise accuracy_by_level's totals
+    # would undercount against the quiz's real question count.
+    _, headers = _fresh_phase6a_user(client)
+    main.limiter.reset()
+
+    # 5 questions total: 2 "remember" (1 answered correctly, 1 left
+    # unanswered -> is_correct=false), 3 "analyze" (2 correct, 1 unanswered).
+    answers = [
+        {"bloom_level": "remember", "question_type": "mcq", "is_correct": True, "self_graded": False},
+        {"bloom_level": "remember", "question_type": "mcq", "is_correct": False, "self_graded": False},
+        {"bloom_level": "analyze", "question_type": "short_answer", "is_correct": True, "self_graded": True},
+        {"bloom_level": "analyze", "question_type": "short_answer", "is_correct": True, "self_graded": True},
+        {"bloom_level": "analyze", "question_type": "short_answer", "is_correct": False, "self_graded": True},
+    ]
+    res = client.post(
+        "/analytics/quiz-attempts", headers=headers,
+        json={"topic": "Full Quiz Totals", "answers": answers}
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["total"] == len(answers)
+
+    summary_res = client.get("/analytics/summary", headers=headers, params={"days": 7})
+    assert summary_res.status_code == 200, summary_res.text
+    accuracy_by_level = summary_res.json()["accuracy_by_level"]
+
+    assert accuracy_by_level["remember"]["total"] == 2
+    assert accuracy_by_level["remember"]["correct"] == 1
+    assert accuracy_by_level["analyze"]["total"] == 3
+    assert accuracy_by_level["analyze"]["correct"] == 2
+
+    # Every question submitted lands in some level's total -- none silently
+    # dropped for being unanswered.
+    total_across_levels = sum(level["total"] for level in accuracy_by_level.values())
+    assert total_across_levels == len(answers)
+
+
 # --- Item 7: summary day-bucketing, timezone boundary, zero-fill ---
 def test_summary_includes_every_day_with_zeros_oldest_first_for_a_fresh_user(client):
     _, headers = _fresh_phase6a_user(client)
@@ -4356,10 +4496,47 @@ def test_summary_includes_every_day_with_zeros_oldest_first_for_a_fresh_user(cli
     assert data["recent_attempts"] == []
 
 
-def test_summary_rejects_bad_days_and_bad_timezone(client, phase6a_headers):
+def test_summary_rejects_bad_days(client, phase6a_headers):
     headers = phase6a_headers
     assert client.get("/analytics/summary", headers=headers, params={"days": 10}).status_code == 422
-    assert client.get("/analytics/summary", headers=headers, params={"tz": "Not/AZone"}).status_code == 422
+
+
+def test_summary_unknown_timezone_falls_back_instead_of_422(client):
+    # A timezone problem must never fail the whole page (Fix item 1c) --
+    # a garbage tz name gets a 200 with the India-time fallback flagged,
+    # not a 422.
+    _, headers = _fresh_phase6a_user(client)
+    res = client.get("/analytics/summary", headers=headers, params={"tz": "Not/AZone"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["tz_fallback"] is True
+    assert data["tz"] == "Asia/Kolkata"
+
+
+def test_summary_accepts_legacy_timezone_alias_asia_calcutta(client):
+    # "Asia/Calcutta" is the old IANA name for "Asia/Kolkata" -- some
+    # OS/browser Intl implementations (Windows among them) still report
+    # it. Must resolve to the exact same zone, not the fallback, and
+    # bucket days identically.
+    username, headers = _fresh_phase6a_user(client)
+    user_id = _user_id(username)
+
+    now_utc = datetime.now(timezone.utc)
+    base_date = (now_utc - timedelta(days=1)).date()
+    event_time_utc = datetime(base_date.year, base_date.month, base_date.day, 20, 0, 0, tzinfo=timezone.utc)
+    _insert_event(user_id, "query", value=1, created_at=event_time_utc.replace(tzinfo=None))
+
+    res_calcutta = client.get("/analytics/summary", headers=headers, params={"days": 7, "tz": "Asia/Calcutta"})
+    assert res_calcutta.status_code == 200, res_calcutta.text
+    data_calcutta = res_calcutta.json()
+    assert data_calcutta["tz_fallback"] is False
+    assert data_calcutta["tz"] == "Asia/Kolkata"
+
+    res_kolkata = client.get("/analytics/summary", headers=headers, params={"days": 7, "tz": "Asia/Kolkata"})
+    data_kolkata = res_kolkata.json()
+
+    assert data_calcutta["queries_by_day"] == data_kolkata["queries_by_day"]
+    assert data_calcutta["active_seconds_by_day"] == data_kolkata["active_seconds_by_day"]
 
 
 def test_summary_buckets_utc_evening_event_into_next_ist_calendar_day(client):
