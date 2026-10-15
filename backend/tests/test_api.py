@@ -20,6 +20,7 @@ from pathlib import Path
 # before this module) so this file doesn't need to set them itself.
 
 import pytest
+from dotenv import dotenv_values
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 
@@ -27,8 +28,17 @@ import database
 
 TEST_DB_PATH = os.path.join(os.path.dirname(__file__), "test_api.db")
 _DEFAULT_TEST_DATABASE_URL = f"sqlite:///{TEST_DB_PATH}"
+
+# A real os.environ var wins (e.g. set by CI); otherwise read backend/.env
+# directly with dotenv_values(), which parses the file WITHOUT touching
+# os.environ -- the suite deliberately runs with no real backend/.env
+# dependency for anything else (see conftest.py's dummy SECRET_KEY/
+# GEMINI_API_KEY/JOBS_SYNC, and note nothing here calls load_dotenv()),
+# and auth.py's own load_dotenv() call (triggered by `import main` below)
+# wouldn't run until after this point anyway.
+_env_file_values = dotenv_values(Path(__file__).resolve().parent.parent / ".env")
 TEST_DATABASE_URL = database.normalize_database_url(
-    os.getenv("TEST_DATABASE_URL") or _DEFAULT_TEST_DATABASE_URL
+    os.getenv("TEST_DATABASE_URL") or _env_file_values.get("TEST_DATABASE_URL") or _DEFAULT_TEST_DATABASE_URL
 )
 IS_SQLITE_TEST_DB = TEST_DATABASE_URL.startswith("sqlite")
 

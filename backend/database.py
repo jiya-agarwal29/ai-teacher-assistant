@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # "production" skips the dev-only create_all() in main.py's lifespan --
@@ -48,7 +48,22 @@ def make_engine(url: str):
         # One shared file, opened from multiple threads (FastAPI's
         # threadpool, jobs.py's background worker) -- check_same_thread
         # must be off for any of them to use it.
-        return create_engine(url, connect_args={"check_same_thread": False})
+        sqlite_engine = create_engine(url, connect_args={"check_same_thread": False})
+
+        # SQLite ignores FOREIGN KEY constraints by default (unlike
+        # Postgres, which always enforces them) -- this had let a real bug
+        # (DELETE /books/{id} leaving a dangling PaperQuestion.book_id)
+        # pass silently on SQLite for the project's whole lifetime until
+        # Postgres caught it. Turning this on for every new connection
+        # makes local dev and the SQLite test run enforce the same links
+        # Postgres does, instead of relying on Postgres to catch it.
+        @event.listens_for(sqlite_engine, "connect")
+        def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+        return sqlite_engine
 
     # Postgres (Neon, etc.): pool_pre_ping discovers and transparently
     # replaces a connection Neon's own idle-compute-suspend already

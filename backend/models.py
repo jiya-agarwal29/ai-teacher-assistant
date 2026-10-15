@@ -15,7 +15,10 @@ class Book(Base):
     __tablename__ = "books"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(255), index=True)
+    # The uploaded file's own filename, straight from the client -- unknown
+    # length, no app-level cap (Fix Phase 7A check item 3), so it must be
+    # Text, not a bounded String.
+    name = Column(Text, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
 
     status = Column(String(20), default="processing", nullable=False)
@@ -148,7 +151,8 @@ class Question(Base):
     book_id = Column(Integer, ForeignKey("books.id"), index=True, nullable=True)
     page_id = Column(Integer, ForeignKey("pages.id"), nullable=True)
 
-    topic = Column(String(255), nullable=False)
+    # User-supplied, no app-level length cap (Fix Phase 7A check item 3).
+    topic = Column(Text, nullable=False)
     type = Column(String(20), nullable=False)
 
     bloom_level = Column(String(20), nullable=False)
@@ -192,8 +196,9 @@ class Paper(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
 
-    title = Column(String(255), nullable=False)
-    subject = Column(String(255), nullable=True)
+    # Both user-supplied, no app-level length cap (Fix Phase 7A check item 3).
+    title = Column(Text, nullable=False)
+    subject = Column(Text, nullable=True)
 
     pattern = Column(Text, nullable=False)        # JSON: the Pattern used (preset or custom)
     bloom_targets = Column(Text, nullable=False)   # JSON: {level: percent}
@@ -298,7 +303,8 @@ class QuizAttempt(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    topic = Column(String(255), nullable=False)
+    # User-supplied, no app-level length cap (Fix Phase 7A check item 3).
+    topic = Column(Text, nullable=False)
     correct = Column(Integer, nullable=False)
     total = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
@@ -340,7 +346,10 @@ class Conversation(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    title = Column(String(255), nullable=False)
+    # Auto-titled from a truncated question, but a manual PATCH rename has
+    # no app-level length cap (Fix Phase 7A check item 3) -- Text, not a
+    # bounded String.
+    title = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),

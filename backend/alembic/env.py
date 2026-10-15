@@ -2,6 +2,7 @@ import os
 import sys
 from logging.config import fileConfig
 
+from dotenv import load_dotenv
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
@@ -10,7 +11,15 @@ from alembic import context
 # backend/ (this file's grandparent) on sys.path, regardless of the cwd
 # `alembic` was invoked from, so `import database`/`models` below always
 # resolves the same way main.py's own imports do.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _BACKEND_DIR)
+
+# A plain `alembic` CLI invocation never imports main.py/auth.py (whose own
+# load_dotenv() call is what normally brings backend/.env's DATABASE_URL
+# into os.environ for the running app) -- without this, `alembic upgrade
+# head` run standalone would silently ignore a DATABASE_URL set only in
+# .env and fall back to the default local SQLite file instead.
+load_dotenv(os.path.join(_BACKEND_DIR, ".env"))
 
 import database
 from models import Base

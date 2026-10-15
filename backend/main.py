@@ -1657,6 +1657,16 @@ def delete_book(
         )
     db.query(Question).filter(Question.book_id == book_id).delete()
 
+    # A slot's own book_id (which unit it's planned against, independent of
+    # whether a question was ever generated for it) also has to be cleared
+    # here -- it's a separate FK to books.id, left pointing at this book by
+    # the nulling above. Harmless on SQLite (no FK enforcement by default),
+    # but Postgres enforces it and the DELETE below would 500 on it
+    # otherwise (Fix Phase 7A check item 1).
+    db.query(PaperQuestion).filter(PaperQuestion.book_id == book_id).update(
+        {PaperQuestion.book_id: None}, synchronize_session=False
+    )
+
     # Cascades to the book's pages via the Book.pages relationship
     db.delete(book)
     db.commit()

@@ -1,9 +1,15 @@
 """baseline schema
 
 Revision ID: b5fb071e112f
-Revises: 
+Revises:
 Create Date: 2026-10-15 18:47:29.854475
 
+Boolean server_defaults (review_ocr/waiting_for_ai/self_graded) are hand-
+fixed to sa.true()/sa.false() -- autogenerate, run against SQLite, rendered
+them as the literal integers 1/0 (sa.text('1')/sa.text('0')), which SQLite's
+untyped columns accept but a real Postgres BOOLEAN column rejects
+(DatatypeMismatch: "column is of type boolean but default expression is of
+type integer"). sa.true()/sa.false() render correctly for either dialect.
 """
 from typing import Sequence, Union
 
@@ -59,7 +65,7 @@ def upgrade() -> None:
     sa.Column('pages_total', sa.Integer(), nullable=False),
     sa.Column('pages_done', sa.Integer(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
-    sa.Column('review_ocr', sa.Boolean(), server_default=sa.text('1'), nullable=False),
+    sa.Column('review_ocr', sa.Boolean(), server_default=sa.true(), nullable=False),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
@@ -96,7 +102,7 @@ def upgrade() -> None:
     sa.Column('progress_done', sa.Integer(), nullable=False),
     sa.Column('progress_total', sa.Integer(), nullable=False),
     sa.Column('warnings', sa.Text(), nullable=True),
-    sa.Column('waiting_for_ai', sa.Boolean(), server_default=sa.text('0'), nullable=False),
+    sa.Column('waiting_for_ai', sa.Boolean(), server_default=sa.false(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
@@ -220,7 +226,7 @@ def upgrade() -> None:
     sa.Column('bloom_level', sa.String(length=20), nullable=True),
     sa.Column('question_type', sa.String(length=20), nullable=False),
     sa.Column('is_correct', sa.Boolean(), nullable=False),
-    sa.Column('self_graded', sa.Boolean(), server_default=sa.text('0'), nullable=False),
+    sa.Column('self_graded', sa.Boolean(), server_default=sa.false(), nullable=False),
     sa.ForeignKeyConstraint(['attempt_id'], ['quiz_attempts.id'], ),
     sa.ForeignKeyConstraint(['question_id'], ['questions.id'], ),
     sa.PrimaryKeyConstraint('id')
