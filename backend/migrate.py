@@ -1,4 +1,12 @@
 """
+DEPRECATED (Phase 7A) -- schema changes now go through Alembic migrations
+(see backend/alembic/, and README's "Database migrations" section) instead
+of this script. Kept only so a local SQLite dev database created before
+Alembic existed can still be brought current by running it one last time,
+then `alembic stamp head` (see the README) to mark it as up to date without
+Alembic trying to recreate anything it already has. Do not add anything new
+here -- a new schema change is a new `alembic revision --autogenerate`.
+
 One-off migration for existing SQLite databases created before books were
 tied to a user account, and before pages tracked which embedding model
 produced their vector.

@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, Column, Index, Integer, String, Text, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql.expression import false as sa_false, true as sa_true
 from database import Base
 
 # Lifecycle of Book.status: a new upload starts "processing" (background
@@ -14,20 +15,20 @@ class Book(Base):
     __tablename__ = "books"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, index=True)
+    name = Column(String(255), index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
 
-    status = Column(String, default="processing", nullable=False)
+    status = Column(String(20), default="processing", nullable=False)
     error = Column(Text, nullable=True)
-    source_type = Column(String, nullable=True)
+    source_type = Column(String(20), nullable=True)
     pages_total = Column(Integer, default=0, nullable=False)
     pages_done = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
     # Whether OCR'd pages need manual review before being indexed (the
     # upload-time checkbox choice) -- stored so /books/{id}/retry can
     # re-run processing with the same choice instead of re-asking for it.
-    review_ocr = Column(Boolean, default=True, nullable=False)
+    review_ocr = Column(Boolean, default=True, server_default=sa_true(), nullable=False)
 
     pages = relationship("Page", cascade="all, delete-orphan")
     document_pages = relationship("DocumentPage", cascade="all, delete-orphan")
@@ -50,13 +51,16 @@ class Page(Base):
 
     content = Column(Text)
 
+    # JSON-serialized list of floats (see jobs.py/retrieval.py) -- plain
+    # Text works identically on SQLite and Postgres, so no round-trip
+    # change is needed for either backend.
     embedding = Column(Text)
 
     # Which provider+model produced `embedding` (e.g. "voyage:voyage-4" or
     # "local:all-MiniLM-L6-v2") -- vectors from different models have
     # different dimensions and can't be compared, so retrieval only scores
     # pages whose embedding_model matches the currently active one.
-    embedding_model = Column(String, nullable=True)
+    embedding_model = Column(String(100), nullable=True)
 
 
 class DocumentPage(Base):
@@ -76,20 +80,20 @@ class DocumentPage(Base):
 
     # Path to the saved page image on disk -- only set for method="ocr"
     # (a rendered PDF page or an uploaded photo); null for method="text".
-    image_path = Column(String, nullable=True)
+    image_path = Column(String(500), nullable=True)
 
     extracted_text = Column(Text, nullable=True)
 
     # "text" (pdfplumber/docx/pptx/txt extraction) or "ocr" (Gemini vision).
-    method = Column(String, nullable=False)
+    method = Column(String(20), nullable=False)
 
     # "auto_approved" (used as-is), "needs_review" (OCR'd, awaiting a human
     # check -- no review/approve endpoint exists yet), or "approved" (will
     # be set by that future endpoint).
-    review_status = Column(String, nullable=False)
+    review_status = Column(String(20), nullable=False)
 
     updated_at = Column(
-        DateTime,
+        DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False
@@ -100,18 +104,22 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True)
-    password = Column(String)
+    username = Column(String(30))
+    password = Column(String(255))
 
     # Phase 6A: set the one time this user's old browser-only (localStorage)
     # analytics history was imported via POST /analytics/import -- null
     # means it never has been, and that endpoint is still available; a
     # second import attempt 409s instead of double-counting old history.
-    analytics_imported_at = Column(DateTime, nullable=True)
+    analytics_imported_at = Column(DateTime(timezone=True), nullable=True)
 
     # Phase 6C: the same one-time-import guard as analytics_imported_at,
     # for POST /conversations/import (old browser-only chat history).
-    chats_imported_at = Column(DateTime, nullable=True)
+    chats_imported_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_users_username", "username", unique=True),
+    )
 
 
 class Question(Base):
@@ -140,12 +148,12 @@ class Question(Base):
     book_id = Column(Integer, ForeignKey("books.id"), index=True, nullable=True)
     page_id = Column(Integer, ForeignKey("pages.id"), nullable=True)
 
-    topic = Column(String, nullable=False)
-    type = Column(String, nullable=False)
+    topic = Column(String(255), nullable=False)
+    type = Column(String(20), nullable=False)
 
-    bloom_level = Column(String, nullable=False)
-    bloom_check = Column(String, default="unchecked", nullable=False)
-    detected_level = Column(String, nullable=True)
+    bloom_level = Column(String(20), nullable=False)
+    bloom_check = Column(String(20), default="unchecked", nullable=False)
+    detected_level = Column(String(20), nullable=True)
 
     question = Column(Text, nullable=False)
     options = Column(Text, nullable=True)
@@ -158,7 +166,7 @@ class Question(Base):
     marks = Column(Integer, nullable=True)
     marking_scheme = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 class Paper(Base):
@@ -184,8 +192,8 @@ class Paper(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
 
-    title = Column(String, nullable=False)
-    subject = Column(String, nullable=True)
+    title = Column(String(255), nullable=False)
+    subject = Column(String(255), nullable=True)
 
     pattern = Column(Text, nullable=False)        # JSON: the Pattern used (preset or custom)
     bloom_targets = Column(Text, nullable=False)   # JSON: {level: percent}
@@ -198,7 +206,7 @@ class Paper(Base):
     unit_weights = Column(Text, nullable=True)
     plan = Column(Text, nullable=False)            # JSON: paper.plan_paper()'s "plan" list
 
-    status = Column(String, default="draft", nullable=False)
+    status = Column(String(20), default="draft", nullable=False)
     error = Column(Text, nullable=True)
     progress_done = Column(Integer, default=0, nullable=False)
     progress_total = Column(Integer, default=0, nullable=False)
@@ -207,11 +215,11 @@ class Paper(Base):
     # a busy/rate-limited AI response (see main.generate_paper) -- status
     # stays "generating" throughout, this is just an extra flag the UI can
     # show ("waiting for AI service...") while progress isn't moving.
-    waiting_for_ai = Column(Boolean, default=False, nullable=False)
+    waiting_for_ai = Column(Boolean, default=False, server_default=sa_false(), nullable=False)
 
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(
-        DateTime,
+        DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False
@@ -234,11 +242,11 @@ class PaperQuestion(Base):
     id = Column(Integer, primary_key=True, index=True)
     paper_id = Column(Integer, ForeignKey("papers.id"), index=True, nullable=False)
 
-    section = Column(String, nullable=False)
-    number = Column(String, nullable=False)
-    option = Column(String, nullable=True)  # "a" | "b" | None
+    section = Column(String(50), nullable=False)
+    number = Column(String(20), nullable=False)
+    option = Column(String(10), nullable=True)  # "a" | "b" | None
     marks = Column(Integer, nullable=False)
-    bloom_level = Column(String, nullable=False)
+    bloom_level = Column(String(20), nullable=False)
     book_id = Column(Integer, ForeignKey("books.id"), nullable=True)
 
     question_id = Column(Integer, ForeignKey("questions.id"), nullable=True)
@@ -267,10 +275,10 @@ class ActivityEvent(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    kind = Column(String, nullable=False)
+    kind = Column(String(30), nullable=False)
     value = Column(Integer, default=1, nullable=False)
     meta = Column(Text, nullable=True)  # small JSON object, e.g. {"tool": "summarize"}
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
 
     __table_args__ = (
         Index("ix_activity_events_user_created", "user_id", "created_at"),
@@ -290,10 +298,10 @@ class QuizAttempt(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    topic = Column(String, nullable=False)
+    topic = Column(String(255), nullable=False)
     correct = Column(Integer, nullable=False)
     total = Column(Integer, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
 
     answers = relationship("QuizAnswer", cascade="all, delete-orphan")
 
@@ -312,10 +320,10 @@ class QuizAnswer(Base):
     id = Column(Integer, primary_key=True, index=True)
     attempt_id = Column(Integer, ForeignKey("quiz_attempts.id"), index=True, nullable=False)
     question_id = Column(Integer, ForeignKey("questions.id"), nullable=True)
-    bloom_level = Column(String, nullable=True)
-    question_type = Column(String, nullable=False)
+    bloom_level = Column(String(20), nullable=True)
+    question_type = Column(String(20), nullable=False)
     is_correct = Column(Boolean, nullable=False)
-    self_graded = Column(Boolean, default=False, nullable=False)
+    self_graded = Column(Boolean, default=False, server_default=sa_false(), nullable=False)
 
 
 class Conversation(Base):
@@ -332,10 +340,10 @@ class Conversation(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    title = Column(String, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    title = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(
-        DateTime,
+        DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False
@@ -357,7 +365,7 @@ class ChatMessage(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id"), index=True, nullable=False)
-    role = Column(String, nullable=False)  # "user" | "assistant"
+    role = Column(String(20), nullable=False)  # "user" | "assistant"
     content = Column(Text, nullable=False)
     sources = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)

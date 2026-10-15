@@ -1,8 +1,13 @@
 """
 End-to-end API tests against a real FastAPI app instance (TestClient),
-using an isolated on-disk SQLite database so nothing here touches the real
-dev database (teacher_ai.db). Exercises the full auth + upload + per-user
-isolation flow described in the deployment checklist.
+using an isolated database so nothing here touches the real dev database
+(teacher_ai.db). Exercises the full auth + upload + per-user isolation
+flow described in the deployment checklist.
+
+Runs against an on-disk SQLite file by default; set TEST_DATABASE_URL
+(e.g. in backend/.env) to run this exact same suite against a real
+Postgres database instead (Phase 7A) -- see README's "Database
+migrations" section.
 """
 import json
 import os
@@ -15,17 +20,23 @@ from pathlib import Path
 # before this module) so this file doesn't need to set them itself.
 
 import pytest
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 
-TEST_DB_PATH = os.path.join(os.path.dirname(__file__), "test_api.db")
-TEST_DATABASE_URL = f"sqlite:///{TEST_DB_PATH}"
+import database
 
-test_engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
+TEST_DB_PATH = os.path.join(os.path.dirname(__file__), "test_api.db")
+_DEFAULT_TEST_DATABASE_URL = f"sqlite:///{TEST_DB_PATH}"
+TEST_DATABASE_URL = database.normalize_database_url(
+    os.getenv("TEST_DATABASE_URL") or _DEFAULT_TEST_DATABASE_URL
+)
+IS_SQLITE_TEST_DB = TEST_DATABASE_URL.startswith("sqlite")
+
+# Same engine-construction path (pooling, etc.) the app itself uses for
+# Postgres -- see database.make_engine.
+test_engine = database.make_engine(TEST_DATABASE_URL)
 TestSessionLocal = sessionmaker(bind=test_engine)
 
-import database
 import main
 from database import get_db
 from models import Base, DocumentPage, Page
@@ -41,8 +52,11 @@ main.UPLOAD_DIR = TEST_UPLOAD_DIR
 # worker each open their own session via `database.SessionLocal()` looked
 # up at call time rather than imported by name, specifically so this
 # redirect reaches them too -- otherwise they'd silently operate on the
-# real dev database (teacher_ai.db) instead of this test one.
+# real dev database (teacher_ai.db) instead of this test one. The lifespan's
+# own create_all() looks up `database.engine` the same way, for the same
+# reason (see main.py).
 database.SessionLocal = TestSessionLocal
+database.engine = test_engine
 
 
 def _override_get_db():
@@ -58,13 +72,19 @@ main.app.dependency_overrides[get_db] = _override_get_db
 
 @pytest.fixture(scope="session", autouse=True)
 def test_database():
-    if os.path.exists(TEST_DB_PATH):
-        os.remove(TEST_DB_PATH)
+    if IS_SQLITE_TEST_DB:
+        if os.path.exists(TEST_DB_PATH):
+            os.remove(TEST_DB_PATH)
+    else:
+        # A real Postgres database has no file to delete -- drop whatever
+        # a previous run left behind instead, so this run starts from a
+        # genuinely empty schema either way.
+        Base.metadata.drop_all(bind=test_engine)
     shutil.rmtree(TEST_UPLOAD_DIR, ignore_errors=True)
     Base.metadata.create_all(bind=test_engine)
     yield
     test_engine.dispose()
-    if os.path.exists(TEST_DB_PATH):
+    if IS_SQLITE_TEST_DB and os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
     shutil.rmtree(TEST_UPLOAD_DIR, ignore_errors=True)
 
@@ -4731,7 +4751,7 @@ def test_summary_accepts_legacy_timezone_alias_asia_calcutta(client):
     now_utc = datetime.now(timezone.utc)
     base_date = (now_utc - timedelta(days=1)).date()
     event_time_utc = datetime(base_date.year, base_date.month, base_date.day, 20, 0, 0, tzinfo=timezone.utc)
-    _insert_event(user_id, "query", value=1, created_at=event_time_utc.replace(tzinfo=None))
+    _insert_event(user_id, "query", value=1, created_at=event_time_utc)
 
     res_calcutta = client.get("/analytics/summary", headers=headers, params={"days": 7, "tz": "Asia/Calcutta"})
     assert res_calcutta.status_code == 200, res_calcutta.text
@@ -4758,7 +4778,7 @@ def test_summary_buckets_utc_evening_event_into_next_ist_calendar_day(client):
     expected_local_date = event_time_utc.astimezone(ist).date()
     assert expected_local_date == base_date + timedelta(days=1)  # confirms the boundary actually crosses
 
-    _insert_event(user_id, "query", value=1, created_at=event_time_utc.replace(tzinfo=None))
+    _insert_event(user_id, "query", value=1, created_at=event_time_utc)
 
     res = client.get("/analytics/summary", headers=headers, params={"days": 7, "tz": "Asia/Kolkata"})
     assert res.status_code == 200

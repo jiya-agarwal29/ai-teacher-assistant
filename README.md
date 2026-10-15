@@ -20,7 +20,7 @@ Gemini (`GEMINI_API_KEY`, free tier) is the main AI provider for both answer gen
 
 ## Tech stack
 
-**Backend** — FastAPI, SQLAlchemy + SQLite, Gemini (`google-genai`) + Voyage (`voyageai`) + local (`sentence-transformers` / `transformers` Flan-T5) AI providers, `pdfplumber` / `python-docx` / `python-pptx`, OCR via Gemini vision + `pypdfium2` / `Pillow` / `pillow-heif`, JWT auth (`python-jose` + `passlib`), rate limiting (`slowapi`)
+**Backend** — FastAPI, SQLAlchemy + SQLite (local dev default) or PostgreSQL (`psycopg` 3, e.g. Neon — see [Database migrations](#database-migrations)) with Alembic migrations, Gemini (`google-genai`) + Voyage (`voyageai`) + local (`sentence-transformers` / `transformers` Flan-T5) AI providers, `pdfplumber` / `python-docx` / `python-pptx`, OCR via Gemini vision + `pypdfium2` / `Pillow` / `pillow-heif`, JWT auth (`python-jose` + `passlib`), rate limiting (`slowapi`)
 
 **Frontend** — React 19, React Router, Vite, Tailwind CSS v4
 
@@ -36,7 +36,8 @@ backend/
   bloom.py                 Bloom's taxonomy: the six levels, verbs, prompt rules, verb classifier (pure Python, no imports from the rest of the app)
   paper.py                 Exam paper patterns + the blueprint planner (pure Python, no imports from the rest of the app) — see Question papers
   paper_export.py          Builds the student/teacher/answer-key .docx exports (python-docx) — see Question papers
-  database.py            SQLite engine/session setup
+  database.py            SQLite/Postgres engine+session setup (DATABASE_URL)
+  alembic/                 Alembic migrations -- see Database migrations
   document_parsers.py    PDF/DOCX/PPTX parsing + chunking
   embeddings.py           Swappable embeddings (Gemini / Voyage / local MiniLM)
   llm.py                   Swappable answer generation (Gemini / local Flan-T5) + Gemini-vision OCR (read_image)
@@ -88,7 +89,8 @@ Create `backend/.env` — see `backend/.env.example` for the full list with desc
 | `CORS_ORIGINS` | the local Vite dev ports | Comma-separated list of allowed frontend origins. **Must** be set in production to your real frontend URL(s) — see [Production deployment](#production-deployment). |
 | `MAX_UPLOAD_MB` | `100` | Maximum accepted size for the single-document `file` upload (phone scans of a multi-page PDF can run large). Per-image uploads (`files`) are separately capped at 15 MB each, regardless of this setting. |
 | `LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`). |
-| `DATABASE_URL` | an absolute `sqlite:///.../backend/teacher_ai.db` path next to `database.py` | SQLAlchemy database URL. Only set this to point at a different file or a different database engine for production. |
+| `DATABASE_URL` | an absolute `sqlite:///.../backend/teacher_ai.db` path next to `database.py` | SQLAlchemy database URL. Accepts a Postgres URL too (`postgres://` or `postgresql://`, as most hosts — Neon, Render, Heroku — hand out); both are normalized to the `postgresql+psycopg://` driver URL automatically. See [Database migrations](#database-migrations). |
+| `ENV` | `development` | Set to `production` to skip the dev-only `create_all()` on startup — production schema changes go through Alembic migrations instead (see [Database migrations](#database-migrations)). Any other value keeps the local-dev convenience of creating missing tables automatically. |
 | `UPLOAD_DIR` | an absolute `uploads/` folder next to `main.py` | Where uploaded original files are saved (`<UPLOAD_DIR>/<user_id>/<book_id>/original<ext>`) for background processing and retry. |
 | `JOB_WORKERS` | `2` | Thread pool size for background document processing (`jobs.py`). |
 | `EMBED_JOB_MAX_WAIT_SECONDS` | `1800` | How long a background upload job waits out Gemini embedding rate limits before marking the document `failed` — see [AI providers](#ai-providers). |
@@ -308,16 +310,53 @@ Either path redirects to `/login` with "Your session has expired. Please log in 
 
 Leaving the review page for another page in the app — the sidebar's nav links or its own Back button — asks the same "discard unsaved changes?" question first if there's an edit in progress; the current page is also kept in the URL as `?page=N` (history is *replaced*, not pushed, so Previous/Next don't pile up back-button entries).
 
-## Migrating an existing database
+## Database migrations
 
-Books are scoped to the account that uploaded them (`Book.user_id`), and pages record which embedding model produced their vector (`Page.embedding_model`). A `teacher_ai.db` created before either of these existed needs both backfilled:
+**Local dev (SQLite, default):** nothing to do — `main.py`'s startup lifespan calls `create_all()` automatically whenever `ENV` isn't `production` (the default), so a fresh `backend/teacher_ai.db` gets every table the first time you run the server. Schema changes to an *existing* local SQLite database still apply automatically the same way, as long as they're only new tables/columns `create_all()` can add non-destructively; anything structural goes through Alembic like everywhere else (below).
+
+**Pointing at Postgres (e.g. Neon):** set `DATABASE_URL` in `backend/.env` to the connection string your host gives you (`postgres://...` or `postgresql://...` both work — see the env var table in [Setup](#setup)), and `psycopg[binary]`/`alembic` (already in `requirements.txt`) will be there. Then run the migrations once against it:
+
+```
+cd backend
+alembic upgrade head
+```
+
+**Production:** set `ENV=production` so the startup lifespan's `create_all()` is skipped entirely — a production database's schema should only ever change via a migration applied as its own deploy step, never implicitly on app startup:
+
+```
+ENV=production DATABASE_URL=postgresql://... alembic upgrade head   # one-time, per deploy with new migrations
+ENV=production DATABASE_URL=postgresql://... uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+**Making a schema change going forward:** edit `models.py`, then generate and apply a migration for it:
+
+```
+cd backend
+alembic revision --autogenerate -m "describe the change"
+# review the generated file in alembic/versions/ -- autogenerate is a first draft, not ground truth
+alembic upgrade head
+```
+
+**A local SQLite database from before Alembic existed** (anything created by `main.py`'s own `create_all()` before this section existed) already has every table Alembic's baseline migration creates — running the baseline against it would try to `CREATE TABLE` something that's already there. Tell Alembic it's already up to date instead of trying to recreate anything:
+
+```
+cd backend
+python migrate.py <username>   # if you haven't already -- see below; brings old columns current first
+alembic stamp head
+```
+
+From here on, every schema change is a new Alembic revision, not a hand-edited column.
+
+### Migrating a database from before `Book.user_id`/`Page.embedding_model`
+
+`migrate.py` is **deprecated** (superseded by Alembic above) and kept only for a local SQLite database old enough to need this one-time backfill. Books are scoped to the account that uploaded them (`Book.user_id`), and pages record which embedding model produced their vector (`Page.embedding_model`). A `teacher_ai.db` created before either of these existed needs both backfilled:
 
 ```
 cd backend
 python migrate.py <username>
 ```
 
-This adds the `books.user_id` column if it's missing and assigns every currently-unowned book to `<username>` (which must already be a registered account), adds `pages.embedding_model` if missing, backfilling it to `"local:all-MiniLM-L6-v2"` on existing rows (all pages embedded before this column existed used local MiniLM), adds the Phase 3A processing columns (`books.status`/`error`/`source_type`/`pages_total`/`pages_done`/`created_at`) if missing, backfilling `status="ready"` on existing rows (they were fully processed synchronously before the background pipeline existed), adds the Phase 3B OCR columns (`books.review_ocr`, and the `document_pages` table) if missing, and creates the `questions` table (see [Bloom's taxonomy](#blooms-taxonomy)) if missing. Safe to run more than once — every column/table is only added once, and every backfill only ever touches rows that still need it.
+This adds the `books.user_id` column if it's missing and assigns every currently-unowned book to `<username>` (which must already be a registered account), adds `pages.embedding_model` if missing, backfilling it to `"local:all-MiniLM-L6-v2"` on existing rows (all pages embedded before this column existed used local MiniLM), adds the Phase 3A processing columns (`books.status`/`error`/`source_type`/`pages_total`/`pages_done`/`created_at`) if missing, backfilling `status="ready"` on existing rows (they were fully processed synchronously before the background pipeline existed), adds the Phase 3B OCR columns (`books.review_ocr`, and the `document_pages` table) if missing, and creates the `questions` table (see [Bloom's taxonomy](#blooms-taxonomy)) if missing. Safe to run more than once — every column/table is only added once, and every backfill only ever touches rows that still need it. Do not add anything new to this script — a new schema change is a new Alembic revision instead.
 
 ## Running tests
 
@@ -330,6 +369,8 @@ python -m pytest tests/ -v
 The whole suite runs with **no internet connection and no real `backend/.env`** — `tests/conftest.py` sets a dummy `SECRET_KEY`/`GEMINI_API_KEY` (so the app's startup lifespan succeeds without a real key or a config file), sets `JOBS_SYNC=true` (so `jobs.py`'s background document processing runs inline instead of racing a real worker thread), and replaces `embeddings.embed_documents()`/`embed_query()` with deterministic fake vectors everywhere except `tests/test_embeddings.py` itself and the handful of tests that deliberately exercise the real embeddings pipeline against a mocked low-level client (marked `@pytest.mark.real_embeddings_path`) to test rate-limit handling; `tests/test_llm.py` and the LLM-dependent `tests/test_api.py` cases mock `llm.generate()`/`generate_json()` directly. No test makes a real API call.
 
 `tests/test_quiz.py` exercises quiz fairness rules (no scenario-question answer leaks, True/False isn't always the same value, no repeated concepts) directly against `rag.py` — no server or database needed. `tests/test_api.py` drives the real FastAPI app through `TestClient` against an isolated on-disk SQLite database and upload folder (`tests/test_api.db` / `tests/test_uploads/`, created and deleted automatically — neither ever touches the real `teacher_ai.db` or `uploads/`): register, login, the generic bad-login message, uploading a small `.txt`, listing books, per-user isolation (a second account can neither see nor delete another account's book), delete, the Gemini-backed chat/summarize/flashcards/quiz routes and their 503/429 edge cases (all against mocked LLM/embedding clients), and the background-processing flow — a background failure (no extractable text, or an embedding service that stays rate-limited) leaves the book `status="failed"` with a friendly error instead of erroring the upload itself, `/books/{id}/status` and `/books/{id}/retry` 404 for a non-owner, retry re-processes a failed book back to `ready` from its saved file, delete removes the book's upload folder, and a book stuck `processing` from an interrupted run is marked `failed` on the next startup.
+
+**Running the exact same suite against Postgres:** set `TEST_DATABASE_URL` (separately from `DATABASE_URL`, which the app itself uses) in `backend/.env` to a real Postgres connection string — `tests/test_api.py` picks it up automatically, drops/recreates the schema fresh at the start of the run instead of deleting a SQLite file, and everything else behaves identically. Leave it unset to keep using the default on-disk SQLite file. `tests/test_alembic_migrations.py` separately guards against drift between `models.py` and the Alembic migrations themselves: it runs `alembic upgrade head` against a brand-new, empty SQLite database and asserts the result has exactly the same tables/columns `Base.metadata.create_all()` would build directly from the current models.
 
 The OCR tests in the same file mock `llm.read_image()` directly (never a real Gemini vision call) and, for the PDF per-page decision, `document_parsers.parse_pdf()` and `ocr.render_pdf_page_to_png()` -- so a mixed scanned/typed PDF doesn't need a real multi-page PDF fixture, just canned per-page text. They cover: a low-text PDF page gets OCR'd while a text-rich one doesn't (and `source_type` comes out `"mixed"`); several images become one book with pages in submission order; `.heic` is accepted; `review_ocr=true` stops at `status="needs_review"` with no `Page` rows yet, `review_ocr=false` goes straight to `ready`; an `[illegible]` marker survives into the indexed text; `LLM_PROVIDER=local` fails OCR with the documented friendly message; and `MAX_OCR_PAGES` is enforced at upload time.
 
@@ -371,7 +412,7 @@ Unexpected server errors (anything not raised deliberately as an `HTTPException`
 - **OCR needs the Gemini provider.** `LLM_PROVIDER=local` has no vision model, so a scanned PDF page or any photo upload fails the whole document with a clear error instead of silently producing an empty or garbled page.
 - **Retry re-extracts (and re-OCRs) everything.** `/books/{id}/retry` (for a `failed` book) doesn't resume partway through or reuse a previous attempt's already-transcribed pages, so retrying a document that failed late (e.g. during embedding, after OCR already succeeded) re-runs OCR on every low-text/image page again. The review endpoints (edit/approve/re-read) are unaffected — they never discard an already-successful OCR pass.
 - **`flan-t5-small` answer quality (LLM_PROVIDER=local only).** The default `LLM_PROVIDER=gemini` doesn't have this limitation. The local answer-generation model is intentionally small (so it runs on a CPU with no external API key), which means answers can be shallow, occasionally repetitive, or misphrase a nuance from the source text. For sharper answers on `local`, uploading more specific/well-structured source material tends to help more than rephrasing the question.
-- **Single SQLite file, single worker.** Fine for individual or small-team use; not built for high-concurrency or multi-instance deployment (see the `--workers 1` note above).
+- **Single worker, regardless of database.** Postgres (see [Database migrations](#database-migrations)) removes the single-SQLite-file constraint for a real deployment, but the backend is still one `uvicorn` worker (the AI models are loaded into that worker's own memory at startup — see the `--workers 1` note above) — fine for individual or small-team use, not built for high-concurrency.
 - **English-oriented.** The embedding and generation models (Gemini, Voyage, and the local fallbacks) are primarily English-trained; other languages will work less reliably for retrieval and generation.
 - **Bloom's level checking is AI-based and can be wrong — for quizzes and papers alike.** The question writer and the independent checker are both the same kind of model making a judgment call — they can agree with each other on a label a human teacher would dispute (e.g. a question that mostly restates an already-stated fact can pass as "Analyze" when it's really closer to "Understand"), or disagree with each other on a question that's genuinely borderline. A `bloom_check="verified"` means two automated passes agreed, not that the level is pedagogically correct, and a `"flagged"` one isn't necessarily *wrong* either — spot-check real output (a paper's teacher copy shows every level/check tag for exactly this reason); don't take either as ground truth.
 - **Each quiz costs several Gemini calls, not one.** Writing N levels in one quiz costs at least one call to generate it and one to check it, plus up to two more if any level needs the mismatch-retry or the missing-level top-up (see [Bloom's taxonomy](#blooms-taxonomy)) — on a free-tier quota, a handful of quizzes in quick succession can exhaust the per-minute budget and return a `503`, on top of the OCR/embedding calls already noted above.

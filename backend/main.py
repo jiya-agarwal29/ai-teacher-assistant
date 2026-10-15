@@ -45,7 +45,7 @@ from rag import (
 from retrieval import retrieve, invalidate_cache, user_has_documents, user_has_any_books, needs_reembedding
 
 import database
-from database import engine, get_db
+from database import ENV, get_db
 from models import (
     Base, Book, DocumentPage, Page, Question, Paper, PaperQuestion, User,
     ActivityEvent, QuizAttempt, QuizAnswer, Conversation, ChatMessage
@@ -116,7 +116,15 @@ async def lifespan(app: FastAPI):
     llm.init()
     app_state["models_ready"] = True
 
-    Base.metadata.create_all(bind=engine)
+    # Production schema changes go through Alembic migrations (see
+    # backend/alembic/), applied as their own deploy step -- create_all()
+    # here would race a real migration, and can silently paper over a
+    # migration that never got run. Local SQLite dev keeps the old
+    # create-on-startup convenience (ENV defaults to "development").
+    # `database.engine`, not `engine` imported by name, so tests (and
+    # Postgres's own real-check run) that redirect it still reach this.
+    if ENV != "production":
+        Base.metadata.create_all(bind=database.engine)
     app_state["database_ready"] = True
 
     # Looked up on the database module at call time (not imported by name)
@@ -4285,23 +4293,26 @@ def _day_keys(days: int, tz: ZoneInfo) -> list:
 
 
 def _window_start_utc(days: int, tz: ZoneInfo) -> datetime:
-    """The naive-UTC instant of local midnight, `days - 1` days before today, in `tz` -- the inclusive start of the summary window."""
+    """The UTC instant of local midnight, `days - 1` days before today, in `tz` -- the inclusive start of the summary window."""
     start_date = _today_local(tz) - timedelta(days=days - 1)
     start_local = datetime(start_date.year, start_date.month, start_date.day, tzinfo=tz)
-    return start_local.astimezone(dt_timezone.utc).replace(tzinfo=None)
+    return start_local.astimezone(dt_timezone.utc)
 
 
-def _noon_utc_naive(local_day, tz: ZoneInfo) -> datetime:
+def _noon_utc(local_day, tz: ZoneInfo) -> datetime:
     """
-    Noon local time on `local_day`, converted to naive UTC for storage --
-    used only by POST /analytics/import, which has no real time-of-day for
-    an old day-bucketed count, just a date. Noon (rather than midnight)
-    keeps it safely inside the same UTC calendar day across any realistic
+    Noon local time on `local_day`, converted to UTC for storage -- used
+    only by POST /analytics/import, which has no real time-of-day for an
+    old day-bucketed count, just a date. Noon (rather than midnight) keeps
+    it safely inside the same UTC calendar day across any realistic
     timezone offset, so _local_date_key() always buckets it back onto the
-    same local day it was imported for.
+    same local day it was imported for. Kept timezone-aware (not stripped
+    to naive) since created_at columns are DateTime(timezone=True) --
+    Postgres would otherwise interpret a naive value in the session's own
+    timezone, not necessarily UTC.
     """
     local_noon = datetime(local_day.year, local_day.month, local_day.day, 12, 0, tzinfo=tz)
-    return local_noon.astimezone(dt_timezone.utc).replace(tzinfo=None)
+    return local_noon.astimezone(dt_timezone.utc)
 
 
 def _compute_paper_coverage(db: Session, user_id: int) -> dict:
@@ -4670,7 +4681,7 @@ def import_analytics(
         if count > 0:
             events_to_add.append(ActivityEvent(
                 user_id=current_user.id, kind="query", value=count,
-                created_at=_noon_utc_naive(local_day, user_tz),
+                created_at=_noon_utc(local_day, user_tz),
             ))
 
     for date_str, seconds in payload.active_seconds_by_day.items():
@@ -4683,7 +4694,7 @@ def import_analytics(
         if seconds > 0:
             events_to_add.append(ActivityEvent(
                 user_id=current_user.id, kind="active_seconds", value=seconds,
-                created_at=_noon_utc_naive(local_day, user_tz),
+                created_at=_noon_utc(local_day, user_tz),
             ))
 
     attempts_to_add = []
@@ -4701,7 +4712,7 @@ def import_analytics(
 
         attempt = QuizAttempt(
             user_id=current_user.id, topic=(entry.topic or "General").strip() or "General",
-            correct=entry.correct, total=entry.total, created_at=created_at_utc.replace(tzinfo=None),
+            correct=entry.correct, total=entry.total, created_at=created_at_utc,
         )
         answers = []
         if entry.byLevel:
