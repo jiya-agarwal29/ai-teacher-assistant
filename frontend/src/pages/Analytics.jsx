@@ -180,7 +180,11 @@ export default function Analytics() {
   const labelFn = days <= 7 ? weekdayLabel : monthDayLabel;
 
   const statCards = [
-    { name: 'Questions asked', value: String(totals.queries), detail: `Last ${days} days`, icon: HelpCircle, color: 'text-cyan-500 bg-cyan-500/10' },
+    {
+      name: 'Questions asked',
+      value: `${totals.queries} (${totals.queries_answered ?? 0} answered)`,
+      detail: `Last ${days} days`, icon: HelpCircle, color: 'text-cyan-500 bg-cyan-500/10'
+    },
     {
       name: 'Quizzes taken', value: String(totals.quizzes_taken),
       detail: totals.average_score_pct != null ? `Average score ${pct(totals.average_score_pct)}` : 'No quizzes taken yet',

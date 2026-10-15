@@ -89,6 +89,24 @@ export const isTokenExpired = (token) => {
  * - Error propagation
  * - Session expiration (401)
  */
+/**
+ * A 4xx `detail` is usually a plain string, but FastAPI/Pydantic's own 422
+ * validation errors (e.g. RegisterRequest's username/password rules) send
+ * a list of {msg, ...} objects instead -- turned into one readable string
+ * here so every caller (the register/login error banner included) always
+ * gets back plain text, never "[object Object]".
+ */
+function formatErrorDetail(detail, fallback) {
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail) && detail.length > 0) {
+    return detail
+      .map((item) => (item && typeof item.msg === 'string' ? item.msg.replace(/^Value error,\s*/, '') : null))
+      .filter(Boolean)
+      .join(' ') || fallback;
+  }
+  return fallback;
+}
+
 async function request(endpoint, options = {}) {
   // Any API call counts as user activity for AuthProvider's idle-aware
   // session handling (see utils/activity.js) -- a logged-in user making
@@ -125,7 +143,7 @@ async function request(endpoint, options = {}) {
       let detail = 'Invalid username or password';
       try {
         const data = await response.json();
-        detail = data.detail || detail;
+        detail = formatErrorDetail(data.detail, detail);
       } catch {
         // Response body wasn't JSON — keep the default detail message above.
       }
@@ -160,7 +178,7 @@ async function request(endpoint, options = {}) {
   if (!response.ok) {
     // `status` lets a caller branch on a specific code (e.g. 409 "already
     // done") without parsing the message text -- see analyticsImport.js.
-    throw Object.assign(new Error(data.detail || `Request failed with status ${response.status}`), {
+    throw Object.assign(new Error(formatErrorDetail(data.detail, `Request failed with status ${response.status}`)), {
       status: response.status
     });
   }

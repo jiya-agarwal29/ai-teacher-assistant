@@ -100,38 +100,41 @@ def llm_mock_headers(client):
     each rate-limited to 10/minute, so giving each of those tests its own
     account would blow through that budget within one pytest run.
     """
-    _register(client, "llm_mock_test_user", "llmmocktestpass1")
-    return _auth_headers(client, "llm_mock_test_user", "llmmocktestpass1")
+    main.limiter.reset()
+    _register(client, "llm_mock_test_user", "Llmmocktestpass1!")
+    return _auth_headers(client, "llm_mock_test_user", "Llmmocktestpass1!")
 
 
 @pytest.fixture(scope="session")
 def phase3a_headers(client):
     """Shared account (same rate-limit-budget reasoning as llm_mock_headers above) for the background-processing tests that only need one account."""
-    _register(client, "phase3a_test_user", "phase3apass1")
-    return _auth_headers(client, "phase3a_test_user", "phase3apass1")
+    main.limiter.reset()
+    _register(client, "phase3a_test_user", "Phase3apass1!")
+    return _auth_headers(client, "phase3a_test_user", "Phase3apass1!")
 
 
 @pytest.fixture(scope="session")
 def phase3a_other_headers(client):
     """A second shared account, for the one background-processing test that needs to check cross-user isolation (404 for a non-owner)."""
-    _register(client, "phase3a_other_user", "phase3aotherpass1")
-    return _auth_headers(client, "phase3a_other_user", "phase3aotherpass1")
+    main.limiter.reset()
+    _register(client, "phase3a_other_user", "Phase3aotherpass1!")
+    return _auth_headers(client, "phase3a_other_user", "Phase3aotherpass1!")
 
 
 def test_register(client):
-    res = _register(client, "apitestuser1", "apitestpass123")
+    res = _register(client, "apitestuser1", "Apitestpass123!")
     assert res.status_code == 200
     assert res.json() == {"message": "User registered successfully"}
 
     # Duplicate username is rejected
-    res = _register(client, "apitestuser1", "apitestpass123")
+    res = _register(client, "apitestuser1", "Apitestpass123!")
     assert res.status_code == 400
 
 
 def test_login(client):
-    _register(client, "apiloginuser", "apiloginpass1")
+    _register(client, "apiloginuser", "Apiloginpass1!")
 
-    res = _login(client, "apiloginuser", "apiloginpass1")
+    res = _login(client, "apiloginuser", "Apiloginpass1!")
     assert res.status_code == 200
     data = res.json()
     assert "access_token" in data
@@ -139,7 +142,7 @@ def test_login(client):
 
 
 def test_bad_login_message(client):
-    _register(client, "apibaduser", "apibadpass123")
+    _register(client, "apibaduser", "Apibadpass123!")
 
     # Wrong password
     res = _login(client, "apibaduser", "wrongpassword")
@@ -153,12 +156,70 @@ def test_bad_login_message(client):
     assert res.json()["detail"] == "Invalid username or password"
 
 
+# --- Fix item 6: Zod (frontend) + matching backend password/username rules ---
+def test_register_rejects_weak_passwords(client):
+    # /register is rate-limited 10/minute per IP across the whole session's
+    # accounts -- reset first so this test's own several attempts (each one
+    # counts, pass or fail) have the full budget, same reasoning as
+    # phase4b_headers and friends below.
+    main.limiter.reset()
+    cases = [
+        ("Ab1!", "at least 8 characters"),
+        ("lowercase123!", "uppercase letter"),
+        ("UPPERCASE123!", "lowercase letter"),
+        ("NoDigitsHere!", "one number"),
+        ("NoSpecialChar123", "special character"),
+    ]
+    for password, expected_fragment in cases:
+        res = _register(client, "regpwtest_weak", password)
+        assert res.status_code == 422, res.text
+        assert expected_fragment in res.text
+
+
+def test_register_rejects_bad_usernames(client):
+    main.limiter.reset()
+    cases = ["ab", "x" * 31, "bad-name", "bad.name", "bad name"]
+    for username in cases:
+        res = _register(client, username, "ValidPass123!")
+        assert res.status_code == 422, res.text
+        assert "Username must be 3-30 characters" in res.text
+
+
+def test_register_accepts_a_valid_strong_password(client):
+    main.limiter.reset()
+    res = _register(client, "regpwtest_valid", "ValidPass123!")
+    assert res.status_code == 200, res.text
+    assert res.json() == {"message": "User registered successfully"}
+
+    login_res = _login(client, "regpwtest_valid", "ValidPass123!")
+    assert login_res.status_code == 200, login_res.text
+
+
+def test_login_still_works_for_an_existing_user_with_an_old_simple_password(client):
+    # The new password-strength rules apply only to NEW registrations -- an
+    # account created before this fix (simulated here by inserting the row
+    # directly, bypassing RegisterRequest's validators entirely) must still
+    # be able to log in with its old, simple password. Login has no
+    # password-format checks at all, old rules or new.
+    db = TestSessionLocal()
+    try:
+        db.add(main.User(username="legacy_simple_pw_user", password=main.hash_password("simplepass1")))
+        db.commit()
+    finally:
+        db.close()
+
+    main.limiter.reset()
+    res = _login(client, "legacy_simple_pw_user", "simplepass1")
+    assert res.status_code == 200, res.text
+    assert "access_token" in res.json()
+
+
 def test_upload_list_isolation_and_delete(client):
     # Two separate accounts
-    _register(client, "apiowner", "apiownerpass1")
-    _register(client, "apiother", "apiotherpass1")
-    headers_owner = _auth_headers(client, "apiowner", "apiownerpass1")
-    headers_other = _auth_headers(client, "apiother", "apiotherpass1")
+    _register(client, "apiowner", "Apiownerpass1!")
+    _register(client, "apiother", "Apiotherpass1!")
+    headers_owner = _auth_headers(client, "apiowner", "Apiownerpass1!")
+    headers_other = _auth_headers(client, "apiother", "Apiotherpass1!")
 
     # Owner uploads a small TXT
     file_content = b"Bees pollinate flowering plants and are essential for many food crops around the world."
@@ -217,8 +278,8 @@ def test_upload_processing_fails_when_embedding_service_stays_rate_limited(clien
     import llm as llm_module
     from google.genai import errors as genai_errors
 
-    _register(client, "apibusyuser", "apibusypass1")
-    headers = _auth_headers(client, "apibusyuser", "apibusypass1")
+    _register(client, "apibusyuser", "Apibusypass1!")
+    headers = _auth_headers(client, "apibusyuser", "Apibusypass1!")
 
     class _AlwaysRateLimitedModels:
         def embed_content(self, **kwargs):
@@ -1454,16 +1515,16 @@ def phase4b_headers(client):
     # session's accounts -- reset first so this registration doesn't fail
     # just because earlier tests already used up that budget.
     main.limiter.reset()
-    _register(client, "phase4b_test_user", "phase4bpass1")
-    return _auth_headers(client, "phase4b_test_user", "phase4bpass1")
+    _register(client, "phase4b_test_user", "Phase4bpass1!")
+    return _auth_headers(client, "phase4b_test_user", "Phase4bpass1!")
 
 
 @pytest.fixture(scope="session")
 def phase4b_other_headers(client):
     """Second account, only for the cross-user question-isolation checks."""
     main.limiter.reset()
-    _register(client, "phase4b_other_user", "phase4bopass1")
-    return _auth_headers(client, "phase4b_other_user", "phase4bopass1")
+    _register(client, "phase4b_other_user", "Phase4bopass1!")
+    return _auth_headers(client, "phase4b_other_user", "Phase4bopass1!")
 
 
 def test_bloom_levels_endpoint_shape(client, phase4b_headers):
@@ -2154,15 +2215,15 @@ def test_generate_quiz_recent_questions_appear_in_prompt_and_stay_user_scoped(
 @pytest.fixture(scope="session")
 def phase4d_headers(client):
     main.limiter.reset()
-    _register(client, "phase4d_test_user", "phase4dpass1")
-    return _auth_headers(client, "phase4d_test_user", "phase4dpass1")
+    _register(client, "phase4d_test_user", "Phase4dpass1!")
+    return _auth_headers(client, "phase4d_test_user", "Phase4dpass1!")
 
 
 @pytest.fixture(scope="session")
 def phase4d_other_headers(client):
     main.limiter.reset()
-    _register(client, "phase4d_other_user", "phase4dopass1")
-    return _auth_headers(client, "phase4d_other_user", "phase4dopass1")
+    _register(client, "phase4d_other_user", "Phase4dopass1!")
+    return _auth_headers(client, "phase4d_other_user", "Phase4dopass1!")
 
 
 def _seed_three_questions_and_get_apply_target(client, headers, monkeypatch, filename, topic="water cycle"):
@@ -2535,15 +2596,15 @@ def test_generate_quiz_drops_near_duplicate_and_tops_up(client, phase4b_headers,
 @pytest.fixture(scope="session")
 def phase5b_headers(client):
     main.limiter.reset()
-    _register(client, "phase5b_test_user", "phase5bpass1")
-    return _auth_headers(client, "phase5b_test_user", "phase5bpass1")
+    _register(client, "phase5b_test_user", "Phase5bpass1!")
+    return _auth_headers(client, "phase5b_test_user", "Phase5bpass1!")
 
 
 @pytest.fixture(scope="session")
 def phase5b_other_headers(client):
     main.limiter.reset()
-    _register(client, "phase5b_other_user", "phase5bopass1")
-    return _auth_headers(client, "phase5b_other_user", "phase5bopass1")
+    _register(client, "phase5b_other_user", "Phase5bopass1!")
+    return _auth_headers(client, "phase5b_other_user", "Phase5bopass1!")
 
 
 PAPER_BOOK_CONTENT = "\n\n".join(
@@ -4060,15 +4121,15 @@ def test_import_paper_pattern_file_not_added_to_documents_and_deleted(client, ph
 @pytest.fixture(scope="session")
 def phase6a_headers(client):
     main.limiter.reset()
-    _register(client, "phase6a_test_user", "phase6apass1")
-    return _auth_headers(client, "phase6a_test_user", "phase6apass1")
+    _register(client, "phase6a_test_user", "Phase6apass1!")
+    return _auth_headers(client, "phase6a_test_user", "Phase6apass1!")
 
 
 @pytest.fixture(scope="session")
 def phase6a_other_headers(client):
     main.limiter.reset()
-    _register(client, "phase6a_other_user", "phase6aopass1")
-    return _auth_headers(client, "phase6a_other_user", "phase6aopass1")
+    _register(client, "phase6a_other_user", "Phase6aopass1!")
+    return _auth_headers(client, "phase6a_other_user", "Phase6aopass1!")
 
 
 _phase6a_fresh_user_counter = {"n": 0}
@@ -4083,7 +4144,7 @@ def _fresh_phase6a_user(client):
     """
     _phase6a_fresh_user_counter["n"] += 1
     username = f"phase6a_fresh_user_{_phase6a_fresh_user_counter['n']}"
-    password = "phase6afreshpass1"
+    password = "Phase6afreshpass1!"
     main.limiter.reset()
     _register(client, username, password)
     return username, _auth_headers(client, username, password)
@@ -4194,6 +4255,152 @@ def test_tutor_logs_query_event_on_success(client, llm_mock_headers, monkeypatch
     assert _count_events(user_id, "query") == before + 1
 
     client.delete(f"/books/{book_id}", headers=headers)
+
+
+def _latest_event_meta(user_id, kind):
+    db = TestSessionLocal()
+    try:
+        latest = (
+            db.query(main.ActivityEvent)
+            .filter(main.ActivityEvent.user_id == user_id, main.ActivityEvent.kind == kind)
+            .order_by(main.ActivityEvent.id.desc()).first()
+        )
+        return json.loads(latest.meta) if latest and latest.meta else None
+    finally:
+        db.close()
+
+
+# --- Fix item 5: chat/tutor when the answer can't come from documents ---
+def test_chat_no_documents_saves_turn_and_logs_unanswered_query(client):
+    # A brand-new account with zero uploads -- the question and the app's
+    # "No documents uploaded" reply must still be saved into the given
+    # conversation and logged with reason="no_documents", not silently
+    # dropped just because there was nothing to answer from.
+    username, headers = _fresh_phase6c_user(client)
+    user_id = _user_id(username)
+    conv = client.post("/conversations", headers=headers).json()
+
+    res = client.post(
+        "/chat", headers=headers,
+        json={"question": "What is in my notes?", "conversation_id": conv["id"]}
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["message"] == "No documents uploaded"
+
+    detail = client.get(f"/conversations/{conv['id']}", headers=headers).json()
+    assert len(detail["messages"]) == 2
+    assert detail["messages"][0]["role"] == "user"
+    assert detail["messages"][0]["content"] == "What is in my notes?"
+    assert detail["messages"][1]["role"] == "assistant"
+    assert detail["messages"][1]["content"] == "No documents uploaded"
+
+    assert _latest_event_meta(user_id, "query") == {"answered": False, "reason": "no_documents"}
+
+
+def test_chat_processing_documents_saves_turn_and_logs_unanswered_query(client, monkeypatch):
+    # A book that exists but isn't "ready" yet (stuck at "needs_review"
+    # here) -- the question must still be answered with the pending
+    # message, saved into the conversation, and logged as
+    # reason="processing" (not "no_documents": the user did upload something).
+    import document_parsers
+    import ocr as ocr_module
+    import llm as llm_module
+
+    username, headers = _fresh_phase6c_user(client)
+    user_id = _user_id(username)
+
+    monkeypatch.setattr(document_parsers, "parse_pdf", lambda f: [
+        {"page_number": 1, "content": "A" * 100},
+        {"page_number": 2, "content": "hi"},
+    ])
+    monkeypatch.setattr(ocr_module, "render_pdf_page_to_png", lambda path, page_index: _make_test_image_bytes())
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "Transcribed handwriting.")
+
+    upload_res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": ("scan.pdf", b"not a real pdf -- parse_pdf is mocked", "application/pdf")}
+    )
+    assert upload_res.status_code == 202
+    assert upload_res.json()["status"] == "needs_review"
+    book_id = upload_res.json()["book_id"]
+
+    conv = client.post("/conversations", headers=headers).json()
+    res = client.post(
+        "/chat", headers=headers,
+        json={"question": "What does page 2 say?", "conversation_id": conv["id"]}
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["message"] == main.PENDING_DOCUMENTS_MESSAGE
+
+    detail = client.get(f"/conversations/{conv['id']}", headers=headers).json()
+    assert len(detail["messages"]) == 2
+    assert detail["messages"][1]["content"] == main.PENDING_DOCUMENTS_MESSAGE
+
+    assert _latest_event_meta(user_id, "query") == {"answered": False, "reason": "processing"}
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_not_enough_info_saves_turn_and_logs_unanswered_query(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    book_id = _upload_bees_doc(client, headers, "analytics_notenough_conv_bees.txt")
+    conv = client.post("/conversations", headers=headers).json()
+
+    monkeypatch.setattr(
+        llm_module, "generate",
+        lambda *a, **kw: "The uploaded documents do not contain enough information for this question."
+    )
+    res = client.post(
+        "/chat", headers=headers,
+        json={"question": "What do bees do?", "conversation_id": conv["id"]}
+    )
+    assert res.status_code == 200, res.text
+    no_info_answer = "The uploaded documents do not contain enough information for this question."
+    assert res.json()["answer"] == no_info_answer
+
+    detail = client.get(f"/conversations/{conv['id']}", headers=headers).json()
+    assert len(detail["messages"]) == 2
+    assert detail["messages"][1]["content"] == no_info_answer
+
+    assert _latest_event_meta(user_id, "query") == {"answered": False, "reason": "not_enough_info"}
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_normal_answer_logs_answered_true_meta(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    book_id = _upload_bees_doc(client, headers, "analytics_answered_true_bees.txt")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+
+    assert _latest_event_meta(user_id, "query") == {"answered": True}
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_summary_totals_queries_and_queries_answered(client):
+    username, headers = _fresh_phase6a_user(client)
+    user_id = _user_id(username)
+
+    _insert_event(user_id, "query", meta={"answered": True})
+    _insert_event(user_id, "query", meta={"answered": False, "reason": "no_documents"})
+    _insert_event(user_id, "query", meta={"answered": False, "reason": "processing"})
+    _insert_event(user_id, "query", meta={"answered": False, "reason": "not_enough_info"})
+    _insert_event(user_id, "query")  # legacy event logged before this field existed
+
+    res = client.get("/analytics/summary", headers=headers, params={"days": 7})
+    assert res.status_code == 200, res.text
+    totals = res.json()["totals"]
+    assert totals["queries"] == 5
+    assert totals["queries_answered"] == 2
 
 
 def test_summarize_logs_tool_event_on_success_not_on_failure(client, llm_mock_headers, monkeypatch):
@@ -4761,7 +4968,7 @@ def _fresh_phase6c_user(client):
     """A brand-new account, for any conversation test that needs a clean, isolated starting state."""
     _phase6c_fresh_user_counter["n"] += 1
     username = f"phase6c_fresh_user_{_phase6c_fresh_user_counter['n']}"
-    password = "phase6cfreshpass1"
+    password = "Phase6cfreshpass1!"
     main.limiter.reset()
     _register(client, username, password)
     return username, _auth_headers(client, username, password)

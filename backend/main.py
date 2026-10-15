@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Dep
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -214,7 +214,12 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+# Fix item 6: tightened from the old 3-32 chars incl. dots/hyphens to match
+# the frontend's Zod schema exactly -- login (OAuth2PasswordRequestForm,
+# no format checks at all) is unaffected, so an existing account created
+# under the old, looser rule still logs in fine.
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,30}$")
+PASSWORD_SPECIAL_CHAR_PATTERN = re.compile(r"[^A-Za-z0-9]")
 
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".pptx", ".doc", ".ppt", ".txt", ".md"}
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "100"))
@@ -921,6 +926,30 @@ class RegisterRequest(BaseModel):
     username: str
     password: str
 
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        if not USERNAME_PATTERN.fullmatch(value):
+            raise ValueError(
+                "Username must be 3-30 characters and contain only letters, numbers, or underscores."
+            )
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("Password must be at least 8 characters long.")
+        if not re.search(r"[A-Z]", value):
+            raise ValueError("Password must contain at least one uppercase letter.")
+        if not re.search(r"[a-z]", value):
+            raise ValueError("Password must contain at least one lowercase letter.")
+        if not re.search(r"[0-9]", value):
+            raise ValueError("Password must contain at least one number.")
+        if not PASSWORD_SPECIAL_CHAR_PATTERN.search(value):
+            raise ValueError("Password must contain at least one special character.")
+        return value
+
 
 class SummarizeRequest(BaseModel):
     text: str
@@ -967,21 +996,9 @@ def health_check():
 @app.post("/register")
 @limiter.limit("10/minute")
 def register(request: Request, payload: RegisterRequest, db: Session = Depends(get_db)):
-
-    if not USERNAME_PATTERN.fullmatch(payload.username):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Username must be 3-32 characters and contain only letters, digits, underscores, dots, or hyphens."
-        )
-
-    if len(payload.password) < 8:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Password must be at least 8 characters long."
-        )
-
+    # Username/password format is validated by RegisterRequest's own field
+    # validators (422 on a bad username or weak password, Fix item 6) --
+    # what's left here is the one check that needs the database.
     existing_user = db.query(User).filter(
         User.username == payload.username
     ).first()
@@ -1750,28 +1767,36 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
     same plain question (no prefix is added anywhere in this pipeline).
 
     `conversation_id` (Phase 6C, /chat only -- /tools/tutor never passes
-    one) saves this question and the answer into that conversation, same
-    boundary as _log_activity just below it: only once a real retrieval
-    attempt happened, never on the "no documents"/"needs re-indexing"
-    bounce-backs (there's no real answer to save yet), and never on a 503 --
-    _save_chat_turn is only ever called right alongside _log_activity.
+    one) saves this question and the answer into that conversation --
+    including on every "couldn't answer" bounce-back (no documents, still
+    processing, or not enough information), not just a real answer, so a
+    conversation's history always shows what the user actually saw. Every
+    outcome also logs a "query" ActivityEvent with meta {"answered": bool,
+    "reason": ...} on a bounce-back, {"answered": true} on a real answer --
+    Fix item 5 -- so /analytics/summary's queries/queries_answered totals
+    agree with what was actually shown, and never on a 503 (no outcome to
+    record yet).
     """
+    pending_message = _pending_documents_message_or_none(db, current_user.id)
     if not user_has_documents(db, current_user.id):
-        return {
-            "message": _pending_documents_message_or_none(db, current_user.id) or "No documents uploaded"
-        }
+        reason = "processing" if pending_message else "no_documents"
+        answer = pending_message or "No documents uploaded"
+        _log_activity(db, current_user.id, "query", meta={"answered": False, "reason": reason})
+        _save_chat_turn(db, current_user.id, conversation_id, question, answer, [])
+        return {"message": answer}
 
     if needs_reembedding(db, current_user.id):
-        return {
-            "message": "Your documents need re-indexing"
-        }
+        answer = "Your documents need re-indexing"
+        _log_activity(db, current_user.id, "query", meta={"answered": False, "reason": "processing"})
+        _save_chat_turn(db, current_user.id, conversation_id, question, answer, [])
+        return {"message": answer}
 
     top_pages = _retrieve_or_503(db, current_user.id, question, top_k=5, apply_threshold=True)
 
     # Relevance checking using both cosine similarity and lexical overlap
     temp_context = " ".join([page.content for _, page in top_pages])
     if not top_pages or not check_context_relevance(question, temp_context, top_pages[0][0]):
-        _log_activity(db, current_user.id, "query")
+        _log_activity(db, current_user.id, "query", meta={"answered": False, "reason": "not_enough_info"})
         no_info_answer = "The uploaded documents do not contain enough information for this question."
         _save_chat_turn(db, current_user.id, conversation_id, question, no_info_answer, [])
         return {
@@ -1813,7 +1838,7 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
     if not answer or "do not contain enough information" in answer.lower():
-        _log_activity(db, current_user.id, "query")
+        _log_activity(db, current_user.id, "query", meta={"answered": False, "reason": "not_enough_info"})
         no_info_answer = "The uploaded documents do not contain enough information for this question."
         _save_chat_turn(db, current_user.id, conversation_id, question, no_info_answer, [])
         return {
@@ -1822,7 +1847,7 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
             "sources": []
         }
 
-    _log_activity(db, current_user.id, "query")
+    _log_activity(db, current_user.id, "query", meta={"answered": True})
     _save_chat_turn(db, current_user.id, conversation_id, question, answer, sources)
     return {
         "question": question,
@@ -4442,6 +4467,7 @@ def get_analytics_summary(
     queries_by_day = {key: 0 for key in day_keys}
     active_seconds_by_day = {key: 0 for key in day_keys}
     totals_queries = 0
+    totals_queries_answered = 0
     totals_tools = 0
     totals_quiz_generated = 0
     totals_active_seconds = 0
@@ -4452,6 +4478,18 @@ def get_analytics_summary(
             day_key = _local_date_key(event.created_at, user_tz)
             if day_key in queries_by_day:
                 queries_by_day[day_key] += event.value
+            # Events logged before this field existed (Fix item 5) have no
+            # meta at all -- those were always real answers (the old code
+            # had no "couldn't answer" bounce-back that logged), so an
+            # absent/unparseable meta defaults to answered=true.
+            answered = True
+            if event.meta:
+                try:
+                    answered = bool(json.loads(event.meta).get("answered", True))
+                except (ValueError, AttributeError):
+                    pass
+            if answered:
+                totals_queries_answered += event.value
         elif event.kind == "tool":
             totals_tools += event.value
         elif event.kind == "quiz_generated":
@@ -4549,6 +4587,7 @@ def get_analytics_summary(
         "tz_fallback": tz_fallback,
         "totals": {
             "queries": totals_queries,
+            "queries_answered": totals_queries_answered,
             "tools_used": totals_tools,
             "quizzes_generated": totals_quiz_generated,
             "quizzes_taken": quizzes_taken,

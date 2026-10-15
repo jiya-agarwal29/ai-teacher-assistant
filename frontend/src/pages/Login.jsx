@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
+import { registerSchema, loginSchema, fieldErrorsFrom, PASSWORD_RULES } from '../utils/authValidation';
 import {
   Lock, User, GraduationCap, AlertCircle, CheckCircle2, Moon, Sun,
-  Plus, ShieldCheck, BookOpenCheck, Sparkle, Eye, EyeOff
+  Plus, ShieldCheck, BookOpenCheck, Sparkle, Eye, EyeOff, Check
 } from 'lucide-react';
 
 export default function Login() {
@@ -17,8 +18,21 @@ export default function Login() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const [validationError, setValidationError] = useState('');
+  const [touched, setTouched] = useState({ username: false, password: false, confirmPassword: false });
   const [successMessage, setSuccessMessage] = useState('');
+
+  // Live validation on every keystroke -- login only checks "required" (an
+  // existing account with an old simple password must still work); register
+  // enforces the same username/password rules as the backend's
+  // RegisterRequest (see utils/authValidation.js). Submit stays disabled
+  // until this passes.
+  const schema = isLoginTab ? loginSchema : registerSchema;
+  const validation = schema.safeParse(
+    isLoginTab ? { username, password } : { username, password, confirmPassword }
+  );
+  const fieldErrors = fieldErrorsFrom(validation);
+  const isFormValid = validation.success;
+  const showFieldError = (field) => (touched[field] ? fieldErrors[field] : null);
 
   const formRef = useRef(null);
   const usernameRef = useRef(null);
@@ -48,25 +62,14 @@ export default function Login() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    setValidationError('');
     setSuccessMessage('');
     clearError();
 
-    if (!username.trim() || !password.trim()) {
-      setValidationError('Please fill in all fields.');
+    if (!isFormValid) {
+      // The Submit button is disabled while invalid, but Enter still
+      // submits the form directly -- show every field's error in that case.
+      setTouched({ username: true, password: true, confirmPassword: true });
       return;
-    }
-
-    if (!isLoginTab) {
-      if (password.length < 8) {
-        setValidationError('Password must be at least 8 characters long.');
-        return;
-      }
-
-      if (password !== confirmPassword) {
-        setValidationError('Passwords do not match.');
-        return;
-      }
     }
 
     if (isLoginTab) {
@@ -97,7 +100,7 @@ export default function Login() {
   const handleTabSwitch = (loginTab) => {
     setIsLoginTab(loginTab);
     clearError();
-    setValidationError('');
+    setTouched({ username: false, password: false, confirmPassword: false });
     setSuccessMessage('');
   };
 
@@ -230,11 +233,13 @@ export default function Login() {
               </button>
             </div>
 
-            {/* Feedback alerts */}
-            {(validationError || error) && (
+            {/* Feedback alerts -- field-level errors show under each input;
+                this is for the backend's own response, shown as-is if it
+                ever disagrees with the frontend's own Zod validation. */}
+            {error && (
               <div className="flex items-start gap-3 p-4 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 mb-6 text-xs font-medium">
                 <AlertCircle size={16} className="shrink-0 mt-0.5" />
-                <span>{validationError || error}</span>
+                <span>{error}</span>
               </div>
             )}
 
@@ -261,10 +266,14 @@ export default function Login() {
                     placeholder="e.g. jiya"
                     value={username}
                     onChange={(e) => setUsername(e.target.value)}
+                    onBlur={() => setTouched((t) => ({ ...t, username: true }))}
                     disabled={isLoading}
                     className="w-full pl-11 pr-4 py-3 rounded-xl text-xs font-medium bg-white dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
                   />
                 </div>
+                {showFieldError('username') && (
+                  <p className="text-[10px] font-semibold text-rose-500 dark:text-rose-400 mt-1.5">{showFieldError('username')}</p>
+                )}
               </div>
 
               <div>
@@ -280,6 +289,7 @@ export default function Login() {
                     placeholder="••••••••"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
+                    onBlur={() => setTouched((t) => ({ ...t, password: true }))}
                     disabled={isLoading}
                     className="w-full pl-11 pr-11 py-3 rounded-xl text-xs font-medium bg-white dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
                   />
@@ -293,6 +303,32 @@ export default function Login() {
                     {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                 </div>
+                {isLoginTab && showFieldError('password') && (
+                  <p className="text-[10px] font-semibold text-rose-500 dark:text-rose-400 mt-1.5">{showFieldError('password')}</p>
+                )}
+
+                {!isLoginTab && (
+                  <ul className="mt-2.5 space-y-1">
+                    {PASSWORD_RULES.map((rule) => {
+                      const met = rule.test(password);
+                      return (
+                        <li
+                          key={rule.key}
+                          className={`flex items-center gap-1.5 text-[10px] font-medium transition-colors ${
+                            met ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-400 dark:text-slate-500'
+                          }`}
+                        >
+                          <span className={`w-3.5 h-3.5 rounded-full flex items-center justify-center shrink-0 ${
+                            met ? 'bg-emerald-500/15' : 'bg-slate-200/60 dark:bg-slate-700/60'
+                          }`}>
+                            {met && <Check size={9} strokeWidth={3} />}
+                          </span>
+                          {rule.label}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
               </div>
 
               {!isLoginTab && (
@@ -309,6 +345,7 @@ export default function Login() {
                       placeholder="••••••••"
                       value={confirmPassword}
                       onChange={(e) => setConfirmPassword(e.target.value)}
+                      onBlur={() => setTouched((t) => ({ ...t, confirmPassword: true }))}
                       disabled={isLoading}
                       className="w-full pl-11 pr-11 py-3 rounded-xl text-xs font-medium bg-white dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
                     />
@@ -322,12 +359,15 @@ export default function Login() {
                       {showConfirmPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                     </button>
                   </div>
+                  {showFieldError('confirmPassword') && (
+                    <p className="text-[10px] font-semibold text-rose-500 dark:text-rose-400 mt-1.5">{showFieldError('confirmPassword')}</p>
+                  )}
                 </div>
               )}
 
               <button
                 type="submit"
-                disabled={isLoading}
+                disabled={isLoading || !isFormValid}
                 className="w-full py-3.5 mt-2 rounded-full bg-indigo-500 hover:bg-indigo-600 text-white font-semibold text-xs tracking-tight shadow-sm transition-colors flex items-center justify-center gap-2 disabled:opacity-75 disabled:pointer-events-none"
               >
                 {isLoading ? (
