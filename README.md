@@ -1,5 +1,7 @@
 # AI Teacher Assistant
 
+[![CI](https://github.com/jiya-agarwal29/ai-teacher-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/jiya-agarwal29/ai-teacher-assistant/actions/workflows/ci.yml)
+
 A RAG-based teaching assistant. Upload your own course material (PDF, Word, PowerPoint) and get grounded AI chat answers, semantic search, and auto-generated quizzes — all sourced from what you actually uploaded, not the open internet.
 
 Gemini (`GEMINI_API_KEY`, free tier) is the main AI provider for both answer generation and embeddings. Voyage AI is available as an optional alternative embedding provider, and everything can also run fully offline via local models (`flan-t5-small` for generation, `all-MiniLM-L6-v2` for embeddings) with no API key at all. See [AI providers](#ai-providers) below.
@@ -371,6 +373,12 @@ Every uploaded original (a document or one or more page photos/scans) and every 
 Keys look like `users/<user_id>/books/<book_id>/original.pdf`, `.../original_images/0001.jpg` (a multi-photo scan), or `.../pages/0003.jpg` (an OCR-rendered or uploaded-image page). `LocalStorage` maps a key to a real path by collapsing `users/<id>/books/<id>/` down to `<id>/<id>/` — the exact layout `backend/uploads/` has always used — so **an existing local upload folder keeps working with `STORAGE_BACKEND=local` and no data migration**; a `DocumentPage.image_path` saved before `storage.py` existed (a full absolute path, not a key) is also still accepted as-is.
 
 Switching an existing deployment from `local` to `s3` does **not** migrate already-uploaded files — only new uploads (and anything re-saved by a retry/rotate) go to the new backend. Move `backend/uploads/` into the bucket yourself first if you need old files to keep working after switching.
+
+## Docker
+
+Run everything with Docker: `docker compose up --build` from the repo root starts a local Postgres 16, the backend (built from `backend/Dockerfile`, migrated and running on `:8000`), and the frontend's Vite dev server (`:5173`, with hot-reload) — see `docker-compose.yml`. It reads `backend/.env` for `SECRET_KEY`/`GEMINI_API_KEY`/etc, but always points the backend at the compose stack's own Postgres and a local uploads volume regardless of what `DATABASE_URL`/`STORAGE_BACKEND` that file has set, so this works the same way for everyone regardless of their own local setup.
+
+`backend/Dockerfile` (a separate, standalone image from the compose stack above) is also what Render builds in production (see `render.yaml`'s `dockerfilePath`/`dockerContext`) and what CI builds on every push (`.github/workflows/ci.yml`) — multi-stage, a `python:3.12.10-slim` base matching `backend/.python-version`, non-root, and no `requirements-local.txt` (the `torch`/`transformers` local-model extras — see [AI providers](#ai-providers)), so it stays small and is only meant for the default Gemini-based setup.
 
 ## Running tests
 

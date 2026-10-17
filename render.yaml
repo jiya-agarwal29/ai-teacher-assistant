@@ -9,25 +9,26 @@
 # https://render.com/docs/blueprint-spec before trusting this file as-is.
 
 services:
-  # --- Backend: FastAPI, as a web service ---
+  # --- Backend: FastAPI, built from backend/Dockerfile (Phase 7E) ---
   - type: web
     name: ai-teacher-assistant-backend
-    runtime: python
+    runtime: docker
     region: singapore
     plan: free
-    rootDir: backend
-    buildCommand: pip install -r requirements.txt
-    # Applies any pending Alembic migrations before the new code starts
-    # serving traffic (never create_all -- see README's "ENV=production"
-    # section), then starts uvicorn with the proxy flags real client-IP
-    # rate limiting needs behind Render's edge proxy (see README's "Behind
-    # a reverse proxy" section and main._client_ip). Trusting
-    # --forwarded-allow-ips="*" is safe here specifically because Render's
-    # own edge is the only proxy in front of this service.
-    startCommand: >-
-      alembic upgrade head &&
-      uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
+    # Relative to the repo root, not rootDir -- Render's own spec is
+    # explicit about this for dockerfilePath/dockerContext specifically
+    # (unlike buildCommand/startCommand on the non-Docker runtimes, which
+    # don't apply here at all; the image's own CMD -- alembic upgrade head
+    # then uvicorn with the proxy flags real client-IP rate limiting needs
+    # behind Render's edge proxy, see README's "Behind a reverse proxy"
+    # section and main._client_ip -- replaces both).
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
     healthCheckPath: /health
+    # Deploys are triggered by CI/CD (.github/workflows/deploy.yml) hitting
+    # this service's deploy hook after tests pass on main, not by Render
+    # noticing a new commit on its own.
+    autoDeployTrigger: off
     envVars:
       - key: ENV
         value: production
@@ -71,6 +72,10 @@ services:
     rootDir: frontend
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
+    # Same reasoning as the backend service above -- CD triggers this
+    # service's own deploy hook after tests pass on main, so Render's own
+    # auto-deploy-on-push would otherwise race it/double-build on every push.
+    autoDeployTrigger: off
     # Client-side routing (react-router): serve index.html for any path that
     # isn't a real built file, so a deep link / page refresh doesn't 404.
     routes:

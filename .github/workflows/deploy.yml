@@ -1,0 +1,78 @@
+name: Deploy
+
+# Triggered by CI finishing, not by push directly -- this is what lets this
+# workflow require "CI succeeded" without a cross-workflow `needs:` (which
+# doesn't exist). The job-level `if:` below then narrows that down to "CI
+# run was for a push to main, and it passed" -- a green CI run on a feature
+# branch or a pull request must never deploy anything.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+jobs:
+  deploy-render:
+    name: Deploy to Render
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    steps:
+      # Render's deploy hooks are plain secret URLs -- hitting one starts a
+      # new deploy of that service from its latest commit on the branch the
+      # service is configured to track. See DEPLOY.md for where to find
+      # these two URLs and how to add them as repo secrets. Skips (not
+      # fails) if a hook isn't configured yet, so this workflow still works
+      # before you've set either secret up.
+      - name: Trigger Render backend deploy
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK_BACKEND }}" ]; then
+            echo "RENDER_DEPLOY_HOOK_BACKEND secret not set -- skipping backend deploy."
+          else
+            curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_BACKEND }}"
+            echo "Backend deploy triggered."
+          fi
+
+      - name: Trigger Render frontend deploy
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK_FRONTEND }}" ]; then
+            echo "RENDER_DEPLOY_HOOK_FRONTEND secret not set -- skipping frontend deploy."
+          else
+            curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_FRONTEND }}"
+            echo "Frontend deploy triggered."
+          fi
+
+  push-image:
+    name: Push backend image to GHCR
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Checks out the exact commit CI just tested, not whatever main
+      # happens to be at by the time this workflow_run fires -- the two can
+      # differ if another push landed on main in between.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          file: backend/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}-backend:${{ github.event.workflow_run.head_sha }}

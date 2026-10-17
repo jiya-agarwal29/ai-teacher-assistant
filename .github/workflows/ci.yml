@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    # A real Postgres 16 to run the suite against a second time -- see the
+    # "Run tests against Postgres" step below. tests/test_api.py always
+    # picks TEST_DATABASE_URL up automatically when it's set; no backend/.env
+    # file exists in this checkout at all (it's gitignored), so the SQLite
+    # run below gets the suite's own default on-disk file, and the handful
+    # of real-S3/real-Neon-specific checks (tests/test_storage.py,
+    # tests/test_api.py's own real-S3 round trip) skip themselves cleanly
+    # since their TEST_S3_*/TEST_DATABASE_URL settings are simply absent.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ai_teacher_assistant_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          # Matches backend/.python-version (Render's own pin) -- kept in
+          # sync manually, there's no built-in way to read one file from
+          # the other here.
+          python-version: "3.12.10"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      # Dummy, never-real values -- conftest.py would set these itself if
+      # left unset, but setting them explicitly here keeps this workflow
+      # self-documenting about exactly what the suite does and doesn't need.
+      - name: Run tests against SQLite
+        working-directory: backend
+        env:
+          SECRET_KEY: ci-dummy-secret-key-never-used-for-anything-real
+          GEMINI_API_KEY: ci-dummy-gemini-key-never-used-for-anything-real
+        run: pytest tests/ -v
+
+      - name: Run tests against Postgres
+        working-directory: backend
+        env:
+          SECRET_KEY: ci-dummy-secret-key-never-used-for-anything-real
+          GEMINI_API_KEY: ci-dummy-gemini-key-never-used-for-anything-real
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ai_teacher_assistant_test
+        run: pytest tests/ -v
+
+  frontend:
+    name: Frontend lint and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          # package.json has no "engines" field -- pinned to the current
+          # Active LTS line instead (see docker-compose.yml's frontend
+          # service, which uses the same version).
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      # Dummy -- only needs to be present and non-empty for vite.config.js's
+      # Phase 7C production-build guard to pass; this build is never served.
+      - name: Build
+        working-directory: frontend
+        env:
+          VITE_API_URL: https://ci-dummy-backend.invalid
+        run: npm run build
+
+  docker:
+    name: Build backend Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # push: false here -- CI only proves the image builds. The actual
+      # ghcr.io push (and the Render deploy) happens in deploy.yml, only on
+      # main, only after this whole workflow succeeds.
+      - name: Build backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          file: backend/Dockerfile
+          push: false
+          tags: ai-teacher-assistant-backend:ci

@@ -1,0 +1,23 @@
+# Secrets -- never bake these into an image layer.
+.env
+.env.*
+!.env.example
+
+# Local dev database and uploads -- not meant to ship in the image; real
+# data lives in Postgres/S3 in any real deployment (see README).
+*.db
+*.sqlite3
+uploads/
+
+# Local Python virtualenvs -- the image installs its own deps.
+venv/
+.venv/
+
+# Caches / bytecode.
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+.git
+node_modules/

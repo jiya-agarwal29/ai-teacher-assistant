@@ -1,0 +1,73 @@
+# Local dev stack: `docker compose up --build` from the repo root.
+#
+# Frontend runs Vite's own dev server (not nginx serving a build) --
+# simpler for local dev: no separate frontend Dockerfile/build stage to
+# maintain, and it gets hot-reload on every file change for free, which a
+# built-and-served bundle wouldn't. nginx would be the right call for
+# something closer to a production image, but that's what Render's static
+# site (render.yaml) already is -- this file is for local dev only.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: ai_teacher_assistant
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d ai_teacher_assistant"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Picks up SECRET_KEY/GEMINI_API_KEY/etc from your own backend/.env --
+    # DATABASE_URL/STORAGE_BACKEND/UPLOAD_DIR below override whatever that
+    # file sets for those three specifically, since this stack always wants
+    # its own compose-network Postgres and a local uploads volume
+    # regardless of what backend/.env is set up for (e.g. Render's S3).
+    env_file:
+      - ./backend/.env
+    environment:
+      ENV: development
+      DATABASE_URL: postgresql://app:app@postgres:5432/ai_teacher_assistant
+      STORAGE_BACKEND: local
+      UPLOAD_DIR: /app/uploads
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_uploads:/app/uploads
+
+  frontend:
+    image: node:24-slim
+    working_dir: /app
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      # Named volume for node_modules so the bind mount above doesn't hide
+      # (or get hidden by) whatever's installed inside the container --
+      # also means `npm ci` only really does work once, not on every start.
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  backend_uploads:
+  frontend_node_modules:

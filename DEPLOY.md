@@ -176,6 +176,40 @@ backend both look like failures at first glance but aren't actual bugs.
 
 ---
 
+## 7. Set up CI/CD (so pushes to main deploy automatically)
+
+`render.yaml` sets `autoDeployTrigger: off` on both services — Render won't
+redeploy them just because you pushed a commit. Instead,
+`.github/workflows/deploy.yml` does that, but only after
+`.github/workflows/ci.yml` (tests, lint, build, a Docker build check) passes
+on `main`. This means a broken commit on `main` never reaches your live
+deployment — it just sits there with CI red until you fix it. Both workflows
+already exist in this repo; you only need to give the deploy one a way to
+actually reach Render:
+
+1. On Render, open the **backend** service → **Settings**, scroll to **Deploy
+   Hook**, and copy its URL (a long secret URL — treat it like a password;
+   anyone with it can trigger a deploy of that service).
+2. Do the same for the **frontend** service.
+3. In your GitHub repo, go to **Settings → Secrets and variables → Actions →
+   New repository secret**, and add:
+   - `RENDER_DEPLOY_HOOK_BACKEND` — the backend's hook URL from step 1.
+   - `RENDER_DEPLOY_HOOK_FRONTEND` — the frontend's hook URL from step 2.
+4. That's it — `deploy.yml` reads these automatically
+   (`${{ secrets.RENDER_DEPLOY_HOOK_BACKEND }}` etc.) and skips with a clear
+   log message instead of failing if either one isn't set yet, so the
+   pipeline still works (it just won't deploy anything) before you add them.
+
+Pushing to `main` now: runs CI → if it passes, triggers both Render deploy
+hooks → Render rebuilds and redeploys each service from that same commit.
+The backend's image is also optionally pushed to GitHub Container Registry
+(`ghcr.io`), tagged with the commit SHA, as a build artifact independent of
+Render — not required for Render itself to work, but useful if you ever want
+to run that exact image somewhere else (e.g. a future move to AWS, per this
+phase's own goal of keeping the backend container-portable).
+
+---
+
 ## Reading the logs
 
 On Render, open the service (backend or frontend) → **Logs** tab. This
