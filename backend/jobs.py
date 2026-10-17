@@ -24,6 +24,7 @@ already-saved page image.
 import io
 import logging
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 import database
@@ -102,62 +103,95 @@ def _extract_pdf_as_pages(db, book, pdf_bytes: bytes, review_ocr: bool) -> list:
     OCR_MIN_CHARS real (post-cleanup) characters, otherwise render that page
     with pypdfium2 and OCR it with Gemini vision. Returns a list of page
     records (page_number/extracted_text/method/review_status/image_path).
+
+    Writes `pdf_bytes` to one temp file and has both pdfplumber and
+    pypdfium2 read from that path rather than from Python-held bytes --
+    passing bytes directly makes each library copy the whole file into
+    its own buffer, so a large scanned PDF would otherwise sit in memory
+    multiple times over (Python's own pdf_bytes, plus pdfplumber's and
+    pypdfium2's own copies) instead of letting both C libraries read the
+    file themselves. pypdfium2 re-opens (and reparses) the file fresh for
+    each OCR'd page rather than keeping one document handle open across
+    the whole loop -- measured empirically (Phase 7C item 6): keeping a
+    single document open let pdfium's own per-page caches (decoded
+    images, content streams) accumulate for the document's entire
+    lifetime, peaking *higher* over a many-page scan than the repeated
+    open/close despite its extra reparsing. Each page's rendered/prepared
+    image is OCR'd, saved, and dropped (`del`) before the next page is
+    even rendered.
     """
-    pages_data = document_parsers.parse_pdf(io.BytesIO(pdf_bytes))
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    try:
+        with os.fdopen(tmp_fd, "wb") as f:
+            f.write(pdf_bytes)
+        del pdf_bytes
 
-    ocr_page_numbers = [
-        p["page_number"] for p in pages_data if len(p["content"].strip()) < OCR_MIN_CHARS
-    ]
-    if len(ocr_page_numbers) > MAX_OCR_PAGES:
-        raise ValueError(
-            f"This document has {len(ocr_page_numbers)} scanned or low-text pages, "
-            f"over the {MAX_OCR_PAGES}-page OCR limit."
-        )
+        pages_data = document_parsers.parse_pdf(tmp_path)
 
-    # Drives the "Reading page N of M" progress shown while book.source_type
-    # is still unset (see jobs._run_pipeline / the frontend status poll).
-    book.pages_total = len(ocr_page_numbers)
-    book.pages_done = 0
-    db.commit()
+        ocr_page_numbers = [
+            p["page_number"] for p in pages_data if len(p["content"].strip()) < OCR_MIN_CHARS
+        ]
+        if len(ocr_page_numbers) > MAX_OCR_PAGES:
+            raise ValueError(
+                f"This document has {len(ocr_page_numbers)} scanned or low-text pages, "
+                f"over the {MAX_OCR_PAGES}-page OCR limit."
+            )
 
-    records = []
-    ocr_done = 0
+        # Drives the "Reading page N of M" progress shown while
+        # book.source_type is still unset (see jobs._run_pipeline / the
+        # frontend status poll).
+        book.pages_total = len(ocr_page_numbers)
+        book.pages_done = 0
+        db.commit()
 
-    for page in pages_data:
-        content = page["content"]
-        page_number = page["page_number"]
+        records = []
+        ocr_done = 0
 
-        if len(content.strip()) >= OCR_MIN_CHARS:
+        for page in pages_data:
+            content = page["content"]
+            page_number = page["page_number"]
+
+            if len(content.strip()) >= OCR_MIN_CHARS:
+                records.append({
+                    "page_number": page_number,
+                    "extracted_text": content,
+                    "method": "text",
+                    "review_status": "auto_approved",
+                    "image_path": None,
+                })
+                continue
+
+            # Opened and closed fresh for each page rather than kept open
+            # across the loop -- measured empirically (Phase 7C item 6):
+            # keeping one pdfium document open for every page let its own
+            # internal per-page caches (decoded images, content streams)
+            # accumulate for the document's whole lifetime, peaking
+            # *higher* than reopening per page despite the repeated parse.
+            # tmp_path (not pdf_bytes) so pdfium reads the file itself
+            # rather than copying it into its own buffer from Python bytes.
+            rendered = ocr.render_pdf_page_to_png(tmp_path, page_index=page_number - 1)
+            prepared = ocr.prepare_image_for_ocr(rendered)
+            del rendered
+            image_path = _save_page_image(book.user_id, book.id, page_number, prepared)
+
+            extracted_text = llm.read_image(
+                prepared, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
+            )
+            del prepared
+
             records.append({
                 "page_number": page_number,
-                "extracted_text": content,
-                "method": "text",
-                "review_status": "auto_approved",
-                "image_path": None,
+                "extracted_text": extracted_text,
+                "method": "ocr",
+                "review_status": "needs_review" if review_ocr else "auto_approved",
+                "image_path": image_path,
             })
-            continue
 
-        # pypdfium2.PdfDocument accepts raw bytes directly -- no need to
-        # round-trip this through a temp file on disk.
-        rendered = ocr.render_pdf_page_to_png(pdf_bytes, page_index=page_number - 1)
-        prepared = ocr.prepare_image_for_ocr(rendered)
-        image_path = _save_page_image(book.user_id, book.id, page_number, prepared)
-
-        extracted_text = llm.read_image(
-            prepared, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
-        )
-
-        records.append({
-            "page_number": page_number,
-            "extracted_text": extracted_text,
-            "method": "ocr",
-            "review_status": "needs_review" if review_ocr else "auto_approved",
-            "image_path": image_path,
-        })
-
-        ocr_done += 1
-        book.pages_done = ocr_done
-        db.commit()
+            ocr_done += 1
+            book.pages_done = ocr_done
+            db.commit()
+    finally:
+        os.remove(tmp_path)
 
     return records
 

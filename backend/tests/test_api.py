@@ -190,6 +190,44 @@ def test_bad_login_message(client):
     assert res.json()["detail"] == "Invalid username or password"
 
 
+def test_login_rate_limit_is_separate_per_forwarded_ip(client):
+    """
+    Phase 7C item 2: behind Render's proxy, every visitor's request.client
+    would be Render's own edge address, so the rate limiter must key on
+    X-Forwarded-For's first (original-client) address instead (see
+    main._client_ip) -- otherwise one visitor exhausting /login's 10/minute
+    budget would lock out every other visitor sharing that same edge IP.
+    """
+    main.limiter.reset()
+    _register(client, "fwdiplogintest", "FwdIpLoginTest1!")
+
+    headers_ip_a = {"X-Forwarded-For": "203.0.113.5"}
+    for _ in range(10):
+        res = client.post(
+            "/login",
+            data={"username": "fwdiplogintest", "password": "FwdIpLoginTest1!"},
+            headers=headers_ip_a,
+        )
+        assert res.status_code == 200, res.text
+
+    # 11th request from that same forwarded IP is rate-limited.
+    res = client.post(
+        "/login",
+        data={"username": "fwdiplogintest", "password": "FwdIpLoginTest1!"},
+        headers=headers_ip_a,
+    )
+    assert res.status_code == 429, res.text
+
+    # A different forwarded IP still has its own, untouched budget.
+    headers_ip_b = {"X-Forwarded-For": "198.51.100.9"}
+    res = client.post(
+        "/login",
+        data={"username": "fwdiplogintest", "password": "FwdIpLoginTest1!"},
+        headers=headers_ip_b,
+    )
+    assert res.status_code == 200, res.text
+
+
 # --- Fix item 6: Zod (frontend) + matching backend password/username rules ---
 def test_register_rejects_weak_passwords(client):
     # /register is rate-limited 10/minute per IP across the whole session's
@@ -950,6 +988,73 @@ def test_pdf_mixed_text_and_scanned_pages(client, phase3a_headers, monkeypatch):
 
     # Nothing is chunked/embedded while any page still needs review.
     assert _get_pages(book_id) == []
+
+
+def test_pdf_ocr_processes_pages_one_by_one_not_all_at_once(client, phase3a_headers, monkeypatch):
+    """
+    Phase 7C item 6: a scanned PDF's pages must be rendered and OCR'd one
+    at a time -- not every page rendered up front and only then OCR'd --
+    otherwise memory for a large multi-page scan would scale with page
+    count (confirmed empirically while measuring this: an earlier version
+    held the whole file in memory twice and reopened/reparsed it once per
+    page). Verified by logging each render/save/OCR call in order and
+    asserting they strictly interleave render(1), save(1), ocr(1),
+    render(2), save(2), ocr(2), ... -- never two renders (or saves) back
+    to back, which is what "all pages rendered before any are OCR'd" (or
+    saved, or any other batching that holds more than one page's image at
+    once) would produce instead.
+    """
+    import document_parsers
+    import llm as llm_module
+    import ocr as ocr_module
+    import storage as storage_module
+
+    headers = phase3a_headers
+    num_pages = 5
+
+    monkeypatch.setattr(document_parsers, "parse_pdf", lambda f: [
+        {"page_number": i, "content": "x"} for i in range(1, num_pages + 1)  # all far below OCR_MIN_CHARS
+    ])
+
+    call_log = []
+    real_render = ocr_module.render_pdf_page_to_png
+    real_save = storage_module.storage.save
+
+    def spy_render(pdf_path_or_bytes, page_index, dpi=ocr_module.OCR_RENDER_DPI):
+        call_log.append(("render", page_index))
+        return _make_test_image_bytes()
+
+    def spy_save(key, data, content_type=None):
+        # Only a page image's own save belongs in this sequence -- the
+        # original upload is saved once, up front, before any page is
+        # even looked at, which isn't part of the one-page-at-a-time
+        # question this test is actually asking.
+        if "/pages/" in key:
+            call_log.append(("save", key))
+        return real_save(key, data, content_type=content_type)
+
+    def spy_read_image(image_bytes, mime_type, max_wait_seconds=None):
+        call_log.append(("ocr", None))
+        return "Some note."
+
+    monkeypatch.setattr(ocr_module, "render_pdf_page_to_png", spy_render)
+    monkeypatch.setattr(storage_module.storage, "save", spy_save)
+    monkeypatch.setattr(llm_module, "read_image", spy_read_image)
+
+    res = client.post(
+        "/upload-book",
+        headers=headers,
+        files={"file": ("one_by_one.pdf", b"not a real pdf -- parse_pdf is mocked", "application/pdf")}
+    )
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] in ("ready", "needs_review")
+
+    kinds = [kind for kind, _ in call_log]
+    assert kinds == ["render", "save", "ocr"] * num_pages, (
+        f"expected strictly interleaved render/save/ocr per page, got: {kinds}"
+    )
+
+    client.delete(f"/books/{res.json()['book_id']}", headers=headers)
 
 
 def test_multiple_images_become_one_book_in_order(client, phase3a_headers, monkeypatch):

@@ -20,7 +20,7 @@ from pydantic import BaseModel, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 import bloom
@@ -60,8 +60,14 @@ from auth import (
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_log_level_value = getattr(logging, LOG_LEVEL, logging.INFO)
+if ENV == "production" and _log_level_value < logging.INFO:
+    # Production never logs below INFO, regardless of what LOG_LEVEL was
+    # set to -- DEBUG-level logging in some modules includes a snippet of
+    # a generated question's text, which must never land in production logs.
+    _log_level_value = logging.INFO
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=_log_level_value,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -149,6 +155,26 @@ async def lifespan(app: FastAPI):
 AI_RATE_LIMIT_DETAIL = "Too many requests. Please wait a minute."
 
 
+def _client_ip(request: Request) -> str:
+    """
+    The real visitor IP, trusting X-Forwarded-For when present. Render
+    (like most PaaS reverse proxies) terminates TLS and forwards every
+    request through its own edge proxy, so request.client.host (what
+    slowapi's own get_remote_address reads) would otherwise always be
+    that proxy's address -- every visitor sharing one IP, and one
+    visitor's /login attempts able to exhaust everyone else's rate-limit
+    budget. Takes the first address in X-Forwarded-For (the original
+    client -- Render's edge is the only hop appending to it, trusted via
+    uvicorn's own --forwarded-allow-ips=* in production; see render.yaml),
+    falling back to get_remote_address when there's no such header (local
+    dev, or a test not setting it).
+    """
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return get_remote_address(request)
+
+
 def _user_rate_limit_key(request: Request) -> str:
     """
     Rate-limits AI routes per logged-in user instead of per IP, so one
@@ -162,12 +188,19 @@ def _user_rate_limit_key(request: Request) -> str:
         username = verify_token(auth_header[7:])
         if username:
             return f"user:{username}"
-    return get_remote_address(request)
+    return _client_ip(request)
 
 
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=_client_ip)
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    # /docs, /redoc, and the raw schema are a reconnaissance aid for
+    # nobody but this project's own developers -- off in production.
+    docs_url=None if ENV == "production" else "/docs",
+    redoc_url=None if ENV == "production" else "/redoc",
+    openapi_url=None if ENV == "production" else "/openapi.json",
+)
 app.state.limiter = limiter
 
 
@@ -220,6 +253,50 @@ app.add_middleware(
     # -- it silently comes back null and falls back to a generic name.
     expose_headers=["Content-Disposition"],
 )
+
+
+def _validate_production_settings():
+    """
+    ENV=production gets stricter validation than local dev -- fails fast
+    with a clear message at import time (same "refuse to start" pattern
+    auth.py's own SECRET_KEY check already uses) rather than letting a
+    misconfigured production deployment silently run with a weak secret,
+    a local-only database/storage backend, or permissive CORS. Everything
+    checked here already has its own *presence* check elsewhere (SECRET_KEY
+    in auth.py, GEMINI_API_KEY in llm.py) -- this adds the production-only
+    *strength*/*kind* requirements on top of those.
+    """
+    if ENV != "production":
+        return
+
+    secret_key = os.getenv("SECRET_KEY") or ""
+    if len(secret_key) < 32:
+        raise RuntimeError(
+            "ENV=production requires SECRET_KEY to be at least 32 characters long. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+    if database.DATABASE_URL.startswith("sqlite"):
+        raise RuntimeError(
+            "ENV=production requires DATABASE_URL to be a Postgres connection string -- "
+            "SQLite is for local dev only (see README's Database migrations section)."
+        )
+
+    if os.getenv("STORAGE_BACKEND", "local").strip().lower() != "s3":
+        raise RuntimeError(
+            "ENV=production requires STORAGE_BACKEND=s3 -- local disk storage doesn't "
+            "survive a redeploy/restart on a host like Render (see README's File storage section)."
+        )
+
+    if not cors_origins_env or "*" in allow_origins:
+        raise RuntimeError(
+            "ENV=production requires CORS_ORIGINS to be set explicitly to your real "
+            "frontend origin(s) -- leaving it unset (which falls back to the local dev "
+            "ports) or including \"*\" is not allowed."
+        )
+
+
+_validate_production_settings()
 
 # Fix item 6: tightened from the old 3-32 chars incl. dots/hyphens to match
 # the frontend's Zod schema exactly -- login (OAuth2PasswordRequestForm,
@@ -991,15 +1068,31 @@ def read_root():
 # HEALTH CHECK
 # -----------------------------
 @app.get("/health")
-def health_check():
+def health_check(db: Session = Depends(get_db)):
+    # A cheap SELECT 1 on every call (not just the startup flags below) --
+    # catches a database that was reachable at startup but has since gone
+    # away (a dropped connection, a Neon branch's compute suspended again),
+    # which is exactly the kind of thing a load balancer's health check
+    # exists to notice. Never raises: a failed query just reports itself
+    # as unreachable rather than 500ing the health check.
+    database_reachable = False
+    try:
+        db.execute(text("SELECT 1"))
+        database_reachable = True
+    except Exception:
+        logger.exception("Health check: database SELECT 1 failed")
 
-    ready = app_state["models_ready"] and app_state["database_ready"]
+    ready = app_state["models_ready"] and app_state["database_ready"] and database_reachable
 
     return {
         "status": "Server is healthy" if ready else "Server is starting up",
         "models_ready": app_state["models_ready"],
         "database_ready": app_state["database_ready"],
-        "llm": llm.provider_status()
+        "database_reachable": database_reachable,
+        # Which backend/provider, never a key or connection string.
+        "storage_backend": os.getenv("STORAGE_BACKEND", "local").strip().lower(),
+        "llm": llm.provider_status(),
+        "embedding_provider": embeddings._provider(),
     }
 
 

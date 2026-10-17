@@ -21,16 +21,69 @@ _MAX_LONGEST_SIDE_PX = 2000
 _AUTOCONTRAST_CUTOFF = 1
 
 
-def render_pdf_page_to_png(pdf_path: str, page_index: int, dpi: int = OCR_RENDER_DPI) -> bytes:
-    """Renders one page (0-indexed) of a PDF file to PNG bytes at ~dpi."""
-    pdf = pdfium.PdfDocument(pdf_path)
+def open_pdf(pdf_path_or_bytes):
+    """
+    Opens a PDF once for rendering multiple pages from it (see render_page
+    below) -- a scanned PDF with many low-text pages used to call
+    pdfium.PdfDocument(...) (and so re-parse the whole file) once per page;
+    opening it once up front and reusing the same handle removes that
+    per-page reparse, which matters for peak memory on a large file
+    (Phase 7C item 6). Caller is responsible for calling .close() on the
+    returned document once done with every page.
+    """
+    return pdfium.PdfDocument(pdf_path_or_bytes)
+
+
+def _dpi_for_page(page, requested_dpi: int) -> int:
+    """
+    Caps the render DPI so an unusually large page (a huge physical page
+    size, or a PDF already created at a very high DPI) never renders to a
+    bitmap bigger than _MAX_LONGEST_SIDE_PX on its longest side -- the same
+    cap prepare_image_for_ocr already applies after the fact, applied
+    before the render instead so the oversized intermediate bitmap is
+    never allocated in the first place (Phase 7C item 6).
+    """
+    width_pt, height_pt = page.get_size()
+    longest_pt = max(width_pt, height_pt)
+    longest_px_at_requested = longest_pt / _PDFIUM_NATIVE_DPI * requested_dpi
+    if longest_px_at_requested <= _MAX_LONGEST_SIDE_PX:
+        return requested_dpi
+    return max(1, round(requested_dpi * _MAX_LONGEST_SIDE_PX / longest_px_at_requested))
+
+
+def render_page(pdf, page_index: int, dpi: int = OCR_RENDER_DPI) -> bytes:
+    """Renders one page (0-indexed) of an already-open PDF (see open_pdf) to PNG bytes at ~dpi (capped for a very large page -- see _dpi_for_page)."""
+    page = pdf[page_index]
     try:
-        page = pdf[page_index]
-        bitmap = page.render(scale=dpi / _PDFIUM_NATIVE_DPI)
-        pil_image = bitmap.to_pil()
-        buffer = io.BytesIO()
-        pil_image.save(buffer, format="PNG")
-        return buffer.getvalue()
+        effective_dpi = _dpi_for_page(page, dpi)
+        bitmap = page.render(scale=effective_dpi / _PDFIUM_NATIVE_DPI)
+        try:
+            pil_image = bitmap.to_pil()
+            try:
+                buffer = io.BytesIO()
+                pil_image.save(buffer, format="PNG")
+                return buffer.getvalue()
+            finally:
+                pil_image.close()
+        finally:
+            bitmap.close()
+    finally:
+        page.close()
+
+
+def render_pdf_page_to_png(pdf_path_or_bytes, page_index: int, dpi: int = OCR_RENDER_DPI) -> bytes:
+    """
+    Renders one page (0-indexed) of a PDF to PNG bytes at ~dpi -- a single-
+    page convenience wrapper around open_pdf()/render_page() for a caller
+    that only ever needs one page from a given PDF (e.g. main.py's old-
+    paper-import flow). Processing every page of the same PDF in a loop
+    should call open_pdf() once and render_page() per page instead, so the
+    file isn't re-opened (and re-parsed) once per page -- see jobs.py's
+    _extract_pdf_as_pages.
+    """
+    pdf = open_pdf(pdf_path_or_bytes)
+    try:
+        return render_page(pdf, page_index, dpi=dpi)
     finally:
         pdf.close()
 

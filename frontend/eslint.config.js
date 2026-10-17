@@ -18,4 +18,14 @@ export default defineConfig([
       parserOptions: { ecmaFeatures: { jsx: true } },
     },
   },
+  {
+    // Build-time config files run under Node, not the browser (vite.config.js
+    // reads process.cwd() to resolve env vars for Phase 7C item 9's
+    // VITE_API_URL check) -- give these their own Node globals instead of
+    // the browser ones above.
+    files: ['vite.config.js', 'eslint.config.js'],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
 ])

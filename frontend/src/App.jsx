@@ -4,6 +4,7 @@ import { AuthProvider } from './hooks/AuthProvider';
 import ProtectedRoute from './components/ProtectedRoute';
 import PageLayout from './components/PageLayout';
 import ErrorBoundary from './components/ErrorBoundary';
+import ColdStartBanner from './components/ColdStartBanner';
 
 // Pages
 import Login from './pages/Login';
@@ -41,6 +42,7 @@ export default function App() {
 
   return (
     <ErrorBoundary>
+      <ColdStartBanner />
       <AuthProvider>
         <BrowserRouter>
           <Routes>

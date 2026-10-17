@@ -1,0 +1,85 @@
+# Render Blueprint (https://render.com/docs/blueprint-spec) -- defines both
+# services so "New +  ->  Blueprint" on Render can create them from this repo
+# in one step. See DEPLOY.md for the full click-by-click walkthrough,
+# including what to fill in for every `sync: false` secret below.
+#
+# Field names verified against Render's current Blueprint spec at the time
+# this was written (`runtime` is the current field; its predecessor `env` is
+# deprecated). If Render has changed the spec since, re-check
+# https://render.com/docs/blueprint-spec before trusting this file as-is.
+
+services:
+  # --- Backend: FastAPI, as a web service ---
+  - type: web
+    name: ai-teacher-assistant-backend
+    runtime: python
+    region: singapore
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    # Applies any pending Alembic migrations before the new code starts
+    # serving traffic (never create_all -- see README's "ENV=production"
+    # section), then starts uvicorn with the proxy flags real client-IP
+    # rate limiting needs behind Render's edge proxy (see README's "Behind
+    # a reverse proxy" section and main._client_ip). Trusting
+    # --forwarded-allow-ips="*" is safe here specifically because Render's
+    # own edge is the only proxy in front of this service.
+    startCommand: >-
+      alembic upgrade head &&
+      uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
+    healthCheckPath: /health
+    envVars:
+      - key: ENV
+        value: production
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: MAX_UPLOAD_MB
+        value: "50"
+      - key: JOB_WORKERS
+        value: "1"
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: EMBEDDING_PROVIDER
+        value: gemini
+      # Secrets and deployment-specific values -- Render prompts for each of
+      # these when the Blueprint is first created and never stores a default
+      # for them in this file. See DEPLOY.md for exactly where each one
+      # comes from (Neon, Supabase, Gemini, the frontend's own URL).
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+
+  # --- Frontend: static build, served from Render's CDN ---
+  - type: web
+    name: ai-teacher-assistant-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    # Client-side routing (react-router): serve index.html for any path that
+    # isn't a real built file, so a deep link / page refresh doesn't 404.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      # Baked into the build at build time, not read at runtime -- must be
+      # the backend service's own public URL (see DEPLOY.md). Render
+      # prompts for it when the Blueprint is first created.
+      - key: VITE_API_URL
+        sync: false

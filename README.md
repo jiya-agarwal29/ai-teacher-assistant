@@ -91,7 +91,7 @@ Create `backend/.env` — see `backend/.env.example` for the full list with desc
 | `MAX_UPLOAD_MB` | `100` | Maximum accepted size for the single-document `file` upload (phone scans of a multi-page PDF can run large). Per-image uploads (`files`) are separately capped at 15 MB each, regardless of this setting. **Set to `50` in production if `STORAGE_BACKEND=s3` on Supabase's free tier** — its Storage plan caps individual files at 50 MB; see [File storage](#file-storage). |
 | `LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`). |
 | `DATABASE_URL` | an absolute `sqlite:///.../backend/teacher_ai.db` path next to `database.py` | SQLAlchemy database URL. Accepts a Postgres URL too (`postgres://` or `postgresql://`, as most hosts — Neon, Render, Heroku — hand out); both are normalized to the `postgresql+psycopg://` driver URL automatically. See [Database migrations](#database-migrations). |
-| `ENV` | `development` | Set to `production` to skip the dev-only `create_all()` on startup — production schema changes go through Alembic migrations instead (see [Database migrations](#database-migrations)). Any other value keeps the local-dev convenience of creating missing tables automatically. |
+| `ENV` | `development` | Set to `production` for stricter startup validation and locked-down behavior (no dev-only `create_all()`, `/docs` disabled, etc.) — see [ENV=production](#envproduction). Any other value keeps the local-dev convenience of creating missing tables automatically. |
 | `STORAGE_BACKEND` | `local` | `local` (today's behaviour, under `UPLOAD_DIR`) or `s3` (any S3-compatible bucket, e.g. Supabase Storage) — see [File storage](#file-storage). `s3` fails to start with a clear message if any `S3_*` setting below is missing. |
 | `UPLOAD_DIR` | an absolute `uploads/` folder next to `main.py` | Where uploaded original files are saved (`<UPLOAD_DIR>/<user_id>/<book_id>/original<ext>`) for background processing and retry, when `STORAGE_BACKEND=local`. Ignored when `STORAGE_BACKEND=s3`. |
 | `S3_ENDPOINT_URL`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | unset | Only read when `STORAGE_BACKEND=s3` — see [File storage](#file-storage). |
@@ -419,6 +419,29 @@ Also worth setting for a real deployment: `ACCESS_TOKEN_EXPIRE_MINUTES`, `MAX_UP
 See [Session expiry](#session-expiry) for `/refresh-token`'s own rate limit and the client-side warning/logout timers.
 
 Unexpected server errors (anything not raised deliberately as an `HTTPException`) are caught by a global handler: the client always gets a plain `{"detail": "Internal server error"}` with a `500`, never the exception text or a stack trace; the real exception and stack trace go to the log instead.
+
+### ENV=production
+
+Setting `ENV=production` turns on stricter startup validation and locks down a few things that are convenient for local dev but wrong for a real deployment:
+
+- The app **refuses to start** unless `SECRET_KEY` is at least 32 characters, `DATABASE_URL` is a Postgres connection string (not SQLite), `STORAGE_BACKEND=s3` (not `local`), and `CORS_ORIGINS` is set to your real frontend origin(s) with no `*` wildcard — each failure names exactly which setting to fix.
+- `/docs`, `/redoc`, and `/openapi.json` are disabled (404) — no reason to expose the API schema to the public internet.
+- The app never runs `Base.metadata.create_all()` on startup — schema changes only ever come from `alembic upgrade head` (see [Database migrations](#database-migrations)), so a production database's schema is never silently altered by whatever happens to be in `models.py` on a given deploy.
+- The log level is clamped to at least `INFO` even if `LOG_LEVEL` asks for something more verbose (e.g. `DEBUG`) — logs never include secrets, uploaded document text, or AI prompts/responses at any level.
+
+Deploying on Render specifically (region, Blueprint, exact steps) is covered in [DEPLOY.md](DEPLOY.md).
+
+### Behind a reverse proxy (Render, or any PaaS)
+
+Render's edge terminates TLS and forwards every request through its own proxy, so `request.client.host` would otherwise be Render's edge address for every visitor, not the real client IP — `GET /health`, `POST /login`, and `POST /register`'s rate limiting would then treat every visitor as sharing one IP. The backend's rate-limit key function reads the real client IP from `X-Forwarded-For` instead (`main._client_ip`), and `uvicorn` is started with `--proxy-headers --forwarded-allow-ips="*"` in production (see `render.yaml`) so the rest of the app sees the real client address too. This trusts exactly one hop, which is correct because Render's own edge is the only proxy in front of the app — don't add `--forwarded-allow-ips="*"` behind a proxy you don't control.
+
+### GET /health
+
+Reports `database_reachable` (a live `SELECT 1`, not just "did the app start"), `storage_backend`, and `embedding_provider`/`llm` — never a secret, key, or connection string. Point your host's health check (Render's `healthCheckPath`, see `render.yaml`) at this.
+
+### Pausing (Supabase free tier)
+
+A Supabase project on the free tier auto-pauses after about a week with no activity (Storage and any Postgres use on that project both stop responding). This app does **not** add a cron job or keep-alive ping to prevent that — a deliberately-idle project should be allowed to pause. To un-pause it when you next need it: open the project in the [Supabase dashboard](https://supabase.com/dashboard), where a paused project shows a banner with a **Restore project** (sometimes labelled "Resume") button — click it and wait a minute or two for the project to come back up, then retry whatever request failed. Storage access (and any Postgres query, if you're also using Supabase for the database) will 5xx/time out until it's restored.
 
 ## Known limitations
 

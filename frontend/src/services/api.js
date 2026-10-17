@@ -1,6 +1,13 @@
 import { recordActivity } from '../utils/activity';
+import { trackRequest } from '../utils/coldStart';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+// The localhost fallback only exists for local dev -- gated on import.meta.
+// env.DEV (statically replaced by Vite at build time) so a production
+// build's bundle never contains the literal string at all, not just an
+// unused one (Phase 7C item 9; vite.config.js separately fails the build
+// outright if VITE_API_URL is missing in production, so this fallback
+// should never actually matter there).
+const API_BASE_URL = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : undefined);
 
 /**
  * Exact text main.py returns from /chat, /tools/tutor, /semantic-search,
@@ -128,12 +135,15 @@ async function request(endpoint, options = {}) {
   const url = `${API_BASE_URL}${endpoint}`;
   
   let response;
+  const untrack = trackRequest();
   try {
     response = await fetch(url, { ...options, headers });
   } catch (netError) {
     // True network connection failure (e.g. server down)
     console.error(`Network connection failed on ${endpoint}:`, netError.message);
     throw new Error('Failed to connect to backend server. Please ensure the backend is running.', { cause: netError });
+  } finally {
+    untrack();
   }
 
   // Handle HTTP status errors (401, 400, etc.)
@@ -303,7 +313,10 @@ export const api = {
           }
         };
 
+        const untrack = trackRequest();
+
         xhr.onload = () => {
+          untrack();
           if (xhr.status >= 200 && xhr.status < 300) {
             try {
               const res = JSON.parse(xhr.responseText);
@@ -324,6 +337,7 @@ export const api = {
         };
 
         xhr.onerror = () => {
+          untrack();
           reject(new Error('Network error during file upload.'));
         };
 
@@ -349,10 +363,13 @@ export const api = {
       const token = getToken();
       const headers = token ? { Authorization: `Bearer ${token}` } : {};
       let response;
+      const untrack = trackRequest();
       try {
         response = await fetch(`${API_BASE_URL}/books/${bookId}/file`, { headers });
       } catch (netError) {
         throw new Error('Failed to connect to backend server. Please ensure the backend is running.', { cause: netError });
+      } finally {
+        untrack();
       }
       if (!response.ok) {
         let detail = 'Failed to load the original file';
@@ -388,10 +405,13 @@ export const api = {
         const token = getToken();
         const headers = token ? { Authorization: `Bearer ${token}` } : {};
         let response;
+        const untrack = trackRequest();
         try {
           response = await fetch(`${API_BASE_URL}/books/${bookId}/pages/${pageNumber}/image`, { headers });
         } catch (netError) {
           throw new Error('Failed to connect to backend server. Please ensure the backend is running.', { cause: netError });
+        } finally {
+          untrack();
         }
         if (!response.ok) {
           let detail = 'Failed to load page image';
@@ -752,10 +772,13 @@ export const api = {
       const token = getToken();
       const headers = token ? { Authorization: `Bearer ${token}` } : {};
       let response;
+      const untrack = trackRequest();
       try {
         response = await fetch(`${API_BASE_URL}/papers/${id}/export?kind=${kind}`, { headers });
       } catch (netError) {
         throw new Error('Failed to connect to backend server. Please ensure the backend is running.', { cause: netError });
+      } finally {
+        untrack();
       }
       if (!response.ok) {
         let detail = 'Failed to export this paper.';
