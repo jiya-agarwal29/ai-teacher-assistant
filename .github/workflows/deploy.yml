@@ -55,7 +55,7 @@ jobs:
       # Checks out the exact commit CI just tested, not whatever main
       # happens to be at by the time this workflow_run fires -- the two can
       # differ if another push landed on main in between.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
