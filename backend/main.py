@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -1073,8 +1073,14 @@ class TutorRequest(BaseModel):
 # -----------------------------
 # ROOT ROUTE
 # -----------------------------
-@app.get("/")
-def read_root():
+@app.api_route("/", methods=["GET", "HEAD"])
+def read_root(request: Request):
+    # Render's own probe (and some uptime monitors) send HEAD / -- a plain
+    # @app.get only registers GET, so HEAD got a 405 and was misread as
+    # "down". HEAD never has a body by definition; the content below is
+    # only ever sent for a real GET.
+    if request.method == "HEAD":
+        return Response(status_code=200)
 
     return {
         "message": "AI Teacher Assistant Backend Running"
@@ -1084,8 +1090,8 @@ def read_root():
 # -----------------------------
 # PING (uptime monitor)
 # -----------------------------
-@app.get("/ping")
-def ping():
+@app.api_route("/ping", methods=["GET", "HEAD"])
+def ping(request: Request):
     """
     For an external uptime monitor -- deliberately makes no database or
     storage call, so pinging it on a schedule never keeps a paused-when-
@@ -1093,7 +1099,13 @@ def ping():
     on a schedule would. Not rate-limited (see /health, same reasoning).
     Use /health instead when you actually need to know the database/
     storage/AI-provider state.
+
+    Answers HEAD as well as GET -- UptimeRobot's free monitor (and
+    others) default to HEAD, which a plain @app.get route doesn't accept
+    (405), misreading a perfectly healthy backend as down.
     """
+    if request.method == "HEAD":
+        return Response(status_code=200)
     return {"ok": True}
 
 

@@ -228,6 +228,31 @@ def test_login_rate_limit_is_separate_per_forwarded_ip(client):
     assert res.status_code == 200, res.text
 
 
+def test_ping_head_returns_200_with_no_body(client):
+    """
+    UptimeRobot's free monitor (and Render's own probe on GET /) defaults to
+    HEAD, not GET -- a plain @app.get route only registers GET, so HEAD got
+    a 405 and a healthy backend was misread as down. HEAD never has a body
+    by definition.
+    """
+    res = client.head("/ping")
+    assert res.status_code == 200, res.text
+    assert res.content == b""
+
+
+def test_ping_get_returns_ok_true(client):
+    res = client.get("/ping")
+    assert res.status_code == 200
+    assert res.json() == {"ok": True}
+
+
+def test_root_head_returns_200_with_no_body(client):
+    """Same HEAD-vs-GET gap as /ping above, for the root route Render's own probe hits."""
+    res = client.head("/")
+    assert res.status_code == 200, res.text
+    assert res.content == b""
+
+
 # --- Fix item 6: Zod (frontend) + matching backend password/username rules ---
 def test_register_rejects_weak_passwords(client):
     # /register is rate-limited 10/minute per IP across the whole session's
