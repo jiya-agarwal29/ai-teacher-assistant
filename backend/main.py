@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
@@ -45,6 +46,7 @@ from retrieval import retrieve, invalidate_cache, user_has_documents, user_has_a
 
 import database
 from database import ENV, get_db
+from env_utils import get_env
 from models import (
     Base, Book, DocumentPage, Page, Question, Paper, PaperQuestion, User,
     ActivityEvent, QuizAttempt, QuizAnswer, Conversation, ChatMessage
@@ -59,7 +61,7 @@ from auth import (
     ACCESS_TOKEN_EXPIRE_MINUTES
 )
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = (get_env("LOG_LEVEL", "INFO") or "INFO").upper()
 _log_level_value = getattr(logging, LOG_LEVEL, logging.INFO)
 if ENV == "production" and _log_level_value < logging.INFO:
     # Production never logs below INFO, regardless of what LOG_LEVEL was
@@ -233,12 +235,18 @@ DEFAULT_CORS_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000"
 ]
-cors_origins_env = os.getenv("CORS_ORIGINS")
+cors_origins_env = get_env("CORS_ORIGINS")
 allow_origins = (
     [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
     if cors_origins_env
     else DEFAULT_CORS_ORIGINS
 )
+
+
+def _is_valid_production_cors_origin(value: str) -> bool:
+    """An https origin with no path and no trailing slash -- "https://app.example.com", not "https://app.example.com/" or ".../some/path"."""
+    parsed = urlparse(value)
+    return parsed.scheme == "https" and bool(parsed.netloc) and parsed.path == ""
 
 app.add_middleware(
     CORSMiddleware,
@@ -269,20 +277,20 @@ def _validate_production_settings():
     if ENV != "production":
         return
 
-    secret_key = os.getenv("SECRET_KEY") or ""
+    secret_key = get_env("SECRET_KEY") or ""
     if len(secret_key) < 32:
         raise RuntimeError(
             "ENV=production requires SECRET_KEY to be at least 32 characters long. "
             "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
         )
 
-    if database.DATABASE_URL.startswith("sqlite"):
-        raise RuntimeError(
-            "ENV=production requires DATABASE_URL to be a Postgres connection string -- "
-            "SQLite is for local dev only (see README's Database migrations section)."
-        )
+    # DATABASE_URL's own production-only format check lives in database.py
+    # instead, not here -- `import database` (via `import jobs` above)
+    # already calls create_engine() on it long before this function ever
+    # runs, so checking it here would be too late to beat SQLAlchemy's own
+    # far more cryptic parse error. See database.py.
 
-    if os.getenv("STORAGE_BACKEND", "local").strip().lower() != "s3":
+    if (get_env("STORAGE_BACKEND", "local") or "local").lower() != "s3":
         raise RuntimeError(
             "ENV=production requires STORAGE_BACKEND=s3 -- local disk storage doesn't "
             "survive a redeploy/restart on a host like Render (see README's File storage section)."
@@ -293,6 +301,15 @@ def _validate_production_settings():
             "ENV=production requires CORS_ORIGINS to be set explicitly to your real "
             "frontend origin(s) -- leaving it unset (which falls back to the local dev "
             "ports) or including \"*\" is not allowed."
+        )
+
+    bad_origins = [origin for origin in allow_origins if not _is_valid_production_cors_origin(origin)]
+    if bad_origins:
+        raise RuntimeError(
+            "ENV=production requires every CORS_ORIGINS entry to be an https origin "
+            "with no path and no trailing slash, e.g. https://app.example.com -- "
+            f"found {len(bad_origins)} entry/entries that aren't (never printed here; "
+            "double-check for a stray \"/\" at the end, a path, or a non-https scheme)."
         )
 
 
@@ -306,7 +323,7 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,30}$")
 PASSWORD_SPECIAL_CHAR_PATTERN = re.compile(r"[^A-Za-z0-9]")
 
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".pptx", ".doc", ".ppt", ".txt", ".md"}
-MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "100"))
+MAX_UPLOAD_MB = float(get_env("MAX_UPLOAD_MB", "100"))
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
 
 # Scanned/photographed pages (jobs.py OCRs these with Gemini vision -- see
@@ -352,7 +369,7 @@ def _find_original_sources(user_id: int, book_id: int):
     return None
 
 
-MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "50"))
+MAX_OCR_PAGES = int(get_env("MAX_OCR_PAGES", "50"))
 
 MAX_SUMMARIZE_CHARS = 20000
 
@@ -1065,6 +1082,22 @@ def read_root():
 
 
 # -----------------------------
+# PING (uptime monitor)
+# -----------------------------
+@app.get("/ping")
+def ping():
+    """
+    For an external uptime monitor -- deliberately makes no database or
+    storage call, so pinging it on a schedule never keeps a paused-when-
+    idle Neon branch (or Supabase project) awake the way hitting /health
+    on a schedule would. Not rate-limited (see /health, same reasoning).
+    Use /health instead when you actually need to know the database/
+    storage/AI-provider state.
+    """
+    return {"ok": True}
+
+
+# -----------------------------
 # HEALTH CHECK
 # -----------------------------
 @app.get("/health")
@@ -1090,7 +1123,7 @@ def health_check(db: Session = Depends(get_db)):
         "database_ready": app_state["database_ready"],
         "database_reachable": database_reachable,
         # Which backend/provider, never a key or connection string.
-        "storage_backend": os.getenv("STORAGE_BACKEND", "local").strip().lower(),
+        "storage_backend": (get_env("STORAGE_BACKEND", "local") or "local").lower(),
         "llm": llm.provider_status(),
         "embedding_provider": embeddings._provider(),
     }
@@ -3786,7 +3819,7 @@ def generate_paper_route(
     return {"paper_id": paper_row.id, "status": paper_row.status}
 
 
-PAPER_JOB_MAX_WAIT_SECONDS = float(os.getenv("PAPER_JOB_MAX_WAIT_SECONDS", "1800"))
+PAPER_JOB_MAX_WAIT_SECONDS = float(get_env("PAPER_JOB_MAX_WAIT_SECONDS", "1800"))
 _PAPER_BUSY_BASE_WAIT_SECONDS = 60.0
 _PAPER_BUSY_MAX_WAIT_SECONDS = 300.0
 

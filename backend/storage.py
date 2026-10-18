@@ -25,6 +25,9 @@ import logging
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlparse
+
+from env_utils import get_env
 
 logger = logging.getLogger(__name__)
 
@@ -204,28 +207,43 @@ def default_local_root() -> Path:
     was always saved under -- exposed so main.py's legacy-path containment
     check (see _resolve_page_image_key) doesn't have to duplicate this.
     """
-    return Path(os.getenv("UPLOAD_DIR") or (Path(__file__).resolve().parent / "uploads"))
+    return Path(get_env("UPLOAD_DIR") or (Path(__file__).resolve().parent / "uploads"))
+
+
+def _is_valid_https_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme == "https" and bool(parsed.netloc)
 
 
 def get_storage():
-    backend = os.getenv("STORAGE_BACKEND", "local").strip().lower()
+    backend = (get_env("STORAGE_BACKEND", "local") or "local").lower()
 
     if backend == "local":
         return LocalStorage(default_local_root())
 
     if backend == "s3":
         settings = {
-            "endpoint_url": os.getenv("S3_ENDPOINT_URL"),
-            "region": os.getenv("S3_REGION"),
-            "bucket": os.getenv("S3_BUCKET"),
-            "access_key_id": os.getenv("S3_ACCESS_KEY_ID"),
-            "secret_access_key": os.getenv("S3_SECRET_ACCESS_KEY"),
+            "endpoint_url": get_env("S3_ENDPOINT_URL"),
+            "region": get_env("S3_REGION"),
+            "bucket": get_env("S3_BUCKET"),
+            "access_key_id": get_env("S3_ACCESS_KEY_ID"),
+            "secret_access_key": get_env("S3_SECRET_ACCESS_KEY"),
         }
         missing = [f"S3_{name.upper()}" for name, value in settings.items() if not value]
         if missing:
             raise StorageNotConfiguredError(
                 f"STORAGE_BACKEND=s3 but missing required setting(s): {', '.join(missing)}. "
                 "Set them in backend/.env -- see .env.example."
+            )
+        # Never include the value itself -- a malformed endpoint here is
+        # almost always a hidden space/newline (get_env above already
+        # strips those) or a copy-paste that dropped the "https://" --
+        # either way, printing the broken value back wouldn't help and
+        # this is exactly the kind of setting worth keeping out of logs.
+        if not _is_valid_https_url(settings["endpoint_url"]):
+            raise StorageNotConfiguredError(
+                "S3_ENDPOINT_URL looks malformed -- expected a full https:// URL, "
+                "e.g. https://<project-ref>.supabase.co/storage/v1/s3"
             )
         return S3Storage(**settings)
 

@@ -2,9 +2,30 @@
 
 [![CI](https://github.com/jiya-agarwal29/ai-teacher-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/jiya-agarwal29/ai-teacher-assistant/actions/workflows/ci.yml)
 
+**Live app:** [ai-teacher-assistant-frontend-0ivk.onrender.com](https://ai-teacher-assistant-frontend-0ivk.onrender.com) — free plan: the server sleeps after ~15 min idle, so the first load after a quiet period can take up to a minute (you'll see a "Waking up the server…" banner while it does).
+
 A RAG-based teaching assistant. Upload your own course material (PDF, Word, PowerPoint) and get grounded AI chat answers, semantic search, and auto-generated quizzes — all sourced from what you actually uploaded, not the open internet.
 
 Gemini (`GEMINI_API_KEY`, free tier) is the main AI provider for both answer generation and embeddings. Voyage AI is available as an optional alternative embedding provider, and everything can also run fully offline via local models (`flan-t5-small` for generation, `all-MiniLM-L6-v2` for embeddings) with no API key at all. See [AI providers](#ai-providers) below.
+
+### How it's deployed
+
+The frontend is a Render static site (React/Vite build); the backend is a Render web service running a Docker image (see `backend/Dockerfile`), backed by Neon Postgres and Supabase Storage (an S3-compatible bucket) for uploaded documents/page images; Gemini is the AI provider for both answers and embeddings. GitHub Actions handles CI/CD: every push runs the test suite, lint, and a build check, and a push to `main` that passes deploys both services on Render automatically. See [DEPLOY.md](DEPLOY.md) for the full step-by-step setup.
+
+```
+ Browser
+    │
+    ▼
+ Render static site (frontend)  ──fetch──▶  Render web service (backend, Docker)
+                                                   │        │
+                                                   ▼        ▼
+                                          Neon Postgres   Supabase Storage (S3 API)
+                                                   │
+                                                   ▼
+                                            Gemini API (chat + embeddings)
+
+ GitHub push → GitHub Actions CI (tests/lint/build) → CD → both Render services redeploy
+```
 
 ## Features
 

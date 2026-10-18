@@ -35,24 +35,25 @@ import llm
 import ocr
 import storage
 from document_parsers import chunk_parsed_document
+from env_utils import get_env
 from models import Book, DocumentPage, Page
 from retrieval import invalidate_cache
 
 logger = logging.getLogger(__name__)
 
-JOB_WORKERS = int(os.getenv("JOB_WORKERS", "2"))
+JOB_WORKERS = int(get_env("JOB_WORKERS", "2"))
 # Background jobs have no user waiting on a response, so they get a much
 # longer Gemini rate-limit wait budget than the interactive upload path
 # used to have -- a large upload just takes longer instead of failing.
-EMBED_JOB_MAX_WAIT_SECONDS = float(os.getenv("EMBED_JOB_MAX_WAIT_SECONDS", "1800"))
+EMBED_JOB_MAX_WAIT_SECONDS = float(get_env("EMBED_JOB_MAX_WAIT_SECONDS", "1800"))
 
 # A pdfplumber page with fewer than this many real (post-cleanup) characters
 # is treated as having no usable text layer and gets OCR'd instead.
-OCR_MIN_CHARS = int(os.getenv("OCR_MIN_CHARS", "40"))
+OCR_MIN_CHARS = int(get_env("OCR_MIN_CHARS", "40"))
 # Caps both how many low-text PDF pages one document may send to OCR, and
 # how many images a multi-image upload may contain -- OCR is a per-page
 # Gemini vision call, so this bounds cost/time on one document.
-MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "50"))
+MAX_OCR_PAGES = int(get_env("MAX_OCR_PAGES", "50"))
 
 NO_READABLE_TEXT_ERROR = (
     "No readable text found. This looks like a scanned document — OCR support is coming soon."
@@ -65,7 +66,7 @@ _executor = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix="doc-
 
 # Tests monkeypatch this to True so uploads finish (ready/failed/needs_review)
 # before the request assertion runs, instead of racing a real background thread.
-JOBS_SYNC = os.getenv("JOBS_SYNC", "false").strip().lower() == "true"
+JOBS_SYNC = (get_env("JOBS_SYNC", "false") or "false").lower() == "true"
 
 
 def submit_processing_job(book_id: int, kind: str, storage_keys: list, filename: str, review_ocr: bool = True):

@@ -16,8 +16,9 @@ building a second one.
 """
 import json
 import logging
-import os
 import time
+
+from env_utils import get_env
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,11 @@ class LLMUnavailableError(Exception):
 
 
 def _provider() -> str:
-    return os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+    return (get_env("LLM_PROVIDER", "gemini") or "gemini").lower()
 
 
 def _gemini_model() -> str:
-    return os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+    return get_env("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 def _get_gemini_client():
@@ -51,7 +52,7 @@ def _get_gemini_client():
     if _gemini_client is not None:
         return _gemini_client
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = get_env("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError(
             "GEMINI_API_KEY is not set, but it's required for Gemini-based "
@@ -357,7 +358,7 @@ def provider_status() -> dict:
     return {
         "provider": "gemini",
         "model": _gemini_model(),
-        "configured": bool(os.getenv("GEMINI_API_KEY")),
+        "configured": bool(get_env("GEMINI_API_KEY")),
         "ready": _gemini_client is not None,
     }
 

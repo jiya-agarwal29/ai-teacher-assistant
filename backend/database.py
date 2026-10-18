@@ -1,14 +1,15 @@
-import os
 from pathlib import Path
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
+from env_utils import get_env
+
 # "production" skips the dev-only create_all() in main.py's lifespan --
 # schema changes in production go through Alembic migrations instead (see
 # backend/alembic/). Any other value (default: "development") keeps the
 # old create-on-startup convenience for a local SQLite dev database.
-ENV = os.getenv("ENV", "development")
+ENV = get_env("ENV", "development")
 
 # Absolute path next to this file, not a "./"-relative one -- a relative
 # path resolves against the process's current working directory, which
@@ -33,7 +34,26 @@ def normalize_database_url(url: str) -> str:
     return url
 
 
-DATABASE_URL = normalize_database_url(os.getenv("DATABASE_URL") or f"sqlite:///{_DEFAULT_DB_PATH}")
+# The raw, un-defaulted setting -- exposed separately from DATABASE_URL
+# below so main.py's production validation can tell "nothing set" / "a
+# non-Postgres URL" apart from an actually-valid one, instead of only ever
+# seeing the already-defaulted-to-sqlite value.
+RAW_DATABASE_URL_SETTING = get_env("DATABASE_URL")
+
+# Checked here, before create_engine() ever sees the value (not only in
+# main.py's own _validate_production_settings(), which runs too late --
+# `import main` reaches `import jobs` -> `import database` -> the
+# `engine = make_engine(...)` line below long before it gets to its own
+# validation). Without this, a malformed production DATABASE_URL (e.g.
+# missing "://") fails here first with SQLAlchemy's own cryptic "Could not
+# parse SQLAlchemy URL from given URL string" instead of a clear message
+# (see DEPLOY.md's troubleshooting section -- this *is* that bug).
+if ENV == "production" and not (RAW_DATABASE_URL_SETTING or "").startswith(("postgres://", "postgresql://")):
+    raise RuntimeError(
+        "DATABASE_URL looks malformed — expected postgresql://user:pass@host/db"
+    )
+
+DATABASE_URL = normalize_database_url(RAW_DATABASE_URL_SETTING or f"sqlite:///{_DEFAULT_DB_PATH}")
 
 
 def make_engine(url: str):

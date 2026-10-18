@@ -174,6 +174,21 @@ If any of this fails, see [Reading the logs](#reading-the-logs) below before
 assuming something is broken — a Gemini free-tier rate limit or a sleeping
 backend both look like failures at first glance but aren't actual bugs.
 
+**To repeat this check without doing it by hand every time**, run
+`backend/scripts/smoke_test.py` against the deployed backend instead — it
+walks the same login → upload → chat → quiz → analytics → cleanup path and
+prints PASS/FAIL with timing for each step:
+
+```
+cd backend
+SMOKE_PASSWORD=<a password for the smoke_test_bot account> python scripts/smoke_test.py --api https://your-backend.onrender.com
+```
+
+It uses one fixed account (`smoke_test_bot`, registering it automatically
+the first time) instead of creating a new throwaway user on every run, and
+always deletes the test document it uploads, even if an earlier step
+failed. Never prints the password or any token.
+
 ---
 
 ## 7. Set up CI/CD (so pushes to main deploy automatically)
@@ -207,6 +222,64 @@ The backend's image is also optionally pushed to GitHub Container Registry
 Render — not required for Render itself to work, but useful if you ever want
 to run that exact image somewhere else (e.g. a future move to AWS, per this
 phase's own goal of keeping the backend container-portable).
+
+---
+
+## Set up an uptime monitor
+
+`GET /ping` (no database or storage call — see README) is built for this:
+point any free uptime monitor (UptimeRobot, Better Stack, Cronitor, etc.) at
+`https://your-backend.onrender.com/ping` on whatever interval you like.
+**Deliberately don't point one at `/health` instead** — `/health` runs a
+real database query, so pinging it on a schedule would keep a paused-when-
+idle Neon branch (or Supabase project) awake, defeating the point of the
+free tier's sleep/pause behavior. A monitor on `/ping` also won't keep the
+*backend itself* awake against your wishes — Render still sleeps it after
+~15 minutes idle regardless of how often `/ping` answers while it's up,
+since `/ping` only ever responds when the service is already awake to
+receive the request.
+
+---
+
+## Troubleshooting from our first deploy
+
+Problems actually hit while setting this up the first time, and what they meant:
+
+- **"Could not parse SQLAlchemy URL from given URL string"** — `DATABASE_URL`
+  is malformed, almost always a missing `://` (e.g. a stray character typed
+  while pasting it into Render's dashboard). It should look exactly like
+  `postgresql://user:password@host/dbname` (Neon's pooled connection string,
+  from [step 1](#1-create-the-database-neon)). Phase 7D added a clear
+  "DATABASE_URL looks malformed" error for this specific case — if you see
+  the raw SQLAlchemy error instead, you're running an older build.
+- **"Invalid endpoint" / "S3_ENDPOINT_URL looks malformed"** — almost always
+  a hidden space or trailing newline picked up when copy-pasting
+  `S3_ENDPOINT_URL` into Render's dashboard. The backend strips whitespace
+  from every setting automatically (see `backend/env_utils.py`), but it has
+  to actually be a valid `https://...` URL underneath that — double-check
+  against Supabase's **Project Settings → Storage → S3 Connection** page.
+- **The frontend loads but every request fails, or CORS errors in the
+  browser console** — Render appends random letters to a service's default
+  URL (e.g. `ai-teacher-assistant-backend-g5li.onrender.com`, not the plain
+  name you typed) — this trips people up constantly. Go back to
+  [step 5](#5-connect-the-two-services-to-each-other) and make sure
+  `CORS_ORIGINS` (on the backend) and `VITE_API_URL` (on the frontend) are
+  both set to the **real, full URLs Render actually assigned**, not what
+  you expected them to be — and remember `VITE_API_URL` needs an actual
+  **rebuild** of the frontend to take effect, not just a saved env var.
+- **A setting that works locally does nothing on Render** — your local
+  `backend/.env` is never read on Render; only env vars actually set in
+  Render's dashboard exist there. A setting like `GEMINI_MODEL` that you
+  changed locally and forgot to also set on Render just silently falls back
+  to its default. Check Render's **Environment** tab for the service, not
+  your local `.env` file, when something behaves differently in production.
+- **Deploys aren't happening on push** — see [Set up CI/CD](#7-set-up-cicd-so-pushes-to-main-deploy-automatically)
+  for adding the two `RENDER_DEPLOY_HOOK_*` secrets; until both are set,
+  `deploy.yml` runs but skips the actual deploy step with a log message
+  saying so (not a failure).
+- **Want a quick end-to-end check without clicking through the whole app**
+  — run `backend/scripts/smoke_test.py` (see [step 6](#6-first-login-smoke-test)
+  above).
 
 ---
 

@@ -1,4 +1,3 @@
-import os
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone
@@ -8,15 +7,16 @@ from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
 from database import get_db
+from env_utils import get_env
 from models import User
 
 load_dotenv()
 
-SECRET_KEY = os.getenv("SECRET_KEY")
+SECRET_KEY = get_env("SECRET_KEY")
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY is not set. Add it to backend/.env")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(get_env("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
 # CHANGE bcrypt -> pbkdf2_sha256
 pwd_context = CryptContext(

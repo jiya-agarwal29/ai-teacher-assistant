@@ -19,10 +19,11 @@ models.Page.embedding_model); retrieval.py only ever loads and scores pages
 whose stored embedding_model matches active_model_name().
 """
 import logging
-import os
 import time
 
 import numpy as np
+
+from env_utils import get_env
 
 logger = logging.getLogger(__name__)
 
@@ -65,41 +66,41 @@ class EmbeddingServiceBusyError(Exception):
 
 
 def _provider() -> str:
-    return os.getenv("EMBEDDING_PROVIDER", "gemini").strip().lower()
+    return (get_env("EMBEDDING_PROVIDER", "gemini") or "gemini").lower()
 
 
 def _voyage_model() -> str:
-    return os.getenv("VOYAGE_MODEL", _VOYAGE_DEFAULT_MODEL).strip()
+    return get_env("VOYAGE_MODEL", _VOYAGE_DEFAULT_MODEL)
 
 
 def _gemini_embed_model() -> str:
-    return os.getenv("GEMINI_EMBED_MODEL", _GEMINI_EMBED_DEFAULT_MODEL).strip()
+    return get_env("GEMINI_EMBED_MODEL", _GEMINI_EMBED_DEFAULT_MODEL)
 
 
 def _gemini_embed_dim() -> int:
     try:
-        return int(os.getenv("GEMINI_EMBED_DIM", str(_GEMINI_EMBED_DEFAULT_DIM)))
+        return int(get_env("GEMINI_EMBED_DIM", str(_GEMINI_EMBED_DEFAULT_DIM)))
     except ValueError:
         return _GEMINI_EMBED_DEFAULT_DIM
 
 
 def _gemini_embed_batch_size() -> int:
     try:
-        return int(os.getenv("GEMINI_EMBED_BATCH_SIZE", str(_GEMINI_EMBED_DEFAULT_BATCH_SIZE)))
+        return int(get_env("GEMINI_EMBED_BATCH_SIZE", str(_GEMINI_EMBED_DEFAULT_BATCH_SIZE)))
     except ValueError:
         return _GEMINI_EMBED_DEFAULT_BATCH_SIZE
 
 
 def _embed_max_wait_seconds() -> float:
     try:
-        return float(os.getenv("EMBED_MAX_WAIT_SECONDS", str(_EMBED_MAX_WAIT_DEFAULT_SECONDS)))
+        return float(get_env("EMBED_MAX_WAIT_SECONDS", str(_EMBED_MAX_WAIT_DEFAULT_SECONDS)))
     except ValueError:
         return _EMBED_MAX_WAIT_DEFAULT_SECONDS
 
 
 def _embed_query_max_wait_seconds() -> float:
     try:
-        return float(os.getenv("EMBED_QUERY_MAX_WAIT_SECONDS", str(_EMBED_QUERY_MAX_WAIT_DEFAULT_SECONDS)))
+        return float(get_env("EMBED_QUERY_MAX_WAIT_SECONDS", str(_EMBED_QUERY_MAX_WAIT_DEFAULT_SECONDS)))
     except ValueError:
         return _EMBED_QUERY_MAX_WAIT_DEFAULT_SECONDS
 
@@ -134,7 +135,7 @@ def _get_voyage_client():
     if _voyage_client is not None:
         return _voyage_client
 
-    api_key = os.getenv("VOYAGE_API_KEY")
+    api_key = get_env("VOYAGE_API_KEY")
     if not api_key:
         raise RuntimeError(
             "EMBEDDING_PROVIDER=voyage but VOYAGE_API_KEY is not set. Set "
