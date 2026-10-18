@@ -5,7 +5,7 @@
 # own cache or any build-only tooling if that ever changes).
 # Base version matches .python-version (kept in sync manually -- there's no
 # way to interpolate a build-arg into a FROM line from a plain file).
-FROM python:3.12.10-slim AS builder
+FROM python:3.14.8-slim AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # --- Final image ---
-FROM python:3.12.10-slim
+FROM python:3.14.8-slim
 
 WORKDIR /app
 
