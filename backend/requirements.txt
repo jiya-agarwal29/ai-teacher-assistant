@@ -1,29 +1,29 @@
-fastapi==0.135.1
-uvicorn[standard]==0.41.0
-python-multipart==0.0.22
-sqlalchemy==2.0.48
-alembic==1.20.0
+fastapi==0.161.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+sqlalchemy==2.1.6
+alembic==1.20.1
 psycopg[binary]==3.3.6
-boto3==1.43.114
+boto3==1.43.118
 passlib==1.7.4
 python-jose==3.5.0
-python-dotenv==1.2.3
+python-dotenv==1.2.4
 slowapi==0.1.10
-google-genai==2.25.0
+google-genai==2.32.0
 voyageai==0.5.0
 
-pdfplumber==0.11.9
+pdfplumber==0.11.10
 python-docx==1.2.0
 python-pptx==1.0.2
 
 # OCR (jobs.py / ocr.py): rendering scanned PDF pages and photos/handwritten
 # notes to images before sending them to Gemini vision for transcription.
 # pypdfium2, not PyMuPDF, specifically to avoid PyMuPDF's AGPL license.
-pypdfium2==5.13.0
+pypdfium2==5.14.0
 Pillow==12.3.0
-pillow-heif==1.8.0
+pillow-heif==1.8.1
 
-numpy==2.4.3
+numpy==2.5.4
 
 # zoneinfo (stdlib) needs this on Windows, which doesn't ship the IANA tz
 # database itself -- Phase 6A's per-user timezone handling (analytics
