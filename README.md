@@ -470,7 +470,11 @@ Reports `database_reachable` (a live `SELECT 1`, not just "did the app start"), 
 
 ### Pausing (Supabase free tier)
 
-A Supabase project on the free tier auto-pauses after about a week with no activity (Storage and any Postgres use on that project both stop responding). This app does **not** add a cron job or keep-alive ping to prevent that — a deliberately-idle project should be allowed to pause. To un-pause it when you next need it: open the project in the [Supabase dashboard](https://supabase.com/dashboard), where a paused project shows a banner with a **Restore project** (sometimes labelled "Resume") button — click it and wait a minute or two for the project to come back up, then retry whatever request failed. Storage access (and any Postgres query, if you're also using Supabase for the database) will 5xx/time out until it's restored.
+A Supabase project on the free tier auto-pauses after about a week with no activity (Storage and any Postgres use on that project both stop responding). For the live deployment linked at the top of this README, that's prevented by a twice-weekly keep-alive (see below) rather than left to happen — but if you deploy your own copy and don't set that up, or the keep-alive itself ever lapses (e.g. its secret gets removed), un-pause it from the [Supabase dashboard](https://supabase.com/dashboard): a paused project shows a banner with a **Restore project** (sometimes labelled "Resume") button — click it and wait a minute or two, then retry whatever request failed. Storage access (and any Postgres query, if you're also using Supabase for the database) will 5xx/time out until it's restored.
+
+### Keep-alive
+
+`.github/workflows/keepalive-smoke.yml` runs `backend/scripts/smoke_test.py` against the live backend every Monday and Thursday (plus on demand, via the Actions tab's "Run workflow" button) — its upload-then-delete of a tiny test document is real Storage activity, which is what keeps the Supabase project above from auto-pausing. It needs a `SMOKE_PASSWORD` repository secret set to the `smoke_test_bot` account's password; a failed run (e.g. that secret missing, or the deployment actually broken) shows up as a red run in the **Actions** tab and emails whoever's watching the repo, same as any other failed scheduled workflow.
 
 ## Known limitations
 

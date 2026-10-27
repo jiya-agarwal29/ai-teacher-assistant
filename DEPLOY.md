@@ -241,6 +241,24 @@ receive the request.
 
 ---
 
+## Keep-alive
+
+Unlike the uptime monitor above, the Supabase **Storage** bucket needs
+actual read/write activity to stay un-paused, not just a ping. `.github/workflows/keepalive-smoke.yml`
+runs `backend/scripts/smoke_test.py` against your live backend every Monday
+and Thursday at 03:30 UTC (and on demand — **Actions** tab → "Keepalive
+Smoke Test" → "Run workflow") — its upload-then-delete of a tiny document
+is real Storage activity, keeping the ~7-day auto-pause from ever
+triggering. Add the `SMOKE_PASSWORD` repository secret (**Settings → Secrets
+and variables → Actions → New repository secret**, set to the
+`smoke_test_bot` account's password — the same one you'd use with
+[step 6](#6-first-login-smoke-test)'s manual smoke test) for it to actually
+run; without it, the job fails with a clear message instead of silently
+skipping, which is deliberate — a missing secret should be visible, not
+quietly ignored.
+
+---
+
 ## Troubleshooting from our first deploy
 
 Problems actually hit while setting this up the first time, and what they meant:

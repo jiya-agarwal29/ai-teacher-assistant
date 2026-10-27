@@ -1,0 +1,38 @@
+name: Keepalive Smoke Test
+
+# Twice a week is enough to count as Storage activity and keep the free
+# Supabase project from auto-pausing (it pauses after ~7 days with none --
+# see README's "Pausing (Supabase free tier)" section), without spending
+# much of the account's free Actions minutes. Times are UTC.
+on:
+  schedule:
+    - cron: "30 3 * * 1"  # Monday 03:30 UTC
+    - cron: "30 3 * * 4"  # Thursday 03:30 UTC
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    name: Smoke test production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          # Matches backend/.python-version -- scripts/smoke_test.py only
+          # uses the standard library (see its own docstring), so there is
+          # nothing to `pip install` here.
+          python-version: "3.12.10"
+
+      # SMOKE_PASSWORD only ever exists as this step's own env var -- never
+      # echoed, never part of a command line. The script itself exits with
+      # a clear message (not a stack trace) if it's unset, so a missing
+      # secret still fails this job with a readable reason rather than a
+      # silent skip or a cryptic 401. A failed run emails the repo's
+      # watchers the same way any other failed scheduled workflow does.
+      - name: Run smoke test against production
+        working-directory: backend
+        env:
+          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
+        run: python scripts/smoke_test.py --api https://ai-teacher-assistant-backend-g5li.onrender.com
