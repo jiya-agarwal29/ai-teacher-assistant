@@ -32,6 +32,19 @@ def test_every_level_has_prompt_rules():
         assert isinstance(level.prompt_rules, str) and level.prompt_rules.strip()
 
 
+# --- Fix round 4, item 3: a true/false question can only confirm or
+# deny a statement (recognition), never genuinely "explain or interpret"
+# -- keeping it at Understand produced near-duplicate true/false pairs
+# with Remember on the same fact, just reworded. ---
+def test_understand_no_longer_allows_true_false():
+    assert "true_false" not in bloom.get_level("understand").question_types
+
+
+def test_understand_prompt_rules_forbid_a_reworded_confirm_or_deny():
+    rules = bloom.get_level("understand").prompt_rules.lower()
+    assert "confirm" in rules or "deny" in rules
+
+
 def test_levels_are_in_canonical_order_one_through_six():
     assert bloom.level_keys() == [
         "remember", "understand", "apply", "analyze", "evaluate", "create"

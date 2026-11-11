@@ -618,6 +618,10 @@ QUIZ_PROMPT_RULES = (
 # A question's Bloom level is chosen when it's written (here, by the prompt
 # below) and only ever checked afterward -- never derived from its "type".
 # See bloom.py's module docstring.
+#
+# Fix round 4, item 4: 'reused_example' rides along in the SAME classifier
+# call/schema (no extra AI call) -- see REUSED_EXAMPLE_RULE and
+# _classify_questions_with_gemini.
 CLASSIFIER_SCHEMA = {
     "type": "object",
     "properties": {
@@ -627,14 +631,37 @@ CLASSIFIER_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer"},
-                    "level": {"type": "string", "enum": bloom.level_keys()}
+                    "level": {"type": "string", "enum": bloom.level_keys()},
+                    "reused_example": {"type": "boolean"}
                 },
-                "required": ["id", "level"]
+                "required": ["id", "level", "reused_example"]
             }
         }
     },
     "required": ["items"]
 }
+
+# Fix round 4, item 4: an Apply/Analyze question is only genuinely testing
+# application if its situation is NEW -- bloom.py's own prompt_rules
+# already tell the WRITER this ("Put the concept into a NEW situation not
+# described in the sources"); this is the matching CHECKER-side rule, so a
+# question that quietly reused the sources' own example anyway (e.g. the
+# sources illustrate inheritance with "Camera, Phone -> SmartPhone" and
+# the question reuses that exact example) gets caught and regenerated,
+# the same way a wrong Bloom level does.
+APPLY_OR_ANALYZE_LEVELS = frozenset({"apply", "analyze"})
+
+REUSED_EXAMPLE_RULE = (
+    "Also set 'reused_example' to true ONLY for a question at Apply or "
+    "Analyze level whose situation/scenario reuses the sources' own "
+    "specific example names, entities, or scenario instead of inventing a "
+    "new one (e.g. the sources illustrate a concept with 'Camera, Phone "
+    "-> SmartPhone' and the question reuses that same example) -- that "
+    "makes it really just recall, not genuine application/analysis. "
+    "Otherwise (every Remember/Understand question, every Evaluate/Create "
+    "question, and any Apply/Analyze question that invents its own new "
+    "situation) set it to false."
+)
 
 
 # Phase 5E: POST /papers/import-pattern's structured-output schema -- reads
@@ -789,44 +816,61 @@ def _classify_questions_with_gemini(question_texts: list, top_pages=None):
     the question text alone -- it is never told which level the question was
     written for, since this is a check on that choice, not a source of it.
     `top_pages` (the same numbered sources the questions were generated
-    from) lets the checker apply CHECKER_DIRECT_ANSWER_RULE; omitted, the
-    rule is simply skipped for that call. Returns a list of levels (or None
-    entries) aligned by position with `question_texts`, or None if the
-    whole response wasn't shaped as expected (treated the same as
+    from) lets the checker apply CHECKER_DIRECT_ANSWER_RULE and (Fix round
+    4, item 4) REUSED_EXAMPLE_RULE -- whether an Apply/Analyze question
+    reused the sources' own example instead of inventing a new situation.
+    Both ride along in this ONE call/schema, never a separate AI call.
+    Omitted entirely, both rules are simply skipped for that call (there's
+    nothing to compare a question's situation against without sources).
+
+    Returns (detected_levels, reused_flags) -- each a list aligned by
+    position with `question_texts` (detected_levels entries may be None;
+    reused_flags entries are always bool). (None, None) if the whole
+    response wasn't shaped as expected (treated the same as
     llm.LLMUnavailableError by the caller: leave the affected questions
     unchecked rather than fail the quiz).
     """
     numbered = "\n".join(f"{i}. {text}" for i, text in enumerate(question_texts, start=1))
     sources_block = ""
+    reused_example_instruction = (
+        "Every item also needs 'reused_example': false -- no sources were "
+        "given to compare a question's situation against."
+    )
     if top_pages:
         numbered_sources = "\n\n".join(
             f"[{idx}] {page.content}" for idx, (_, page) in enumerate(top_pages, start=1)
         )
         sources_block = f"\n\n{CHECKER_DIRECT_ANSWER_RULE}\n\nSources:\n{numbered_sources}"
+        reused_example_instruction = REUSED_EXAMPLE_RULE
     prompt = (
         "Classify each numbered question below into exactly one Bloom's "
         "taxonomy level, based only on what it asks the student to do. "
-        f"The six levels are:\n{_bloom_level_descriptions_block()}"
+        f"The six levels are:\n{_bloom_level_descriptions_block()}\n\n"
+        f"{reused_example_instruction}"
         f"{sources_block}\n\n"
         f"Questions:\n{numbered}"
     )
     result = llm.generate_json(prompt, schema=CLASSIFIER_SCHEMA)
 
     if not isinstance(result, dict):
-        return None
+        return None, None
     raw_items = result.get("items")
     if not isinstance(raw_items, list):
-        return None
+        return None, None
 
     detected_by_position = {}
+    reused_by_position = {}
     for entry in raw_items:
         if not isinstance(entry, dict):
             continue
         position, level = entry.get("id"), entry.get("level")
         if isinstance(position, int) and bloom.is_valid_level(level):
             detected_by_position[position] = level
+            reused_by_position[position] = bool(entry.get("reused_example"))
 
-    return [detected_by_position.get(i) for i in range(1, len(question_texts) + 1)]
+    detected_levels = [detected_by_position.get(i) for i in range(1, len(question_texts) + 1)]
+    reused_flags = [reused_by_position.get(i, False) for i in range(1, len(question_texts) + 1)]
+    return detected_levels, reused_flags
 
 
 def _generate_and_validate_questions(
@@ -876,6 +920,13 @@ def _check_and_fix_bloom_levels(
 
     `marks_by_level`/`paper_kind` (Phase 5B exam papers only): forwarded to
     the regeneration call so replacements still carry marks/marking_scheme.
+
+    Fix round 4, item 4: a question flagged `reused_example` (Apply/Analyze
+    only -- see REUSED_EXAMPLE_RULE) is regenerated through this exact same
+    mismatch-and-replace path as a wrong Bloom level, even when its level
+    itself was correct -- `q["reused_example"]` records which reason(s)
+    applied, but bloom_check/detected_level stay strictly about the level
+    check, unchanged from before.
     """
     for q in questions:
         verb_level = bloom.classify_by_verbs(q["question"])["level"]
@@ -886,25 +937,34 @@ def _check_and_fix_bloom_levels(
             )
 
     try:
-        detected_levels = _classify_questions_with_gemini([q["question"] for q in questions], top_pages)
+        detected_levels, reused_flags = _classify_questions_with_gemini(
+            [q["question"] for q in questions], top_pages
+        )
     except llm.LLMUnavailableError:
-        detected_levels = None
+        detected_levels, reused_flags = None, None
 
     if detected_levels is None:
         for q in questions:
             q["bloom_check"] = "unchecked"
             q["detected_level"] = None
+            q["reused_example"] = False
         return questions
 
     mismatched_indices = []
     for i, q in enumerate(questions):
         detected = detected_levels[i]
+        reused = bool(reused_flags[i]) if reused_flags else False
+        needs_new_scenario = reused and q["bloom_level"] in APPLY_OR_ANALYZE_LEVELS
+        q["reused_example"] = needs_new_scenario
+
         if detected == q["bloom_level"]:
             q["bloom_check"] = "verified"
             q["detected_level"] = None
         else:
             q["bloom_check"] = "flagged"
             q["detected_level"] = detected
+
+        if detected != q["bloom_level"] or needs_new_scenario:
             mismatched_indices.append(i)
 
     if not mismatched_indices:
@@ -938,18 +998,21 @@ def _check_and_fix_bloom_levels(
 
     if replaced_indices:
         try:
-            recheck = _classify_questions_with_gemini(
+            recheck_levels, recheck_reused = _classify_questions_with_gemini(
                 [questions[i]["question"] for i in replaced_indices], top_pages
             )
         except llm.LLMUnavailableError:
-            recheck = None
+            recheck_levels, recheck_reused = None, None
 
         for position, i in enumerate(replaced_indices):
-            if recheck is None:
+            if recheck_levels is None:
                 questions[i]["bloom_check"] = "unchecked"
                 questions[i]["detected_level"] = None
+                questions[i]["reused_example"] = False
                 continue
-            detected = recheck[position]
+            detected = recheck_levels[position]
+            reused = bool(recheck_reused[position]) if recheck_reused else False
+            questions[i]["reused_example"] = reused and questions[i]["bloom_level"] in APPLY_OR_ANALYZE_LEVELS
             if detected == questions[i]["bloom_level"]:
                 questions[i]["bloom_check"] = "verified"
                 questions[i]["detected_level"] = None
@@ -1026,24 +1089,87 @@ def _jaccard_similarity(text_a: str, text_b: str) -> float:
     return len(words_a & words_b) / len(words_a | words_b)
 
 
+# Fix round 4, item 3: once a pair's word overlap suggests they MIGHT be
+# about the same thing (share at least one real, non-generic term -- see
+# _shares_grounding_terms) but weren't already caught by the pure-Jaccard
+# check above, their embeddings are compared too -- catches a pair worded
+# completely differently but testing the exact same fact (e.g. a
+# true/false and an explain-in-your-own-words question both just
+# restating "inheritance models an is-a relationship"). Gated behind the
+# shared-term check so two genuinely unrelated questions (no shared
+# vocabulary at all) never pay for an embedding call or risk a false match.
+NEAR_DUPLICATE_EMBEDDING_THRESHOLD = 0.92
+
+
+def _shares_grounding_terms(text_a: str, text_b: str, min_shared: int = 2) -> bool:
+    """
+    True if `text_a`/`text_b` share at least `min_shared` real, non-generic
+    terms (reusing _grounding_terms' >=4-letter/stopword-filtered
+    definition below) -- the gate for the embedding escalation in
+    _drop_near_duplicates and the Question Bank save-time check (Fix round
+    4, items 3/6). Needs more than just one incidental shared word (e.g.
+    two different "water cycle" questions both mentioning "water") --
+    that alone is normal for several genuinely different questions on one
+    topic, not a sign of duplication; `min_shared` defaults to the same
+    bar _is_grounded already uses (GROUNDING_MIN_SHARED_TERMS) for the
+    same reason. Two texts under that bar never pay for an embedding
+    call, which also means they can never be misjudged a duplicate by one.
+    """
+    return len(_grounding_terms(text_a) & _grounding_terms(text_b)) >= min_shared
+
+
 def _drop_near_duplicates(questions: list, drop_log: list = None) -> list:
     """
     _validate_quiz_questions already drops *exact*-text duplicates; this
-    catches near-identical rewordings it wouldn't, by comparing every pair
-    of questions' word-overlap (Jaccard similarity on normalized text).
-    For any pair at or above NEAR_DUPLICATE_JACCARD_THRESHOLD, drops the
-    LATER one -- the caller's existing top-up mechanism (_top_up_missing_levels)
-    naturally refills whichever level that leaves short.
+    catches near-identical rewordings it wouldn't. Two checks, either one
+    enough to drop the LATER of a pair -- the caller's existing top-up
+    mechanism (_top_up_missing_levels) naturally refills whichever level
+    that leaves short:
+
+      1. Word-overlap (Jaccard similarity on normalized text) at or above
+         NEAR_DUPLICATE_JACCARD_THRESHOLD -- catches near-identical wording.
+      2. Embedding similarity at or above NEAR_DUPLICATE_EMBEDDING_THRESHOLD
+         (Fix round 4, item 3), for a pair that shares at least one real
+         term but didn't already trip check 1 -- catches two completely
+         differently-worded questions that are nonetheless asking the
+         exact same thing. Computed from ONE batch embed call for the
+         whole quiz (never one call per pair), and only made at all if at
+         least one pair actually needs it; a busy embedding service just
+         means that escalation is skipped, same as the Jaccard-only
+         behaviour before this fix existed.
     """
+    texts = [q["question"] for q in questions]
+    n = len(questions)
+
+    jaccard_by_pair = {}
+    candidate_pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            jaccard = _jaccard_similarity(texts[i], texts[j])
+            jaccard_by_pair[(i, j)] = jaccard
+            if jaccard < NEAR_DUPLICATE_JACCARD_THRESHOLD and _shares_grounding_terms(texts[i], texts[j]):
+                candidate_pairs.append((i, j))
+
+    embedding_similarity = {}
+    if candidate_pairs:
+        try:
+            vectors = embeddings.embed_documents(texts)
+            for i, j in candidate_pairs:
+                embedding_similarity[(i, j)] = float(vectors[i] @ vectors[j])
+        except embeddings.EmbeddingServiceBusyError:
+            pass
+
     dropped_indices = set()
-    for i in range(len(questions)):
+    for i in range(n):
         if i in dropped_indices:
             continue
-        for j in range(i + 1, len(questions)):
+        for j in range(i + 1, n):
             if j in dropped_indices:
                 continue
-            similarity = _jaccard_similarity(questions[i]["question"], questions[j]["question"])
-            if similarity >= NEAR_DUPLICATE_JACCARD_THRESHOLD:
+            is_duplicate = jaccard_by_pair[(i, j)] >= NEAR_DUPLICATE_JACCARD_THRESHOLD
+            if not is_duplicate and embedding_similarity.get((i, j), 0.0) >= NEAR_DUPLICATE_EMBEDDING_THRESHOLD:
+                is_duplicate = True
+            if is_duplicate:
                 dropped_indices.add(j)
                 if drop_log is not None:
                     drop_log.append("too similar to another question in this quiz")
@@ -1972,14 +2098,15 @@ def search_content(
     ]
 
 
-def _retrieve_or_503(db: Session, user_id: int, query: str, top_k: int, apply_threshold: bool):
+def _retrieve_or_503(db: Session, user_id: int, query: str, top_k: int, apply_threshold: bool, book_ids=None):
     """
     Wraps retrieve() so a Gemini embed_query() rate limit that's still busy
     after EMBED_QUERY_MAX_WAIT_SECONDS surfaces as a 503 to the client,
-    instead of a generic 500 or an unhandled exception.
+    instead of a generic 500 or an unhandled exception. `book_ids` -- see
+    retrieve()'s own docstring (Fix round 4, item 1).
     """
     try:
-        return retrieve(db, user_id, query, top_k=top_k, apply_threshold=apply_threshold)
+        return retrieve(db, user_id, query, top_k=top_k, apply_threshold=apply_threshold, book_ids=book_ids)
     except embeddings.EmbeddingServiceBusyError:
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
@@ -2964,14 +3091,77 @@ def _resolve_question_source(db: Session, top_pages, source_index):
     return {"book_name": book.name, "page_number": page.page_number}, page.book_id, page.id
 
 
+def _mark_bank_duplicates(db: Session, user_id: int, questions: list) -> dict:
+    """
+    Fix round 4, item 6: compares each of `questions` (about to be saved)
+    against this user's existing Bank questions -- same similarity rule
+    as _drop_near_duplicates (items 3/6 share one check) -- so a
+    near-duplicate is MARKED, not silently skipped (the AI call that
+    wrote it already happened; it's kept and flagged for the teacher to
+    review, via Question.duplicate_of_id) rather than a paper ever
+    picking two versions of the same question.
+
+    Returns {question_text: existing_question_id} for whichever of
+    `questions` turned out to be a near-duplicate of something already in
+    the bank. At most ONE extra embed_documents() call for this whole
+    batch, regardless of how many questions need the escalation.
+    """
+    existing = db.query(Question.id, Question.question).filter(Question.user_id == user_id).all()
+    if not existing:
+        return {}
+
+    duplicate_of = {}
+    embedding_candidates = []  # (new_text, existing_id, existing_text)
+
+    for q in questions:
+        text = q["question"]
+        for existing_id, existing_text in existing:
+            if _jaccard_similarity(text, existing_text) >= NEAR_DUPLICATE_JACCARD_THRESHOLD:
+                duplicate_of[text] = existing_id
+                break
+        if text in duplicate_of:
+            continue
+        for existing_id, existing_text in existing:
+            if _shares_grounding_terms(text, existing_text):
+                embedding_candidates.append((text, existing_id, existing_text))
+
+    if not embedding_candidates:
+        return duplicate_of
+
+    texts_to_embed = []
+    text_index = {}
+    for new_text, _existing_id, existing_text in embedding_candidates:
+        for t in (new_text, existing_text):
+            if t not in text_index:
+                text_index[t] = len(texts_to_embed)
+                texts_to_embed.append(t)
+
+    try:
+        vectors = embeddings.embed_documents(texts_to_embed)
+    except embeddings.EmbeddingServiceBusyError:
+        return duplicate_of
+
+    for new_text, existing_id, existing_text in embedding_candidates:
+        if new_text in duplicate_of:
+            continue
+        similarity = float(vectors[text_index[new_text]] @ vectors[text_index[existing_text]])
+        if similarity >= NEAR_DUPLICATE_EMBEDDING_THRESHOLD:
+            duplicate_of[new_text] = existing_id
+
+    return duplicate_of
+
+
 def _save_generated_questions(db: Session, user_id: int, topic: str, questions: list, top_pages) -> list:
     """
     Persists every question in `questions` as its own Question row and
     returns the API response list for them -- the existing fields plus
-    question_id, bloom_level/bloom_label/bloom_check/detected_level and
-    source. `top_pages` resolves each question's source_index (absent
-    entirely for local hybrid-fallback questions, which get a null source).
+    question_id, bloom_level/bloom_label/bloom_check/detected_level,
+    source, and duplicate_of_id (Fix round 4, item 6). `top_pages`
+    resolves each question's source_index (absent entirely for local
+    hybrid-fallback questions, which get a null source).
     """
+    duplicate_of_by_text = _mark_bank_duplicates(db, user_id, questions)
+
     pending = []
     for q in questions:
         source, book_id, page_id = _resolve_question_source(db, top_pages, q.get("source_index"))
@@ -2988,6 +3178,7 @@ def _save_generated_questions(db: Session, user_id: int, topic: str, questions: 
             options=json.dumps(q["options"]) if q.get("options") else None,
             correct_answer=q["correctAnswer"],
             explanation=q["explanation"],
+            duplicate_of_id=duplicate_of_by_text.get(q["question"]),
         )
         db.add(db_question)
         pending.append((q, db_question, source))
@@ -3009,6 +3200,7 @@ def _save_generated_questions(db: Session, user_id: int, topic: str, questions: 
             "bloom_check": q["bloom_check"],
             "detected_level": q.get("detected_level"),
             "source": source,
+            "duplicate_of_id": db_question.duplicate_of_id,
         }
         if "options" in q:
             item["options"] = q["options"]
@@ -3018,6 +3210,53 @@ def _save_generated_questions(db: Session, user_id: int, topic: str, questions: 
     return response_questions
 
 
+# Fix round 4, item 5: a topic typed/pasted with surrounding quotes (the
+# UI showed '"CPU scheduling and deadlock"' as the quiz heading, and the
+# same stray quotes in every Bank label for it) is cleaned once here, at
+# the point a topic first enters the pipeline -- everything downstream
+# (the heading, Question.topic, recent_questions matching, Bank labels)
+# already gets the clean version, since it's never saved with quotes in
+# the first place.
+_SURROUNDING_QUOTE_PATTERN = re.compile(r'^[\'"‘’“”]+|[\'"‘’“”]+$')
+
+
+def _clean_topic(topic: str) -> str:
+    return _SURROUNDING_QUOTE_PATTERN.sub('', topic.strip()).strip()
+
+
+def _parse_book_ids(raw: str | None, db: Session, user_id: int) -> list | None:
+    """
+    Parses a comma-separated list of book ids (Fix round 4, item 1's
+    "Choose document(s)" -- mirrors `levels`' own comma-separated style).
+    None/empty means "all of this user's ready documents" (the default),
+    returned as None so retrieve() uses its normal whole-user cache
+    instead of a scoped lookup. Raises ValueError (caller turns this into
+    a 422) naming the id(s) that aren't a real, ready document owned by
+    this user.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+
+    try:
+        ids = [int(part.strip()) for part in str(raw).split(",") if part.strip()]
+    except ValueError:
+        raise ValueError(f"book_ids must be a comma-separated list of numbers, got '{raw}'") from None
+
+    if not ids:
+        return None
+
+    owned_ready_ids = {
+        row[0] for row in db.query(Book.id).filter(
+            Book.id.in_(ids), Book.user_id == user_id, Book.status == "ready"
+        ).all()
+    }
+    unknown = [str(i) for i in ids if i not in owned_ready_ids]
+    if unknown:
+        raise ValueError(f"Unknown or not-ready document id(s): {', '.join(unknown)}")
+
+    return ids
+
+
 @app.get("/generate-quiz")
 @limiter.limit("5/minute", key_func=_user_rate_limit_key)
 def generate_ai_quiz(
@@ -3025,11 +3264,19 @@ def generate_ai_quiz(
     topic: str,
     levels: str | None = None,
     count: int = 6,
+    book_ids: str | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    topic = _clean_topic(topic)
+
     try:
         requested_levels = bloom.parse_levels(levels)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        requested_book_ids = _parse_book_ids(book_ids, db, current_user.id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -3059,7 +3306,9 @@ def generate_ai_quiz(
             "warnings": []
         }
 
-    top_pages = _retrieve_or_503(db, current_user.id, topic, top_k=5, apply_threshold=True)
+    top_pages = _retrieve_or_503(
+        db, current_user.id, topic, top_k=5, apply_threshold=True, book_ids=requested_book_ids
+    )
 
     # Relevance checking using both cosine similarity and lexical overlap
     temp_context = " ".join([page.content for _, page in top_pages])
@@ -3212,6 +3461,7 @@ def _question_summary(db: Session, question: Question) -> dict:
         "source": _question_source(db, question),
         "origin": "paper" if question.marks is not None else "quiz",
         "used_in_papers": _question_papers_using(db, question.id),
+        "duplicate_of_id": question.duplicate_of_id,
     }
 
 
@@ -3236,6 +3486,8 @@ def list_questions(
     topic: str | None = None,
     check: str | None = None,
     source: str | None = None,
+    book_id: int | None = None,
+    type: str | None = None,
     limit: int = 50,
     offset: int = 0,
     current_user: User = Depends(get_current_user),
@@ -3247,6 +3499,15 @@ def list_questions(
         for key in level_keys:
             if not bloom.is_valid_level(key):
                 raise HTTPException(status_code=422, detail=f"Unknown Bloom's level: '{key}'")
+    # Fix round 4, item 7: type chips (mcq/true_false/fill_blank/short_answer/
+    # long_answer/scenario/viva/interview) -- combinable with every other
+    # filter here, same comma-separated style as `level`.
+    type_keys = None
+    if type is not None and type.strip():
+        type_keys = [key.strip() for key in type.split(",") if key.strip()]
+        for key in type_keys:
+            if key not in QUIZ_QUESTION_TYPES:
+                raise HTTPException(status_code=422, detail=f"Unknown question type: '{key}'")
     if check is not None and check not in QUESTION_CHECK_STATUSES:
         raise HTTPException(status_code=422, detail=f"Unknown check status: '{check}'")
     if source is not None and source not in QUESTION_SOURCE_FILTERS:
@@ -3259,10 +3520,19 @@ def list_questions(
     query = db.query(Question).filter(Question.user_id == current_user.id)
     if level_keys:
         query = query.filter(Question.bloom_level.in_(level_keys))
+    if type_keys:
+        query = query.filter(Question.type.in_(type_keys))
     if check is not None:
         query = query.filter(Question.bloom_check == check)
     if topic is not None and topic.strip():
         query = query.filter(Question.topic.ilike(f"%{_escape_like(topic)}%", escape="\\"))
+    # Fix round 4, item 7: a document dropdown -- only this user's own
+    # questions can match anyway (the base filter above), so no ownership
+    # check is needed beyond that; a book_id that isn't (or never was)
+    # this user's own book just matches nothing, same as any other filter
+    # with no results.
+    if book_id is not None:
+        query = query.filter(Question.book_id == book_id)
     # source: "quiz"/"paper" is ORIGIN (whether this question was ever written
     # for a paper slot, via the `marks` column -- see models.Question's
     # docstring); "unused" is CURRENT usage (no paper_questions row points at
@@ -3983,7 +4253,7 @@ def _estimate_bloom_mix(raw_questions: list):
 
     question_texts = [str(q.get("text") or "") for q in raw_questions]
     try:
-        detected_levels = _classify_questions_with_gemini(question_texts)
+        detected_levels, _reused_flags = _classify_questions_with_gemini(question_texts)
     except llm.LLMUnavailableError:
         detected_levels = None
     if not detected_levels:
@@ -5045,6 +5315,58 @@ def record_quiz_attempt(
 
     db.commit()
     return {"attempt_id": attempt.id, "topic": topic, "correct": correct, "total": total}
+
+
+class QuizAnswerRegradeRequest(BaseModel):
+    question_id: int
+    is_correct: bool
+
+
+@app.patch("/analytics/quiz-attempts/{attempt_id}/answers")
+@limiter.limit("30/minute", key_func=_user_rate_limit_key)
+def regrade_quiz_answer(
+    request: Request,
+    attempt_id: int,
+    payload: QuizAnswerRegradeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Fix round 4, item 8: a self-graded answer (short_answer/long_answer/
+    scenario/viva/interview -- there's no single correct letter/text to
+    compare against, so the teacher marks it themselves) is graded by
+    clicking "Mark Correct"/"Mark Incorrect" AFTER Submit already recorded
+    the attempt with it counted wrong (nothing to grade yet at that
+    point). This updates that already-saved result in place -- the
+    QuizAnswer row, and the parent QuizAttempt's `correct` total
+    recomputed from every one of its answers -- so /analytics/summary's
+    score and accuracy-by-level (both read straight from these rows)
+    reflect the real grade on their very next call, not just the
+    in-browser display.
+    """
+    attempt = db.query(QuizAttempt).filter(
+        QuizAttempt.id == attempt_id, QuizAttempt.user_id == current_user.id
+    ).first()
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Quiz attempt not found.")
+
+    answer = db.query(QuizAnswer).filter(
+        QuizAnswer.attempt_id == attempt_id, QuizAnswer.question_id == payload.question_id
+    ).first()
+    if not answer:
+        raise HTTPException(status_code=404, detail="No answer for that question in this attempt.")
+    if not answer.self_graded:
+        raise HTTPException(status_code=400, detail="Only self-graded answers can be updated after submitting.")
+
+    answer.is_correct = payload.is_correct
+    db.flush()
+
+    attempt.correct = db.query(QuizAnswer).filter(
+        QuizAnswer.attempt_id == attempt_id, QuizAnswer.is_correct.is_(True)
+    ).count()
+    db.commit()
+
+    return {"attempt_id": attempt.id, "correct": attempt.correct, "total": attempt.total}
 
 
 @app.get("/analytics/summary")

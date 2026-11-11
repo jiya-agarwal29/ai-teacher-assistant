@@ -59,23 +59,27 @@ def needs_reembedding(db: Session, user_id: int) -> bool:
     return not has_current
 
 
-def _ensure_cache(db: Session, user_id: int):
-    if user_id in _cache_by_user:
-        return
-
+def _build_embedding_matrix(db: Session, user_id: int, book_ids=None):
+    """
+    Shared by _ensure_cache (the whole-user cache) and retrieve()'s
+    book-scoped path (Fix round 4, item 1): every ready page's embedding
+    for this user, optionally narrowed to `book_ids`.
+    """
     vectors = []
     ids = []
 
-    pages = db.query(Page).join(
+    query = db.query(Page).join(
         Book, Page.book_id == Book.id
     ).filter(
         Book.user_id == user_id,
         Book.status == "ready",
         Page.embedding.isnot(None),
         Page.embedding_model == embeddings.active_model_name()
-    ).all()
+    )
+    if book_ids is not None:
+        query = query.filter(Book.id.in_(book_ids))
 
-    for page in pages:
+    for page in query.all():
         try:
             vectors.append(json.loads(page.embedding))
             ids.append(page.id)
@@ -83,7 +87,13 @@ def _ensure_cache(db: Session, user_id: int):
             continue
 
     matrix = np.array(vectors) if vectors else np.empty((0, 0))
-    _cache_by_user[user_id] = (matrix, ids)
+    return matrix, ids
+
+
+def _ensure_cache(db: Session, user_id: int):
+    if user_id in _cache_by_user:
+        return
+    _cache_by_user[user_id] = _build_embedding_matrix(db, user_id)
 
 
 def retrieve(
@@ -91,11 +101,22 @@ def retrieve(
     user_id: int,
     query: str,
     top_k: int = 3,
-    apply_threshold: bool = True
+    apply_threshold: bool = True,
+    book_ids=None
 ) -> list[tuple[float, Page]]:
-    _ensure_cache(db, user_id)
-
-    embedding_matrix, page_ids = _cache_by_user[user_id]
+    """
+    `book_ids` (Fix round 4, item 1 -- Quiz Builder's "Choose document(s)"):
+    when given, retrieval is scoped to only those books, bypassing the
+    whole-user cache entirely (a fresh, uncached lookup) -- so a topic
+    search never pulls in chunks from a document the teacher didn't
+    select. None (the default, and every existing caller) keeps the
+    original whole-user, cached behaviour unchanged.
+    """
+    if book_ids is not None:
+        embedding_matrix, page_ids = _build_embedding_matrix(db, user_id, book_ids)
+    else:
+        _ensure_cache(db, user_id)
+        embedding_matrix, page_ids = _cache_by_user[user_id]
 
     if embedding_matrix.shape[0] == 0:
         return []

@@ -565,19 +565,24 @@ export const api = {
   
   quiz: {
     /**
-     * GET /generate-quiz?topic=...&levels=...&count=...
-     * `levels` (array of level keys, or an already-comma-joined string)
-     * and `count` are both optional -- omitting them keeps the backend's
-     * own defaults (all six levels, count=6), so existing callers that
-     * only pass `topic` keep working unchanged.
+     * GET /generate-quiz?topic=...&levels=...&count=...&book_ids=...
+     * `levels` (array of level keys, or an already-comma-joined string),
+     * `count` and `bookIds` (array of document ids, Fix round 4, item 1 --
+     * "Choose document(s)") are all optional -- omitting them keeps the
+     * backend's own defaults (all six levels, count=6, every ready
+     * document), so existing callers that only pass `topic` keep working
+     * unchanged.
      */
-    generate: (topic, { levels, count } = {}) => {
+    generate: (topic, { levels, count, bookIds } = {}) => {
       const queryParams = new URLSearchParams({ topic });
       if (levels) {
         queryParams.append('levels', Array.isArray(levels) ? levels.join(',') : levels);
       }
       if (count !== undefined && count !== null) {
         queryParams.append('count', String(count));
+      }
+      if (bookIds && bookIds.length > 0) {
+        queryParams.append('book_ids', bookIds.join(','));
       }
       return request(`/generate-quiz?${queryParams.toString()}`);
     }
@@ -594,23 +599,30 @@ export const api = {
 
   questions: {
     /**
-     * GET /questions?level=...&topic=...&check=...&source=...&limit=...&offset=...
-     * `level` may be a single key, an array of keys, or an already
-     * comma-joined string (multi-select filtering on the Question Bank
-     * page) -- the backend accepts a comma-separated list for this param.
-     * `source` is "quiz" (never written for a paper), "paper" (written
-     * for a paper slot, whether or not it's still in one), or "unused"
-     * (not currently in any paper slot -- true of every quiz question,
-     * and of a paper question swapped/regenerated out of its slot).
+     * GET /questions?level=...&type=...&topic=...&check=...&source=...
+     * &book_id=...&limit=...&offset=...
+     * `level`/`type` (Fix round 4, item 7: type chips) may each be a
+     * single key, an array of keys, or an already comma-joined string
+     * (multi-select filtering on the Question Bank page) -- the backend
+     * accepts a comma-separated list for both. `book_id` (item 7's
+     * document dropdown) is a single id. `source` is "quiz" (never
+     * written for a paper), "paper" (written for a paper slot, whether
+     * or not it's still in one), or "unused" (not currently in any paper
+     * slot -- true of every quiz question, and of a paper question
+     * swapped/regenerated out of its slot).
      */
-    list: ({ level, topic, check, source, limit, offset } = {}) => {
+    list: ({ level, type, topic, check, source, bookId, limit, offset } = {}) => {
       const params = new URLSearchParams();
       if (level && (!Array.isArray(level) || level.length > 0)) {
         params.append('level', Array.isArray(level) ? level.join(',') : level);
       }
+      if (type && (!Array.isArray(type) || type.length > 0)) {
+        params.append('type', Array.isArray(type) ? type.join(',') : type);
+      }
       if (topic) params.append('topic', topic);
       if (check) params.append('check', check);
       if (source) params.append('source', source);
+      if (bookId) params.append('book_id', String(bookId));
       if (limit !== undefined && limit !== null) params.append('limit', String(limit));
       if (offset !== undefined && offset !== null) params.append('offset', String(offset));
       return request(`/questions?${params.toString()}`);
@@ -840,6 +852,22 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }),
+
+    /**
+     * PATCH /analytics/quiz-attempts/{attemptId}/answers {question_id,
+     * is_correct} -- Fix round 4, item 8: updates an already-submitted
+     * self-graded answer (grading happens after Submit, when there's
+     * nothing to grade yet) and recomputes the attempt's saved score.
+     * Returns {attempt_id, correct, total}.
+     */
+    regradeQuizAnswer: (attemptId, questionId, isCorrect) => request(
+      `/analytics/quiz-attempts/${attemptId}/answers`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question_id: questionId, is_correct: isCorrect }),
+      }
+    ),
 
     /**
      * POST /analytics/import?tz=<IANA> {queries_by_day, active_seconds_by_day,

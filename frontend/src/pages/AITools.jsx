@@ -8,6 +8,7 @@ import MarkdownRenderer from '../components/MarkdownRenderer';
 import BloomBadge from '../components/BloomBadge';
 import { cleanSnippetText } from '../utils/textCleanup';
 import { validateNonEmpty, validateSummarizerInput } from './aiToolsValidation';
+import { mergeRegeneratedQuestion } from './quizRegenerate';
 import {
   Brain, 
   Search, 
@@ -21,7 +22,8 @@ import {
   AlertCircle,
   Copy,
   ChevronRight,
-  BookMarked
+  BookMarked,
+  RefreshCw
 } from 'lucide-react';
 
 // Types the student grades themselves (no single correct letter/text to
@@ -114,7 +116,9 @@ export default function AITools() {
     })();
     return () => { ignore = true; };
   }, []);
-  const readyBooksForSummarizer = books.filter((b) => b.status === 'ready');
+  // Shared by the Summarizer's "Choose a document" dropdown and the Quiz
+  // Builder's "Choose document(s)" checklist (Fix round 4, item 1).
+  const readyBooks = books.filter((b) => b.status === 'ready');
 
   // -----------------------------
   // TOOL 1: QUIZ GENERATOR STATE
@@ -134,6 +138,26 @@ export default function AITools() {
   const [shortAnswers, setShortAnswers] = useState(restoredQuiz?.shortAnswers || {}); // { questionId: string }
   const [shortAnswerGrades, setShortAnswerGrades] = useState(restoredQuiz?.shortAnswerGrades || {}); // { questionId: 'correct' | 'incorrect' }
   const [submittedQuiz, setSubmittedQuiz] = useState(restoredQuiz?.submittedQuiz || false);
+  // Fix round 4, item 8: the saved QuizAttempt id returned on Submit, so a
+  // self-grade clicked afterward can update that already-saved result
+  // instead of only the in-browser display.
+  const [quizAttemptId, setQuizAttemptId] = useState(restoredQuiz?.quizAttemptId ?? null);
+
+  // Fix round 4, item 1: "Choose document(s)" -- null means "not decided
+  // yet", which defaults to every ready document (see effectiveBookIds)
+  // rather than persisting a sticky preference like the Bloom levels do.
+  const [selectedBookIds, setSelectedBookIds] = useState(restoredQuiz?.selectedBookIds ?? null);
+  const effectiveBookIds = selectedBookIds !== null ? selectedBookIds : readyBooks.map((b) => b.id);
+  const toggleBookId = (id) => {
+    setSelectedBookIds((prev) => {
+      const current = prev !== null ? prev : readyBooks.map((b) => b.id);
+      if (current.includes(id)) {
+        if (current.length === 1) return current; // at least one must stay selected
+        return current.filter((b) => b !== id);
+      }
+      return [...current, id];
+    });
+  };
 
   // Persist the quiz-in-progress on every change, and clear it once there's
   // nothing worth restoring (no topic typed, no quiz generated).
@@ -154,13 +178,18 @@ export default function AITools() {
           fillBlankAnswers,
           shortAnswers,
           shortAnswerGrades,
-          submittedQuiz
+          submittedQuiz,
+          quizAttemptId,
+          selectedBookIds
         })
       );
     } catch {
       // sessionStorage unavailable -- nothing to do about it here.
     }
-  }, [quizTopic, quizResult, quizQuestions, quizWarnings, selectedAnswers, fillBlankAnswers, shortAnswers, shortAnswerGrades, submittedQuiz]);
+  }, [
+    quizTopic, quizResult, quizQuestions, quizWarnings, selectedAnswers, fillBlankAnswers,
+    shortAnswers, shortAnswerGrades, submittedQuiz, quizAttemptId, selectedBookIds
+  ]);
 
   // Logout clears the in-progress quiz too -- 'before-logout' fires while
   // the current username (and so the right sessionStorage key) still
@@ -182,6 +211,8 @@ export default function AITools() {
     setShortAnswers({});
     setShortAnswerGrades({});
     setSubmittedQuiz(false);
+    setQuizAttemptId(null);
+    setSelectedBookIds(null);
     clearPersistedQuizState();
   };
 
@@ -246,6 +277,50 @@ export default function AITools() {
       return shortAnswerGrades[q.id] === 'correct';
     }
     return false;
+  };
+
+  // Fix round 4, item 8: updates the local grade immediately (so the UI
+  // reacts right away) and, if this quiz has already been submitted
+  // (quizAttemptId set) and this question has a real bank id, also
+  // updates the already-saved attempt server-side -- fire-and-forget, so
+  // a failed/offline regrade call never blocks the self-grading buttons
+  // from working locally.
+  const handleSelfGrade = (q, grade) => {
+    setShortAnswerGrades((prev) => ({ ...prev, [q.id]: grade }));
+    if (quizAttemptId && q.question_id) {
+      api.analytics.regradeQuizAnswer(quizAttemptId, q.question_id, grade === 'correct').catch(() => {});
+    }
+  };
+
+  // Fix round 4, item 2: a regenerate button on each question before
+  // submitting -- writes one new question at the same level/type (the
+  // backend endpoint already existed, from Phase 4D's Question Bank
+  // page; this just wires it into the Quiz Builder's own question
+  // cards too). Response fields are snake_case (_question_summary);
+  // merged into the camelCase shape quizQuestions already uses.
+  const [regeneratingQuestionId, setRegeneratingQuestionId] = useState(null);
+  const [regenerateError, setRegenerateError] = useState('');
+
+  const handleRegenerateQuestion = async (q) => {
+    if (!q.question_id) return;
+    setRegenerateError('');
+    setRegeneratingQuestionId(q.question_id);
+    try {
+      const updated = await api.questions.regenerate(q.question_id);
+      setQuizQuestions((prev) => prev.map((existing) => (
+        existing.question_id === updated.question_id ? mergeRegeneratedQuestion(existing, updated) : existing
+      )));
+      // The question's content just changed -- any answer/grade already
+      // given for it no longer applies.
+      setSelectedAnswers((prev) => { const next = { ...prev }; delete next[q.id]; return next; });
+      setFillBlankAnswers((prev) => { const next = { ...prev }; delete next[q.id]; return next; });
+      setShortAnswers((prev) => { const next = { ...prev }; delete next[q.id]; return next; });
+      setShortAnswerGrades((prev) => { const next = { ...prev }; delete next[q.id]; return next; });
+    } catch (err) {
+      setRegenerateError(err.message || 'Could not regenerate this question.');
+    } finally {
+      setRegeneratingQuestionId(null);
+    }
   };
 
   const calculateScore = () => {
@@ -363,10 +438,13 @@ export default function AITools() {
     setShortAnswers({});
     setShortAnswerGrades({});
     setSubmittedQuiz(false);
+    setQuizAttemptId(null);
     setError('');
 
     try {
-      const res = await api.quiz.generate(quizTopic, { levels: effectiveLevels, count: questionCount });
+      const res = await api.quiz.generate(quizTopic, {
+        levels: effectiveLevels, count: questionCount, bookIds: selectedBookIds
+      });
       setQuizResult(res.quiz);
       setQuizWarnings(res.warnings || []);
 
@@ -641,6 +719,50 @@ export default function AITools() {
                     )}
                   </div>
 
+                  {/* Fix round 4, item 1: Choose document(s) -- default is
+                      every ready document, same as leaving this alone. */}
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
+                        Documents
+                      </span>
+                      {readyBooks.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedBookIds(null)}
+                          className="px-2.5 py-1 rounded-lg text-[9px] font-bold bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                        >
+                          All
+                        </button>
+                      )}
+                    </div>
+
+                    {readyBooks.length === 0 ? (
+                      <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                        No ready documents yet -- upload one on the Documents page first.
+                      </p>
+                    ) : (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {readyBooks.map((book) => (
+                          <label
+                            key={book.id}
+                            className="flex items-center gap-2.5 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/30 cursor-pointer transition-colors"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={effectiveBookIds.includes(book.id)}
+                              onChange={() => toggleBookId(book.id)}
+                              className="rounded border-slate-300 dark:border-slate-700 text-violet-600 focus:ring-violet-500 focus:ring-offset-0"
+                            />
+                            <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 truncate">
+                              {book.name}
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
                   {/* Bloom's level picker */}
                   <div className="space-y-2">
                     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -741,6 +863,13 @@ export default function AITools() {
                 </div>
               )}
 
+              {regenerateError && (
+                <div className="flex items-start gap-3 p-3.5 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-[11px] font-medium animate-fadeIn">
+                  <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                  <span>{regenerateError}</span>
+                </div>
+              )}
+
               {/* Quiz interactive display */}
               {quizQuestions.length > 0 ? (
                 <div className="space-y-6 animate-fadeIn">
@@ -754,6 +883,9 @@ export default function AITools() {
                             if (result.totalCount > 0) {
                               // Fire-and-forget -- a failed analytics call must
                               // never block the student from seeing their score.
+                              // Fix round 4, item 8: captures the attempt id so a
+                              // self-grade clicked afterward can update this
+                              // already-saved result, not just the display.
                               api.analytics.quizAttempt({
                                 topic: quizTopic,
                                 answers: quizQuestions.map((q) => ({
@@ -763,7 +895,7 @@ export default function AITools() {
                                   is_correct: isCorrectAnswer(q),
                                   self_graded: SELF_GRADED_TYPES.includes(q.type)
                                 }))
-                              }).catch(() => {});
+                              }).then((attempt) => setQuizAttemptId(attempt.attempt_id)).catch(() => {});
                             }
                             setSubmittedQuiz(true);
                           }}
@@ -886,6 +1018,19 @@ export default function AITools() {
                                 {q.type === 'interview' && 'Interview Question'}
                                 {!q.type && 'MCQ'}
                               </span>
+                              {/* Fix round 4, item 2: regenerate this one
+                                  question (same level/type) before submitting. */}
+                              {!submittedQuiz && q.question_id && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleRegenerateQuestion(q)}
+                                  disabled={regeneratingQuestionId === q.question_id}
+                                  title="Regenerate this question"
+                                  className="p-1.5 rounded-lg text-slate-400 hover:text-violet-600 hover:bg-violet-500/10 transition-all disabled:opacity-50 disabled:pointer-events-none"
+                                >
+                                  <RefreshCw size={12} className={regeneratingQuestionId === q.question_id ? 'animate-spin' : ''} />
+                                </button>
+                              )}
                             </div>
                           </div>
 
@@ -1014,7 +1159,7 @@ export default function AITools() {
                                   <div className="flex items-center gap-3">
                                     <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">Self-Grading:</span>
                                     <button
-                                      onClick={() => setShortAnswerGrades({ ...shortAnswerGrades, [q.id]: 'correct' })}
+                                      onClick={() => handleSelfGrade(q, 'correct')}
                                       className={`px-3 py-1.5 rounded-xl text-[10px] font-bold transition-all ${
                                         shortAnswerGrades[q.id] === 'correct'
                                           ? 'bg-emerald-500 text-white shadow-sm shadow-emerald-500/25'
@@ -1024,7 +1169,7 @@ export default function AITools() {
                                       Mark Correct
                                     </button>
                                     <button
-                                      onClick={() => setShortAnswerGrades({ ...shortAnswerGrades, [q.id]: 'incorrect' })}
+                                      onClick={() => handleSelfGrade(q, 'incorrect')}
                                       className={`px-3 py-1.5 rounded-xl text-[10px] font-bold transition-all ${
                                         shortAnswerGrades[q.id] === 'incorrect'
                                           ? 'bg-rose-500 text-white shadow-sm shadow-rose-500/25'
@@ -1191,7 +1336,7 @@ export default function AITools() {
                     />
                   ) : (
                     <div className="space-y-3">
-                      {readyBooksForSummarizer.length === 0 ? (
+                      {readyBooks.length === 0 ? (
                         <p className="text-[10px] text-slate-500 dark:text-slate-400">
                           No ready documents yet -- upload one on the Documents page first.
                         </p>
@@ -1202,7 +1347,7 @@ export default function AITools() {
                           className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
                         >
                           <option value="">Select a document…</option>
-                          {readyBooksForSummarizer.map((book) => (
+                          {readyBooks.map((book) => (
                             <option key={book.id} value={book.id}>{book.name}</option>
                           ))}
                         </select>

@@ -608,7 +608,7 @@ def test_chat_multi_part_question_merges_sources_and_notes_uncovered_part(client
     finally:
         db.close()
 
-    def fake_retrieve(db_arg, user_id, query, top_k=3, apply_threshold=True):
+    def fake_retrieve(db_arg, user_id, query, top_k=3, apply_threshold=True, book_ids=None):
         q = query.lower()
         if "firewall" in q:
             return [(0.9, fw_page)]
@@ -2756,6 +2756,120 @@ def test_generate_quiz_rejects_out_of_range_count(client, phase4b_headers):
     assert too_high.status_code == 422
 
 
+# --- Fix round 4, item 1: Quiz Builder's "Choose document(s)" --
+# retrieval scoped to only the chosen documents; default (omitted) is all. ---
+def test_generate_quiz_book_ids_param_is_forwarded_to_retrieval(client, phase4b_headers, monkeypatch):
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "book_ids_forward.txt")
+
+    captured = {}
+
+    def fake_retrieve(db, user_id, query, top_k=3, apply_threshold=True, book_ids=None):
+        captured["book_ids"] = book_ids
+        return []
+
+    monkeypatch.setattr(main_module, "retrieve", fake_retrieve)
+
+    client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "book_ids": str(book_id)}
+    )
+
+    assert captured["book_ids"] == [book_id]
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_book_ids_omitted_means_every_document(client, phase4b_headers, monkeypatch):
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "book_ids_all.txt")
+
+    captured = {}
+
+    def fake_retrieve(db, user_id, query, top_k=3, apply_threshold=True, book_ids=None):
+        captured["book_ids"] = book_ids
+        return []
+
+    monkeypatch.setattr(main_module, "retrieve", fake_retrieve)
+
+    client.get("/generate-quiz", headers=headers, params={"topic": "water cycle"})
+
+    assert captured["book_ids"] is None
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_generate_quiz_rejects_unknown_book_id(client, phase4b_headers):
+    main.limiter.reset()
+    res = client.get(
+        "/generate-quiz", headers=phase4b_headers,
+        params={"topic": "anything", "book_ids": "999999"}
+    )
+    assert res.status_code == 422
+
+
+def test_generate_quiz_rejects_another_users_book_id(client, phase4b_headers):
+    main.limiter.reset()
+    headers = phase4b_headers
+    _, other_headers = _fresh_phase6c_user(client)
+    other_book_id = _upload_bees_doc(client, other_headers, "other_user_quiz_doc.txt")
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "anything", "book_ids": str(other_book_id)}
+    )
+    assert res.status_code == 422
+
+    client.delete(f"/books/{other_book_id}", headers=other_headers)
+
+
+# --- Fix round 4, item 5: topic quotes/extra spaces stripped once, at the
+# point a topic enters the pipeline, so the heading, saved Question.topic,
+# and Bank labels are all already clean. ---
+def test_clean_topic_strips_various_quote_styles():
+    assert main._clean_topic('"CPU scheduling and deadlock"') == "CPU scheduling and deadlock"
+    assert main._clean_topic('""CPU scheduling and deadlock""') == "CPU scheduling and deadlock"
+    assert main._clean_topic("  'inheritance'  ") == "inheritance"
+    assert main._clean_topic("“Unicode quotes”") == "Unicode quotes"
+    assert main._clean_topic("no quotes here") == "no quotes here"
+
+
+def test_generate_quiz_strips_surrounding_quotes_from_topic(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "quoted_topic.txt")
+
+    monkeypatch.setattr(llm_module, "generate_json", lambda prompt, schema, system=None: {"questions": []})
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": '""CPU scheduling and deadlock""'}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["topic"] == "CPU scheduling and deadlock"
+
+    if data["questions"]:
+        db = TestSessionLocal()
+        try:
+            saved = db.query(main.Question).filter(
+                main.Question.id == data["questions"][0]["question_id"]
+            ).first()
+            assert saved.topic == "CPU scheduling and deadlock"
+        finally:
+            db.close()
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
 def test_generate_quiz_distributes_requested_levels_into_the_prompt(client, phase4b_headers, monkeypatch):
     import bloom
     import llm as llm_module
@@ -2959,6 +3073,184 @@ def _bloom_fix_question(qid, q_type, level, question, answer, options=None):
     elif q_type == "mcq":
         q["options"] = options or ["Alpha", "Beta", "Gamma", "Delta"]
     return q
+
+
+# --- Fix round 4, item 4: an Apply/Analyze question that quietly reused
+# the sources' own example is regenerated through the same mismatch path
+# as a wrong Bloom level -- inside the existing classifier call, no extra
+# AI call. ---
+def test_apply_question_reusing_the_sources_example_is_regenerated(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "reused_example.txt")
+
+    initial = [
+        _bloom_fix_question(1, "true_false", "remember", "True or False: heat causes evaporation.", "A"),
+        _bloom_fix_question(
+            2, "short_answer", "understand", "Explain why water evaporates due to heat from the sun.",
+            "Heat energy turns liquid water into vapor."
+        ),
+        _bloom_fix_question(
+            3, "scenario", "apply",
+            "A hiker notices clouds forming overhead. Apply the water cycle to explain why.",
+            "Condensation is occurring."
+        ),
+    ]
+    regenerated_apply = _bloom_fix_question(
+        10, "scenario", "apply",
+        "A farmer wants to use the water cycle to plan irrigation. How would they apply it?",
+        "They would track evaporation and precipitation patterns."
+    )
+
+    quiz_call = {"n": 0}
+    classifier_call = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            classifier_call["n"] += 1
+            if classifier_call["n"] == 1:
+                # Every level is correct -- but the apply question reused
+                # the sources' own example, so it still needs regenerating.
+                return {"items": [
+                    {"id": 1, "level": "remember", "reused_example": False},
+                    {"id": 2, "level": "understand", "reused_example": False},
+                    {"id": 3, "level": "apply", "reused_example": True},
+                ]}
+            # Recheck of the one regenerated replacement: correct level,
+            # and this time a genuinely new scenario.
+            return {"items": [{"id": 1, "level": "apply", "reused_example": False}]}
+
+        quiz_call["n"] += 1
+        if quiz_call["n"] == 1:
+            return {"questions": initial}
+        return {"questions": [regenerated_apply]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3
+
+    by_level = {q["bloom_level"]: q for q in data["questions"]}
+    assert by_level["remember"]["bloom_check"] == "verified"
+    assert by_level["understand"]["bloom_check"] == "verified"
+    assert by_level["apply"]["bloom_check"] == "verified"  # the level itself was always correct
+    assert by_level["apply"]["question"] == regenerated_apply["question"]
+
+    assert quiz_call["n"] == 2  # initial generation + exactly one regeneration
+    assert classifier_call["n"] == 2  # initial check + one recheck, same as a level mismatch
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_apply_question_with_a_genuinely_new_scenario_is_kept_as_is(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "new_scenario.txt")
+
+    initial = [
+        _bloom_fix_question(1, "true_false", "remember", "True or False: heat causes evaporation.", "A"),
+        _bloom_fix_question(
+            2, "short_answer", "understand", "Explain why water evaporates due to heat from the sun.",
+            "Heat energy turns liquid water into vapor."
+        ),
+        _bloom_fix_question(
+            3, "scenario", "apply",
+            "A farmer wants to use the water cycle to plan irrigation. How would they apply it?",
+            "They would track evaporation and precipitation patterns."
+        ),
+    ]
+
+    classifier_call = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            classifier_call["n"] += 1
+            return {"items": [
+                {"id": 1, "level": "remember", "reused_example": False},
+                {"id": 2, "level": "understand", "reused_example": False},
+                {"id": 3, "level": "apply", "reused_example": False},
+            ]}
+        return {"questions": initial}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3
+
+    by_level = {q["bloom_level"]: q for q in data["questions"]}
+    assert by_level["apply"]["question"] == initial[2]["question"]
+    assert by_level["apply"]["bloom_check"] == "verified"
+    assert classifier_call["n"] == 1  # no regeneration needed
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_reused_example_flag_is_ignored_outside_apply_and_analyze(client, phase4b_headers, monkeypatch):
+    # A model incorrectly setting reused_example=true for Remember/Understand
+    # must not trigger a pointless regeneration -- only Apply/Analyze need a
+    # NEW situation (bloom.py's own prompt_rules).
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "remember_reused_ignored.txt")
+
+    initial = [
+        _bloom_fix_question(1, "true_false", "remember", "True or False: heat causes evaporation.", "A"),
+        _bloom_fix_question(
+            2, "short_answer", "understand", "Explain why water evaporates due to heat from the sun.",
+            "Heat energy turns liquid water into vapor."
+        ),
+        _bloom_fix_question(
+            3, "scenario", "apply",
+            "A farmer wants to use the water cycle to plan irrigation. How would they apply it?",
+            "They would track evaporation and precipitation patterns."
+        ),
+    ]
+
+    classifier_call = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            classifier_call["n"] += 1
+            return {"items": [
+                {"id": 1, "level": "remember", "reused_example": True},
+                {"id": 2, "level": "understand", "reused_example": True},
+                {"id": 3, "level": "apply", "reused_example": False},
+            ]}
+        return {"questions": initial}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "water cycle", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["questions"]) == 3
+    for q in data["questions"]:
+        assert q["bloom_check"] == "verified"
+    assert classifier_call["n"] == 1  # no regeneration triggered
+
+    client.delete(f"/books/{book_id}", headers=headers)
 
 
 def test_generate_quiz_top_up_fills_a_missing_level(client, phase4b_headers, monkeypatch):
@@ -3265,6 +3557,129 @@ def test_list_questions_rejects_invalid_filters(client, phase4b_headers):
     assert client.get("/questions", headers=headers, params={"check": "bogus"}).status_code == 422
     assert client.get("/questions", headers=headers, params={"limit": 0}).status_code == 422
     assert client.get("/questions", headers=headers, params={"offset": -1}).status_code == 422
+    assert client.get("/questions", headers=headers, params={"type": "bogus"}).status_code == 422
+    assert client.get("/questions", headers=headers, params={"type": "mcq,bogus"}).status_code == 422
+
+
+# --- Fix round 4, item 7: Question Bank filters -- a document dropdown
+# and type chips, combinable with the level/check/source/topic filters
+# already there. ---
+def test_list_questions_filters_by_document(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_a_id = _upload_water_cycle_doc(client, headers, "bank_filter_doc_a.txt")
+    book_b_id = _upload_water_cycle_doc(client, headers, "bank_filter_doc_b.txt")
+
+    seed_a = [
+        _bloom_fix_question(1, "true_false", "remember", "Doc A filter question one.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Doc A filter question two.", "Answer."),
+        _bloom_fix_question(3, "scenario", "apply", "Doc A filter question three.", "Answer."),
+    ]
+    seed_b = [
+        _bloom_fix_question(1, "true_false", "remember", "Doc B filter question one.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Doc B filter question two.", "Answer."),
+        _bloom_fix_question(3, "scenario", "apply", "Doc B filter question three.", "Answer."),
+    ]
+    state = {"seed": seed_a}
+
+    def fake_generate_json(prompt, schema, system=None):
+        seed = state["seed"]
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(seed, start=1)]}
+        return {"questions": seed}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res_a = client.get(
+        "/generate-quiz", headers=headers,
+        params={
+            "topic": "doc filter topic a", "levels": "remember,understand,apply", "count": 3,
+            "book_ids": str(book_a_id)
+        }
+    )
+    assert res_a.status_code == 200
+
+    state["seed"] = seed_b
+    res_b = client.get(
+        "/generate-quiz", headers=headers,
+        params={
+            "topic": "doc filter topic b", "levels": "remember,understand,apply", "count": 3,
+            "book_ids": str(book_b_id)
+        }
+    )
+    assert res_b.status_code == 200
+
+    list_a = client.get("/questions", headers=headers, params={"book_id": book_a_id}).json()
+    assert list_a["total"] == 3
+    assert all(item["source"]["book_name"] == "bank_filter_doc_a.txt" for item in list_a["items"])
+
+    list_b = client.get("/questions", headers=headers, params={"book_id": book_b_id}).json()
+    assert list_b["total"] == 3
+    assert all(item["source"]["book_name"] == "bank_filter_doc_b.txt" for item in list_b["items"])
+
+    client.delete(f"/books/{book_a_id}", headers=headers)
+    client.delete(f"/books/{book_b_id}", headers=headers)
+
+
+def test_list_questions_filters_by_type_and_combines_with_level(client, phase4b_headers, monkeypatch):
+    import llm as llm_module
+    import main as main_module
+
+    headers = phase4b_headers
+    main.limiter.reset()
+    book_id = _upload_water_cycle_doc(client, headers, "bank_filter_type.txt")
+
+    # Deliberately varied vocabulary across all three -- sharing a common
+    # template phrase would give every pair >=2 shared grounding terms and
+    # trip item 3's embedding-based near-duplicate escalation under this
+    # suite's fake (identical-vector) embeddings, dropping ones this test
+    # needs to survive. short_answer is only a valid type at understand/
+    # apply (bloom.py), never remember -- an invalid (type, level) pairing
+    # is silently dropped by _validate_quiz_questions.
+    seed = [
+        _bloom_fix_question(1, "true_false", "remember", "True or False: water evaporates due to heat from the sun.", "A"),
+        _bloom_fix_question(2, "short_answer", "understand", "Explain why condensation forms clouds in the atmosphere.", "Water vapor cools and clumps into droplets."),
+        _bloom_fix_question(
+            3, "short_answer", "apply",
+            "A farmer wants to plan irrigation around seasonal rainfall. How would understanding the water cycle help?",
+            "Tracking evaporation and precipitation patterns guides irrigation timing."
+        ),
+    ]
+
+    def fake_generate_json(prompt, schema, system=None):
+        if schema is main_module.CLASSIFIER_SCHEMA:
+            return {"items": [{"id": i, "level": q["bloom_level"]} for i, q in enumerate(seed, start=1)]}
+        return {"questions": seed}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.get(
+        "/generate-quiz", headers=headers,
+        params={"topic": "type filter topic", "levels": "remember,understand,apply", "count": 3}
+    )
+    assert res.status_code == 200
+
+    # type alone
+    by_type = client.get(
+        "/questions", headers=headers,
+        params={"topic": "type filter topic", "type": "short_answer"}
+    ).json()
+    assert {item["type"] for item in by_type["items"]} == {"short_answer"}
+    assert len(by_type["items"]) == 2
+
+    # type combined with level
+    combined = client.get(
+        "/questions", headers=headers,
+        params={"topic": "type filter topic", "type": "short_answer", "level": "understand"}
+    ).json()
+    assert len(combined["items"]) == 1
+    assert combined["items"][0]["type"] == "short_answer"
+    assert combined["items"][0]["bloom_level"] == "understand"
+
+    client.delete(f"/books/{book_id}", headers=headers)
 
 
 def test_list_questions_filters_by_multiple_levels(client, phase4b_headers, monkeypatch):
@@ -3782,6 +4197,182 @@ def test_generate_quiz_drops_near_duplicate_and_tops_up(client, phase4b_headers,
     assert any("too similar to another question in this quiz" in msg for msg in drop_logs)
 
     client.delete(f"/books/{book_id}", headers=headers)
+
+
+# --- Fix round 4, item 3: embedding-based escalation catches a pair
+# worded completely differently but testing the exact same fact -- the
+# kind of duplicate pure word-overlap (Jaccard) alone would miss. Unit
+# tests against _drop_near_duplicates directly (no HTTP/book upload
+# needed) since it's a pure function of a question list. ---
+def test_drop_near_duplicates_catches_semantic_duplicate_via_embeddings(monkeypatch):
+    import numpy as np
+    import embeddings
+
+    q1 = (
+        "True or False: inheritance models an is-a relationship between "
+        "a base class and a derived class."
+    )
+    q2 = (
+        "Explain whether inheritance truly captures a parent-child is-a "
+        "relationship in object-oriented design."
+    )
+    q3 = "A hiker notices clouds forming overhead. What process is at work?"
+    questions = [{"id": 1, "question": q1}, {"id": 2, "question": q2}, {"id": 3, "question": q3}]
+
+    # q1/q2 share real vocabulary ("inheritance", "relationship") but are
+    # worded differently enough that Jaccard alone wouldn't drop either --
+    # a real embedding model would still recognize they ask the same
+    # thing, simulated here with a high dot product for that pair only.
+    vectors_by_text = {
+        q1: [1.0, 0.0, 0.0],
+        q2: [0.99, 0.14, 0.0],
+        q3: [0.0, 0.0, 1.0],
+    }
+    assert main._jaccard_similarity(q1, q2) < main.NEAR_DUPLICATE_JACCARD_THRESHOLD
+
+    def fake_embed_documents(texts, max_wait_seconds=None, on_batch_done=None):
+        return np.array([vectors_by_text[t] for t in texts])
+
+    monkeypatch.setattr(embeddings, "embed_documents", fake_embed_documents)
+
+    drop_log = []
+    result = main._drop_near_duplicates(questions, drop_log)
+
+    assert [q["id"] for q in result] == [1, 3]  # question 2 dropped as a duplicate of 1
+    assert "too similar to another question in this quiz" in drop_log
+
+
+def test_drop_near_duplicates_never_escalates_without_shared_vocabulary(monkeypatch):
+    # Two questions sharing nothing real never even reach the embedding
+    # check -- even a hostile fake that would call every pair a duplicate
+    # can't drop either of them, and is never actually called (confirming
+    # this isn't just "the threshold happened not to trip").
+    import embeddings
+
+    questions = [
+        {"id": 1, "question": "Define polymorphism in object-oriented programming."},
+        {"id": 2, "question": "A hiker notices clouds forming overhead. What process is at work?"},
+    ]
+
+    def fake_embed_documents(texts, max_wait_seconds=None, on_batch_done=None):
+        pytest.fail("embed_documents should never be called -- no pair shares enough vocabulary to need it")
+
+    monkeypatch.setattr(embeddings, "embed_documents", fake_embed_documents)
+
+    result = main._drop_near_duplicates(questions, [])
+    assert [q["id"] for q in result] == [1, 2]
+
+
+def test_drop_near_duplicates_falls_back_to_jaccard_only_when_embeddings_are_busy(monkeypatch):
+    import embeddings
+
+    q1 = (
+        "True or False: inheritance models an is-a relationship between "
+        "a base class and a derived class."
+    )
+    q2 = (
+        "Explain whether inheritance truly captures a parent-child is-a "
+        "relationship in object-oriented design."
+    )
+    questions = [{"id": 1, "question": q1}, {"id": 2, "question": q2}]
+
+    def raise_busy(texts, max_wait_seconds=None, on_batch_done=None):
+        raise embeddings.EmbeddingServiceBusyError("busy")
+
+    monkeypatch.setattr(embeddings, "embed_documents", raise_busy)
+
+    # Neither question is dropped -- a busy embedding service degrades to
+    # the pre-existing Jaccard-only behaviour instead of failing the quiz.
+    result = main._drop_near_duplicates(questions, [])
+    assert [q["id"] for q in result] == [1, 2]
+
+
+# --- Fix round 4, item 6: a near-duplicate of a question already in the
+# user's Bank is MARKED (duplicate_of_id), not silently skipped, at save
+# time -- same similarity rule as item 3. ---
+def test_save_generated_questions_marks_near_duplicate_already_in_the_bank(client, monkeypatch):
+    import numpy as np
+    import embeddings
+
+    username, _headers = _fresh_phase6c_user(client)
+    user_id = _user_id(username)
+
+    existing_text = (
+        "True or False: inheritance models an is-a relationship between "
+        "a base class and a derived class."
+    )
+    new_text = (
+        "Explain whether inheritance truly captures a parent-child is-a "
+        "relationship in object-oriented design."
+    )
+    assert main._jaccard_similarity(existing_text, new_text) < main.NEAR_DUPLICATE_JACCARD_THRESHOLD
+
+    db = TestSessionLocal()
+    try:
+        existing = main.Question(
+            user_id=user_id, topic="oop_bank_dedup", type="true_false", bloom_level="remember",
+            bloom_check="verified", question=existing_text,
+            correct_answer="A", explanation="Already in the bank.",
+        )
+        db.add(existing)
+        db.commit()
+        existing_id = existing.id
+    finally:
+        db.close()
+
+    def fake_embed_documents(texts, max_wait_seconds=None, on_batch_done=None):
+        vectors_by_text = {existing_text: np.array([1.0, 0.0]), new_text: np.array([0.99, 0.14])}
+        return np.array([vectors_by_text[t] for t in texts])
+
+    monkeypatch.setattr(embeddings, "embed_documents", fake_embed_documents)
+
+    new_question = {
+        "id": 1, "type": "short_answer", "bloom_level": "understand", "bloom_check": "verified",
+        "question": new_text, "correctAnswer": "Yes, inheritance models an is-a relationship.",
+        "explanation": "A fresh explanation.",
+    }
+
+    db2 = TestSessionLocal()
+    try:
+        response = main._save_generated_questions(db2, user_id, "oop_bank_dedup", [new_question], [])
+        new_id = response[0]["question_id"]
+        assert response[0]["duplicate_of_id"] == existing_id
+
+        saved = db2.query(main.Question).filter(main.Question.id == new_id).first()
+        assert saved.duplicate_of_id == existing_id
+    finally:
+        db2.query(main.Question).filter(main.Question.id.in_([existing_id, new_id])).delete(synchronize_session=False)
+        db2.commit()
+        db2.close()
+
+
+def test_save_generated_questions_leaves_duplicate_of_id_null_when_nothing_matches(client, monkeypatch):
+    import embeddings
+
+    username, _headers = _fresh_phase6c_user(client)
+    user_id = _user_id(username)
+
+    def fail_if_called(*a, **kw):
+        pytest.fail("embed_documents should not be called -- no existing bank questions to compare against")
+
+    monkeypatch.setattr(embeddings, "embed_documents", fail_if_called)
+
+    new_question = {
+        "id": 1, "type": "mcq", "bloom_level": "remember", "bloom_check": "verified",
+        "question": "A brand new question with nothing in the bank yet.",
+        "correctAnswer": "A", "options": ["A", "B", "C", "D"],
+        "explanation": "x",
+    }
+
+    db = TestSessionLocal()
+    try:
+        response = main._save_generated_questions(db, user_id, "fresh_bank_topic_xyz", [new_question], [])
+        new_id = response[0]["question_id"]
+        assert response[0]["duplicate_of_id"] is None
+    finally:
+        db.query(main.Question).filter(main.Question.id == new_id).delete(synchronize_session=False)
+        db.commit()
+        db.close()
 
 
 # -----------------------------
@@ -5821,6 +6412,145 @@ def test_quiz_attempt_computes_totals_and_ignores_foreign_question_id(
         assert answer.question_id is None  # a foreign question_id is ignored, not 404'd
     finally:
         db.close()
+
+
+# --- Fix round 4, item 8: self-graded answers (no single correct letter/
+# text to compare against) are graded by clicking "Mark Correct"/"Mark
+# Incorrect" AFTER Submit already recorded them as wrong -- regrading
+# must update the saved attempt, not just the in-browser display. ---
+def test_quiz_attempt_self_graded_answers_can_be_regraded_after_submit(client, phase6a_headers):
+    headers = phase6a_headers
+    user_id = _user_id("phase6a_test_user")
+
+    db = TestSessionLocal()
+    try:
+        q1 = main.Question(
+            user_id=user_id, topic="regrade_after_submit", type="short_answer", bloom_level="apply",
+            question="Explain how you would apply X.", correct_answer="A reference answer.", explanation="E",
+        )
+        q2 = main.Question(
+            user_id=user_id, topic="regrade_after_submit", type="long_answer", bloom_level="create",
+            question="Design a new Y using the concepts.", correct_answer="A reference design.", explanation="E",
+        )
+        db.add_all([q1, q2])
+        db.commit()
+        q1_id, q2_id = q1.id, q2.id
+    finally:
+        db.close()
+
+    main.limiter.reset()
+    res = client.post(
+        "/analytics/quiz-attempts", headers=headers,
+        json={
+            "topic": "regrade_after_submit",
+            "answers": [
+                {"question_type": "mcq", "is_correct": True, "self_graded": False},
+                {"question_type": "mcq", "is_correct": True, "self_graded": False},
+                {"question_type": "true_false", "is_correct": True, "self_graded": False},
+                {"question_type": "true_false", "is_correct": True, "self_graded": False},
+                # Both self-graded answers recorded as wrong -- nothing to
+                # grade yet at the moment Submit fires, exactly the bug.
+                {
+                    "question_id": q1_id, "bloom_level": "apply",
+                    "question_type": "short_answer", "is_correct": False, "self_graded": True
+                },
+                {
+                    "question_id": q2_id, "bloom_level": "create",
+                    "question_type": "long_answer", "is_correct": False, "self_graded": True
+                },
+            ]
+        }
+    )
+    assert res.status_code == 200, res.text
+    attempt_id = res.json()["attempt_id"]
+    assert res.json()["correct"] == 4
+    assert res.json()["total"] == 6
+
+    r1 = client.patch(
+        f"/analytics/quiz-attempts/{attempt_id}/answers", headers=headers,
+        json={"question_id": q1_id, "is_correct": True}
+    )
+    assert r1.status_code == 200, r1.text
+    assert r1.json() == {"attempt_id": attempt_id, "correct": 5, "total": 6}
+
+    r2 = client.patch(
+        f"/analytics/quiz-attempts/{attempt_id}/answers", headers=headers,
+        json={"question_id": q2_id, "is_correct": True}
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json() == {"attempt_id": attempt_id, "correct": 6, "total": 6}
+
+    # /analytics/summary (score + accuracy by level, both read straight
+    # from these rows) reflects the corrected 6/6 = 100%, not the
+    # original 4/6 = 66.7%.
+    summary = client.get("/analytics/summary", headers=headers, params={"days": 30}).json()
+    this_attempt = next(a for a in summary["recent_attempts"] if a["topic"] == "regrade_after_submit")
+    assert this_attempt["correct"] == 6
+    assert this_attempt["total"] == 6
+    assert this_attempt["pct"] == 100.0
+    assert summary["accuracy_by_level"]["apply"]["correct"] >= 1
+    assert summary["accuracy_by_level"]["create"]["correct"] >= 1
+
+
+def test_quiz_attempt_regrade_rejects_invalid_requests(client, phase6a_headers, phase6a_other_headers):
+    headers = phase6a_headers
+    user_id = _user_id("phase6a_test_user")
+
+    db = TestSessionLocal()
+    try:
+        auto_graded_q = main.Question(
+            user_id=user_id, topic="regrade_invalid", type="mcq", bloom_level="remember",
+            question="Pick one.", correct_answer="A", explanation="E",
+        )
+        db.add(auto_graded_q)
+        db.commit()
+        auto_graded_q_id = auto_graded_q.id
+    finally:
+        db.close()
+
+    main.limiter.reset()
+    res = client.post(
+        "/analytics/quiz-attempts", headers=headers,
+        json={
+            "topic": "regrade_invalid",
+            "answers": [
+                {
+                    "question_id": auto_graded_q_id, "bloom_level": "remember",
+                    "question_type": "mcq", "is_correct": True, "self_graded": False
+                },
+            ]
+        }
+    )
+    assert res.status_code == 200, res.text
+    attempt_id = res.json()["attempt_id"]
+
+    # Not self-graded -- can't be regraded after the fact.
+    not_self_graded = client.patch(
+        f"/analytics/quiz-attempts/{attempt_id}/answers", headers=headers,
+        json={"question_id": auto_graded_q_id, "is_correct": False}
+    )
+    assert not_self_graded.status_code == 400
+
+    # No answer for that question_id in this attempt.
+    no_such_answer = client.patch(
+        f"/analytics/quiz-attempts/{attempt_id}/answers", headers=headers,
+        json={"question_id": 999999, "is_correct": True}
+    )
+    assert no_such_answer.status_code == 404
+
+    # No such attempt at all.
+    no_such_attempt = client.patch(
+        "/analytics/quiz-attempts/999999/answers", headers=headers,
+        json={"question_id": auto_graded_q_id, "is_correct": True}
+    )
+    assert no_such_attempt.status_code == 404
+
+    # Someone else's attempt -- not visible/editable to this user.
+    other_users_attempt = client.patch(
+        f"/analytics/quiz-attempts/{attempt_id}/answers", headers=phase6a_other_headers,
+        json={"question_id": auto_graded_q_id, "is_correct": True}
+    )
+    assert other_users_attempt.status_code == 404
 
 
 def test_quiz_attempt_validates_answer_count_and_fields(client, phase6a_headers):

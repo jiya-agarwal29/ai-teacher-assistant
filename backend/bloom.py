@@ -98,11 +98,19 @@ LEVELS = (
             "outline", "report", "infer", "give an example",
             "in your own words", "what does it mean"
         ),
-        question_types=("mcq", "short_answer", "true_false"),
+        # Fix round 4, item 3: true_false removed -- a true/false question can
+        # only ever ask the student to CONFIRM or DENY a statement, which is
+        # recognition (Remember), not genuine explanation/interpretation.
+        # Keeping it here produced true/false pairs at Remember and Understand
+        # that were really the same reworded fact (near-duplicates).
+        question_types=("mcq", "short_answer"),
         prompt_rules=(
             "Ask the student to explain, summarize, or restate an idea from the "
             "sources in their own words, without giving them the exact wording "
-            "to copy. " + SHARED_SOURCE_CONSTRAINT
+            "to copy. The question must require genuine explanation or "
+            "interpretation -- it must NOT be answerable by simply confirming "
+            "or denying a reworded definition/statement (that is only "
+            "Remember in disguise). " + SHARED_SOURCE_CONSTRAINT
         ),
     ),
     BloomLevel(

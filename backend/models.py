@@ -170,6 +170,15 @@ class Question(Base):
     marks = Column(Integer, nullable=True)
     marking_scheme = Column(Text, nullable=True)
 
+    # Fix round 4, item 6: set (not a FK constraint -- the question it
+    # points at can be deleted independently) when this question was
+    # found to be a near-duplicate of one already in the user's Bank at
+    # save time, so a paper never ends up picking two versions of the
+    # same question. Marked, never skipped -- the AI call that wrote it
+    # already happened, so it's kept and simply flagged for the teacher
+    # to review instead of being silently discarded.
+    duplicate_of_id = Column(Integer, nullable=True)
+
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
 

@@ -164,6 +164,16 @@ function QuestionRow({ item, bloomLevels, onUpdated, onDeleted }) {
                 Flagged
               </span>
             )}
+            {/* Fix round 4, item 6: marked (not skipped) at save time when
+                it's a near-duplicate of a question already in the bank. */}
+            {item.duplicate_of_id && (
+              <span
+                title={`Looks like a near-duplicate of question #${item.duplicate_of_id}`}
+                className="px-2 py-0.5 rounded-full text-[9px] font-bold bg-orange-500/10 text-orange-600 dark:text-orange-400"
+              >
+                Possible duplicate
+              </span>
+            )}
             <span className="text-[9px] font-semibold text-slate-400 dark:text-slate-500">{originLabel(item)}</span>
           </div>
           <p className="text-xs font-semibold text-slate-800 dark:text-white">{item.question}</p>
@@ -313,10 +323,31 @@ export default function QuestionBank() {
   const [summaryError, setSummaryError] = useState('');
 
   const [selectedLevels, setSelectedLevels] = useState([]);
+  // Fix round 4, item 7: type chips and a document dropdown, combinable
+  // with the level/flagged/source/topic filters already here.
+  const [selectedTypes, setSelectedTypes] = useState([]);
+  const [selectedBookId, setSelectedBookId] = useState('');
   const [flaggedOnly, setFlaggedOnly] = useState(false);
   const [sourceFilter, setSourceFilter] = useState('');
   const [topicInput, setTopicInput] = useState('');
   const [debouncedTopic, setDebouncedTopic] = useState('');
+
+  // Only the user's own documents, for the filter dropdown -- a failure
+  // here just means that one filter has nothing to offer, not a
+  // page-level error, so it's swallowed rather than surfaced.
+  const [books, setBooks] = useState([]);
+  useEffect(() => {
+    let ignore = false;
+    (async () => {
+      try {
+        const data = await api.books.getAll();
+        if (!ignore) setBooks(data || []);
+      } catch {
+        // Ignored -- see comment above.
+      }
+    })();
+    return () => { ignore = true; };
+  }, []);
 
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
@@ -326,6 +357,20 @@ export default function QuestionBank() {
 
   const [deletingUnused, setDeletingUnused] = useState(false);
   const [deleteUnusedError, setDeleteUnusedError] = useState('');
+
+  // Shared by the refetch-on-filter-change effect, "load more", and
+  // "delete unused" below, instead of repeating the same six `if`s three
+  // times over.
+  const buildFilterParams = useCallback((offset) => {
+    const params = { limit: PAGE_SIZE, offset };
+    if (selectedLevels.length > 0) params.level = selectedLevels;
+    if (selectedTypes.length > 0) params.type = selectedTypes;
+    if (selectedBookId) params.bookId = selectedBookId;
+    if (flaggedOnly) params.check = 'flagged';
+    if (sourceFilter) params.source = sourceFilter;
+    if (debouncedTopic) params.topic = debouncedTopic;
+    return params;
+  }, [selectedLevels, selectedTypes, selectedBookId, flaggedOnly, sourceFilter, debouncedTopic]);
 
   const refreshSummary = useCallback(() => {
     api.questions.summary()
@@ -353,13 +398,7 @@ export default function QuestionBank() {
   useEffect(() => {
     let cancelled = false;
 
-    const params = { limit: PAGE_SIZE, offset: 0 };
-    if (selectedLevels.length > 0) params.level = selectedLevels;
-    if (flaggedOnly) params.check = 'flagged';
-    if (sourceFilter) params.source = sourceFilter;
-    if (debouncedTopic) params.topic = debouncedTopic;
-
-    api.questions.list(params)
+    api.questions.list(buildFilterParams(0))
       .then((data) => {
         if (cancelled) return;
         setItems(data.items);
@@ -375,18 +414,13 @@ export default function QuestionBank() {
     return () => {
       cancelled = true;
     };
-  }, [selectedLevels, flaggedOnly, sourceFilter, debouncedTopic]);
+  }, [buildFilterParams]);
 
   const handleLoadMore = async () => {
     setLoadingMore(true);
     setError('');
     try {
-      const params = { limit: PAGE_SIZE, offset: items.length };
-      if (selectedLevels.length > 0) params.level = selectedLevels;
-      if (flaggedOnly) params.check = 'flagged';
-      if (sourceFilter) params.source = sourceFilter;
-      if (debouncedTopic) params.topic = debouncedTopic;
-      const data = await api.questions.list(params);
+      const data = await api.questions.list(buildFilterParams(items.length));
       setItems((prev) => [...prev, ...data.items]);
       setTotal(data.total);
     } catch (err) {
@@ -398,6 +432,18 @@ export default function QuestionBank() {
 
   const toggleLevelFilter = (key) => {
     setSelectedLevels((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+    setLoading(true);
+    setError('');
+  };
+
+  const toggleTypeFilter = (key) => {
+    setSelectedTypes((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+    setLoading(true);
+    setError('');
+  };
+
+  const handleBookFilterChange = (e) => {
+    setSelectedBookId(e.target.value);
     setLoading(true);
     setError('');
   };
@@ -415,12 +461,7 @@ export default function QuestionBank() {
     try {
       const { deleted } = await api.questions.deleteUnused();
       setLoading(true);
-      const params = { limit: PAGE_SIZE, offset: 0 };
-      if (selectedLevels.length > 0) params.level = selectedLevels;
-      if (flaggedOnly) params.check = 'flagged';
-      if (sourceFilter) params.source = sourceFilter;
-      if (debouncedTopic) params.topic = debouncedTopic;
-      const data = await api.questions.list(params);
+      const data = await api.questions.list(buildFilterParams(0));
       setItems(data.items);
       setTotal(data.total);
       refreshSummary();
@@ -561,16 +602,49 @@ export default function QuestionBank() {
           ))}
         </div>
 
+        {/* Fix round 4, item 7: type chips, combinable with every other
+            filter here. */}
+        <div className="flex flex-wrap gap-2">
+          {Object.entries(TYPE_LABELS).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => toggleTypeFilter(key)}
+              className={`px-3 py-1.5 rounded-full text-[10px] font-bold border transition-all ${
+                selectedTypes.includes(key)
+                  ? 'bg-indigo-600 text-white border-indigo-600'
+                  : 'border-slate-200 dark:border-slate-800 text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/30'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
         <div className="flex items-center justify-between gap-3 flex-wrap">
-          <div className="relative max-w-sm flex-1 min-w-50">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-            <input
-              type="text"
-              placeholder="Search by topic..."
-              value={topicInput}
-              onChange={handleTopicInputChange}
-              className="w-full pl-9 pr-4 py-2.5 rounded-xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
-            />
+          <div className="flex items-center gap-3 flex-1 flex-wrap">
+            <div className="relative max-w-sm flex-1 min-w-50">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                placeholder="Search by topic..."
+                value={topicInput}
+                onChange={handleTopicInputChange}
+                className="w-full pl-9 pr-4 py-2.5 rounded-xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
+              />
+            </div>
+            {/* Fix round 4, item 7: a document dropdown, combinable with
+                every other filter here. */}
+            <select
+              value={selectedBookId}
+              onChange={handleBookFilterChange}
+              className="px-3 py-2.5 rounded-xl text-[11px] bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all max-w-[200px]"
+            >
+              <option value="">All documents</option>
+              {books.map((book) => (
+                <option key={book.id} value={book.id}>{book.name}</option>
+              ))}
+            </select>
           </div>
           <button
             type="button"
