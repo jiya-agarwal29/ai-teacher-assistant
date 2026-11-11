@@ -3,6 +3,7 @@ import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { api } from '../services/api';
 import { useDraftPersistence } from '../hooks/useDraftPersistence';
 import { setNavigationGuard, clearNavigationGuard } from '../utils/navigationGuard';
+import { shouldRereadAfterRotate } from './documentReviewRotate';
 import {
   ArrowLeft,
   ZoomIn,
@@ -453,11 +454,20 @@ export default function DocumentReview() {
         URL.revokeObjectURL(freshUrl); // the user navigated away while this was in flight
       }
 
-      // No confirmation popup here -- rotating a page always invalidates
-      // its existing transcription (it was read in the old orientation),
-      // so a fresh OCR pass always runs right after, same as the
-      // "Re-read page" button's own call to performReread.
-      await performReread(pageNumber);
+      // Rotating always invalidates the existing transcription (it was
+      // read in the old orientation), so an unedited page just re-reads
+      // automatically -- no popup. But if the teacher has already edited
+      // this page's text, a silent re-read would throw those edits away,
+      // so this is the one case that still asks first; Cancel means
+      // "rotate only" -- the image stays rotated, the edited text stays
+      // exactly as the teacher left it.
+      if (shouldRereadAfterRotate({
+        isDirty,
+        alreadyEdited: editedPageNumbersRef.current.has(pageNumber),
+        confirmFn: window.confirm,
+      })) {
+        await performReread(pageNumber);
+      }
     } catch (err) {
       setActionError(err.message || 'Failed to rotate this page.');
     } finally {

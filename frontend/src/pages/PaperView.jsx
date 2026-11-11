@@ -19,6 +19,7 @@ import {
 import { api } from '../services/api';
 import useBloomLevels from '../hooks/useBloomLevels';
 import BloomBadge from '../components/BloomBadge';
+import MarkdownRenderer from '../components/MarkdownRenderer';
 import BlueprintPanel from '../components/BlueprintPanel';
 import QuestionsToReview from '../components/QuestionsToReview';
 import PaperPlanPreview from '../components/PaperPlanPreview';
@@ -153,7 +154,7 @@ function SwapDialog({ paperId, slot, onClose, onSwapped }) {
                       <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500">{c.marks} marks</span>
                     )}
                   </div>
-                  <p className="text-[11px] font-semibold text-slate-700 dark:text-slate-200">{c.question}</p>
+                  <MarkdownRenderer content={c.question} className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 [&>p]:text-[11px] [&>p]:font-semibold [&>p]:my-0" />
                   {c.source && (
                     <p className="text-[9px] text-slate-400 dark:text-slate-500">
                       {c.source.book_name}{c.source.page_number != null ? `, p.${c.source.page_number}` : ''}
@@ -325,17 +326,20 @@ function QuestionSlot({ slot, option, paperId, teacherView, bloomLevelsByKey, on
     <div id={`paper-slot-${slot.id}`} className="space-y-2 scroll-mt-24">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
-          <p className="text-sm text-slate-800 dark:text-slate-100 leading-relaxed">
-            {label && <span className="font-bold">{label} </span>}
-            {editing ? null : q.question}
-          </p>
+          <div className="text-sm text-slate-800 dark:text-slate-100 leading-relaxed flex items-start gap-1">
+            {label && <span className="font-bold shrink-0">{label}</span>}
+            {!editing && (
+              <MarkdownRenderer content={q.question} className="[&>p]:text-sm [&>p]:text-slate-800 dark:[&>p]:text-slate-100 [&>p]:my-0 [&>p]:leading-relaxed" />
+            )}
+          </div>
 
           {!editing && q.options && q.options.length > 0 && (
             <div className="mt-2 space-y-1 pl-1">
               {q.options.map((opt, idx) => (
-                <p key={idx} className="text-[13px] text-slate-600 dark:text-slate-300">
-                  {(['A', 'B', 'C', 'D'][idx] || '')}. {opt}
-                </p>
+                <div key={idx} className="flex items-start gap-1 text-[13px] text-slate-600 dark:text-slate-300">
+                  <span className="shrink-0">{(['A', 'B', 'C', 'D'][idx] || '')}.</span>
+                  <MarkdownRenderer content={opt} className="[&>p]:text-[13px] [&>p]:text-slate-600 dark:[&>p]:text-slate-300 [&>p]:my-0" />
+                </div>
               ))}
             </div>
           )}
@@ -366,16 +370,20 @@ function QuestionSlot({ slot, option, paperId, teacherView, bloomLevelsByKey, on
             </p>
           )}
 
-          <p className="text-[11px] text-slate-500 dark:text-slate-400">
-            <span className="font-bold text-slate-600 dark:text-slate-300">Answer:</span> {q.correct_answer}
-          </p>
+          <div className="text-[11px] text-slate-500 dark:text-slate-400 flex items-start gap-1">
+            <span className="font-bold text-slate-600 dark:text-slate-300 shrink-0">Answer:</span>
+            <MarkdownRenderer content={q.correct_answer} className="[&>p]:text-[11px] [&>p]:text-slate-500 dark:[&>p]:text-slate-400 [&>p]:my-0" />
+          </div>
 
           {q.marking_scheme && q.marking_scheme.length > 0 && (
             <div className="text-[11px] text-slate-500 dark:text-slate-400">
               <span className="font-bold text-slate-600 dark:text-slate-300">Marking scheme:</span>
               <ul className="list-disc pl-5 mt-0.5 space-y-0.5">
                 {q.marking_scheme.map((pt, idx) => (
-                  <li key={idx}>{pt.point} <span className="font-bold">({pt.marks})</span></li>
+                  <li key={idx} className="flex items-start gap-1">
+                    <MarkdownRenderer content={pt.point} className="[&>p]:text-[11px] [&>p]:text-slate-500 dark:[&>p]:text-slate-400 [&>p]:my-0" />
+                    <span className="font-bold shrink-0">({pt.marks})</span>
+                  </li>
                 ))}
               </ul>
             </div>

@@ -469,7 +469,7 @@ def test_chat_llm_reports_not_enough_information(client, llm_mock_headers, monke
     res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
     assert res.status_code == 200
     data = res.json()
-    assert data["answer"] == "The uploaded documents do not contain enough information for this question."
+    assert data["answer"] == main.NOT_ENOUGH_INFO_ANSWER
     assert data["sources"] == []
 
     client.delete(f"/books/{book_id}", headers=headers)
@@ -489,6 +489,262 @@ def test_chat_returns_503_on_llm_unavailable(client, llm_mock_headers, monkeypat
     res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
     assert res.status_code == 503
     assert res.json()["detail"] == "AI service is busy. Please try again in a minute."
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+# --- Fix round 2, item 10: friendlier refusal wording ---
+def test_not_enough_info_answer_is_friendlier_than_old_flat_refusal():
+    assert main.NOT_ENOUGH_INFO_ANSWER == "I couldn't find this in your documents. Try uploading notes that cover it."
+
+
+# --- Fix round 2, item 9: only show sources the answer actually cites ---
+def test_chat_only_shows_sources_actually_cited_in_the_answer(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    bees_book_id = _upload_bees_doc(client, headers, "chat_cited_bees.txt")
+
+    other_res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": (
+            "unrelated_subject.txt",
+            b"Relational databases use primary and foreign keys for integrity.",
+            "text/plain"
+        )}
+    )
+    assert other_res.status_code == 202
+    other_book_id = other_res.json()["book_id"]
+
+    db = TestSessionLocal()
+    try:
+        bees_page = db.query(Page).filter(Page.book_id == bees_book_id).first()
+        other_page = db.query(Page).filter(Page.book_id == other_book_id).first()
+    finally:
+        db.close()
+
+    # Simulates retrieval returning a strong match AND a weak, unrelated
+    # match that passed the similarity threshold but isn't really about
+    # the question (row 5: "NS pages under a PCB question").
+    monkeypatch.setattr(main, "retrieve", lambda *a, **kw: [(0.9, bees_page), (0.58, other_page)])
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+
+    assert len(data["sources"]) == 1
+    assert data["sources"][0]["book_name"] == "chat_cited_bees.txt"
+
+    client.delete(f"/books/{bees_book_id}", headers=headers)
+    client.delete(f"/books/{other_book_id}", headers=headers)
+
+
+def test_chat_falls_back_to_showing_all_sources_when_answer_has_no_citations(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_no_citation_bees.txt")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate many flowering plants.")
+
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["answer"] == "Bees pollinate many flowering plants."
+    assert len(data["sources"]) == 1
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+# --- Fix round 2, item 7: a long, multi-part question is retrieved part by part ---
+def test_chat_multi_part_question_merges_sources_and_notes_uncovered_part(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+
+    fw_res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": (
+            "firewalls.txt", b"The firewall inspects traffic entering the network perimeter.", "text/plain"
+        )}
+    )
+    assert fw_res.status_code == 202
+    fw_book_id = fw_res.json()["book_id"]
+
+    enc_res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": (
+            "encryption.txt", b"Encryption scrambles data using a shared secret key.", "text/plain"
+        )}
+    )
+    assert enc_res.status_code == 202
+    enc_book_id = enc_res.json()["book_id"]
+
+    db = TestSessionLocal()
+    try:
+        fw_page = db.query(Page).filter(Page.book_id == fw_book_id).first()
+        enc_page = db.query(Page).filter(Page.book_id == enc_book_id).first()
+    finally:
+        db.close()
+
+    def fake_retrieve(db_arg, user_id, query, top_k=3, apply_threshold=True):
+        q = query.lower()
+        if "firewall" in q:
+            return [(0.9, fw_page)]
+        if "encryption" in q:
+            return [(0.9, enc_page)]
+        return []  # the "subnetting" part: nothing relevant found for it
+
+    monkeypatch.setattr(main, "retrieve", fake_retrieve)
+
+    captured = {}
+
+    def fake_generate(prompt, system=None, temperature=0.3, max_tokens=1024):
+        captured["prompt"] = prompt
+        return (
+            "Firewalls filter traffic entering the network [1]. Encryption "
+            "scrambles data with a shared key [2]. Subnetting is not "
+            "covered in your uploaded documents."
+        )
+
+    monkeypatch.setattr(llm_module, "generate", fake_generate)
+
+    question = "1) Explain firewalls. 2) Explain encryption. 3) Explain subnetting."
+    res = client.post("/chat", headers=headers, json={"question": question})
+    assert res.status_code == 200, res.text
+    data = res.json()
+
+    assert "not covered" in data["answer"]
+    assert len(data["sources"]) == 2
+    assert {s["book_name"] for s in data["sources"]} == {"firewalls.txt", "encryption.txt"}
+
+    # The model was told which part had no matching sources, and to
+    # answer the other two parts anyway rather than refuse everything.
+    assert "multiple distinct parts" in captured["prompt"]
+    assert "subnetting" in captured["prompt"].lower()
+
+    client.delete(f"/books/{fw_book_id}", headers=headers)
+    client.delete(f"/books/{enc_book_id}", headers=headers)
+
+
+def test_chat_multi_part_question_refuses_completely_when_no_part_has_sources(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_multi_none_bees.txt")
+
+    monkeypatch.setattr(main, "retrieve", lambda *a, **kw: [])
+
+    def _forbid_generate(*a, **kw):
+        raise AssertionError("llm.generate must not be called when no part found any relevant sources")
+
+    monkeypatch.setattr(llm_module, "generate", _forbid_generate)
+
+    question = "1) Explain quantum computing basics. 2) Explain blockchain consensus."
+    res = client.post("/chat", headers=headers, json={"question": question})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["answer"] == main.NOT_ENOUGH_INFO_ANSWER
+    assert data["sources"] == []
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+# --- Fix round 2, item 4 (backend half): tell the AI to write maths as
+# plain text (n, x + 1, 2^6), not LaTeX/"$...$" -- the frontend's
+# stripMathDelimiters is only a fallback for whatever slips through. ---
+def test_math_plain_text_rule_is_in_chat_system_instruction():
+    assert main.MATH_PLAIN_TEXT_RULE in main.CHAT_SYSTEM_INSTRUCTION
+
+
+def test_math_plain_text_rule_is_in_quiz_prompt_rules():
+    assert main.MATH_PLAIN_TEXT_RULE in main.QUIZ_PROMPT_RULES
+
+
+def test_math_plain_text_rule_reaches_summarize_prompt(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    captured = {}
+
+    def fake_generate_json(prompt, schema, system=None):
+        captured["prompt"] = prompt
+        return {"bullets": ["Point one."]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post(
+        "/tools/summarize", headers=headers,
+        json={"text": "Some pasted paragraph about photosynthesis and plant biology."}
+    )
+    assert res.status_code == 200
+    assert main.MATH_PLAIN_TEXT_RULE in captured["prompt"]
+
+
+def test_math_plain_text_rule_reaches_flashcards_prompt(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "flash_math_bees.txt")
+    captured = {}
+
+    def fake_generate_json(prompt, schema, system=None):
+        captured["prompt"] = prompt
+        return {"cards": []}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post("/tools/flashcards", headers=headers, json={"topic": "bees"})
+    assert res.status_code == 200
+    assert main.MATH_PLAIN_TEXT_RULE in captured["prompt"]
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+# --- Fix round 2, item 13 (backend half): time each chat step so a slow
+# answer can be explained from Render logs, without logging the question
+# itself or anything from the documents. ---
+def test_chat_logs_retrieval_and_generate_timing_without_leaking_question_text(
+    client, llm_mock_headers, monkeypatch, caplog
+):
+    import llm as llm_module
+    import logging as logging_module
+
+    headers = llm_mock_headers
+    secret_marker = "SuperSecretQuestionMarkerXYZ"
+    book_id = _upload_bees_doc(client, headers, "chat_timing_bees.txt")
+
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+
+    with caplog.at_level(logging_module.INFO, logger="main"):
+        res = client.get(
+            "/chat", headers=headers,
+            params={"question": f"What do bees do? {secret_marker}"}
+        )
+    assert res.status_code == 200, res.text
+
+    timing_logs = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Chat answer")]
+    assert any("retrieval=" in msg and "generate=" in msg for msg in timing_logs)
+    assert all(secret_marker not in r.getMessage() for r in caplog.records)
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_chat_logs_timing_on_refusal_too(client, llm_mock_headers, monkeypatch, caplog):
+    import logging as logging_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_timing_refusal_bees.txt")
+
+    monkeypatch.setattr(main, "retrieve", lambda *a, **kw: [])
+
+    with caplog.at_level(logging_module.INFO, logger="main"):
+        res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+
+    timing_logs = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Chat answer refused")]
+    assert any("retrieval=" in msg for msg in timing_logs)
 
     client.delete(f"/books/{book_id}", headers=headers)
 
@@ -4804,7 +5060,7 @@ def test_chat_not_enough_info_saves_turn_and_logs_unanswered_query(client, llm_m
         json={"question": "What do bees do?", "conversation_id": conv["id"]}
     )
     assert res.status_code == 200, res.text
-    no_info_answer = "The uploaded documents do not contain enough information for this question."
+    no_info_answer = main.NOT_ENOUGH_INFO_ANSWER
     assert res.json()["answer"] == no_info_answer
 
     detail = client.get(f"/conversations/{conv['id']}", headers=headers).json()

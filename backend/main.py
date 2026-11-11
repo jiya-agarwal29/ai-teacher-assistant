@@ -42,7 +42,11 @@ from rag import (
     clean_pdf_text_for_quiz,
     clean_extracted_text
 )
-from retrieval import retrieve, invalidate_cache, user_has_documents, user_has_any_books, needs_reembedding
+from retrieval import (
+    retrieve, invalidate_cache, user_has_documents, user_has_any_books,
+    needs_reembedding, expand_with_neighbor_chunks
+)
+from chat_utils import split_question_parts
 
 import database
 from database import ENV, get_db
@@ -377,6 +381,23 @@ AI_BUSY_DETAIL = "AI service is busy. Please try again in a minute."
 
 PENDING_DOCUMENTS_MESSAGE = "Your documents are still being processed or waiting for review."
 
+# Fix round 2, item 10: friendlier than the old flat refusal -- tells the
+# teacher what to actually do about it. The model is still instructed (see
+# CHAT_SYSTEM_INSTRUCTION) to reply with the OLD exact phrase when it can't
+# answer -- that string is only ever used internally, to detect the
+# model's own refusal (see "do not contain enough information" check
+# below); this is the message a user actually sees.
+NOT_ENOUGH_INFO_ANSWER = "I couldn't find this in your documents. Try uploading notes that cover it."
+
+# Fix round 2, item 4: told to every prompt that generates text a student
+# will read, so maths comes out as plain characters a markdown renderer
+# won't mangle, instead of LaTeX-style "$...$" the frontend would otherwise
+# have to strip back out (see frontend's stripMathDelimiters fallback).
+MATH_PLAIN_TEXT_RULE = (
+    "Write any maths in plain text using ordinary characters (e.g. n, "
+    "x + 1, 2^6) -- never use LaTeX or '$...$' delimiters."
+)
+
 
 def _pending_documents_message_or_none(db: Session, user_id: int):
     """
@@ -395,7 +416,7 @@ CHAT_SYSTEM_INSTRUCTION = (
     "Cite sources inline like [1]. If the sources do not contain the answer, reply "
     "exactly: 'The uploaded documents do not contain enough information for this "
     "question.' Use short headings and bullet points where helpful. Explain simply "
-    "for students."
+    f"for students. {MATH_PLAIN_TEXT_RULE}"
 )
 
 SUMMARIZE_SCHEMA = {
@@ -525,7 +546,7 @@ QUIZ_PROMPT_RULES = (
     "underlying concept or scenario setup, even if worded differently. Every "
     "question needs a source_index (the number of the source chunk it's "
     "grounded in) and a bloom_level matching exactly the level it was written "
-    "for below."
+    f"for below. {MATH_PLAIN_TEXT_RULE}"
 )
 
 # A question's Bloom level is chosen when it's written (here, by the prompt
@@ -1923,6 +1944,31 @@ def semantic_search(
 # -----------------------------
 # AI CHAT
 # -----------------------------
+# Fix round 2, item 7: a multi-part question is retrieved in smaller
+# per-part batches (rather than top_k=5 for the whole thing at once) so
+# the merged total stays within the context limit even with several parts.
+_PART_TOP_K = 3
+_MAX_MERGED_SOURCES = 10
+
+_CITATION_PATTERN = re.compile(r'\[(\d+)\]')
+
+
+def _retrieve_relevant_pages(db: Session, user_id: int, text: str, top_k: int):
+    """
+    Shared per-question(-part) retrieval step used by both the single- and
+    multi-part paths below: get the top_k best matches above the relevance
+    threshold, then expand the single best one with its immediate
+    neighbor chunks (Fix round 2, item 8). Returns (pages, is_relevant) --
+    pages may be non-empty even when is_relevant is False (a weak,
+    irrelevant match), so callers must check is_relevant, not just pages.
+    """
+    pages = _retrieve_or_503(db, user_id, text, top_k=top_k, apply_threshold=True)
+    pages = expand_with_neighbor_chunks(db, pages)
+    context = " ".join(page.content for _, page in pages)
+    is_relevant = bool(pages) and check_context_relevance(text, context, pages[0][0])
+    return pages, is_relevant
+
+
 def _answer_question(question: str, current_user: User, db: Session, conversation_id: int = None):
     """
     Shared retrieval + grounded-answer pipeline used by both /chat and
@@ -1939,6 +1985,18 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
     Fix item 5 -- so /analytics/summary's queries/queries_answered totals
     agree with what was actually shown, and never on a 503 (no outcome to
     record yet).
+
+    Fix round 2, item 7: a long question covering several distinct topics
+    (split_question_parts) is retrieved separately FOR EACH PART, and the
+    unique chunks found are merged into one prompt -- rather than
+    embedding the whole question as a single query, which tends to match
+    nothing well enough to pass the relevance check even when every
+    individual part has an answer in the notes. Still only one extra LLM
+    call total (never one per part): the merge happens before generate()
+    is called, not after. Refuses completely only when NOT ONE part found
+    anything relevant; otherwise the model is told which parts (if any)
+    had no sources, and asked to say so plainly instead of refusing
+    everything.
     """
     pending_message = _pending_documents_message_or_none(db, current_user.id)
     if not user_has_documents(db, current_user.id):
@@ -1954,17 +2012,50 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
         _save_chat_turn(db, current_user.id, conversation_id, question, answer, [])
         return {"message": answer}
 
-    top_pages = _retrieve_or_503(db, current_user.id, question, top_k=5, apply_threshold=True)
+    parts = split_question_parts(question)
+    uncovered_parts = []
 
-    # Relevance checking using both cosine similarity and lexical overlap
-    temp_context = " ".join([page.content for _, page in top_pages])
-    if not top_pages or not check_context_relevance(question, temp_context, top_pages[0][0]):
+    # Fix round 2, item 13: timed (never logs the question/part text
+    # itself, or anything from the documents -- just how long each step
+    # took and how many parts/sources were involved) so a slow chat answer
+    # can be explained from Render logs afterward instead of guessed at.
+    retrieval_started_at = time.perf_counter()
+
+    if len(parts) == 1:
+        top_pages, is_relevant = _retrieve_relevant_pages(db, current_user.id, question, top_k=5)
+        if not is_relevant:
+            top_pages = []
+    else:
+        merged_pages = []
+        merged_ids = set()
+        for part in parts:
+            part_pages, part_is_relevant = _retrieve_relevant_pages(db, current_user.id, part, top_k=_PART_TOP_K)
+            if not part_is_relevant:
+                uncovered_parts.append(part)
+                continue
+            for score, page in part_pages:
+                if page.id in merged_ids:
+                    continue
+                merged_pages.append((score, page))
+                merged_ids.add(page.id)
+
+        merged_pages.sort(key=lambda scored_page: scored_page[0], reverse=True)
+        top_pages = merged_pages[:_MAX_MERGED_SOURCES]
+
+    retrieval_seconds = time.perf_counter() - retrieval_started_at
+
+    if not top_pages:
+        # Nothing relevant for the question (single-part) or for ANY of
+        # its parts (multi-part) -- refuse completely, same as before.
+        logger.info(
+            "Chat answer refused: parts=%d retrieval=%.2fs reason=not_enough_info",
+            len(parts), retrieval_seconds
+        )
         _log_activity(db, current_user.id, "query", meta={"answered": False, "reason": "not_enough_info"})
-        no_info_answer = "The uploaded documents do not contain enough information for this question."
-        _save_chat_turn(db, current_user.id, conversation_id, question, no_info_answer, [])
+        _save_chat_turn(db, current_user.id, conversation_id, question, NOT_ENOUGH_INFO_ANSWER, [])
         return {
             "question": question,
-            "answer": no_info_answer,
+            "answer": NOT_ENOUGH_INFO_ANSWER,
             "sources": []
         }
 
@@ -1993,23 +2084,64 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
         })
         numbered_sources.append(f"[{idx}] ({book.name}, page {page.page_number}): {page.content}")
 
-    prompt = f"Question: {question}\n\nSources:\n" + "\n\n".join(numbered_sources)
+    if len(parts) == 1:
+        prompt = f"Question: {question}\n\nSources:\n" + "\n\n".join(numbered_sources)
+    else:
+        prompt = (
+            f"Question (has multiple parts):\n{question}\n\n"
+            "This question has multiple distinct parts. Answer EVERY part "
+            "for which sources are given below, each under its own short "
+            "heading. If a part has no matching sources, say plainly that "
+            "specific part is not covered in the uploaded documents -- do "
+            "not refuse to answer the other parts just because of that.\n\n"
+        )
+        if uncovered_parts:
+            prompt += (
+                "These parts had no matching sources (say plainly that "
+                "each one is not covered):\n"
+                + "\n".join(f"- {part}" for part in uncovered_parts) + "\n\n"
+            )
+        prompt += "Sources:\n" + "\n\n".join(numbered_sources)
 
+    generate_started_at = time.perf_counter()
     try:
         answer = llm.generate(prompt, system=CHAT_SYSTEM_INSTRUCTION)
     except llm.LLMUnavailableError:
+        logger.warning(
+            "Chat answer failed: parts=%d sources=%d retrieval=%.2fs generate=%.2fs (LLM unavailable/rate-limited)",
+            len(parts), len(sources), retrieval_seconds, time.perf_counter() - generate_started_at
+        )
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+    generate_seconds = time.perf_counter() - generate_started_at
 
     if not answer or "do not contain enough information" in answer.lower():
+        logger.info(
+            "Chat answer refused: parts=%d sources=%d retrieval=%.2fs generate=%.2fs reason=not_enough_info",
+            len(parts), len(sources), retrieval_seconds, generate_seconds
+        )
         _log_activity(db, current_user.id, "query", meta={"answered": False, "reason": "not_enough_info"})
-        no_info_answer = "The uploaded documents do not contain enough information for this question."
-        _save_chat_turn(db, current_user.id, conversation_id, question, no_info_answer, [])
+        _save_chat_turn(db, current_user.id, conversation_id, question, NOT_ENOUGH_INFO_ANSWER, [])
         return {
             "question": question,
-            "answer": no_info_answer,
+            "answer": NOT_ENOUGH_INFO_ANSWER,
             "sources": []
         }
 
+    # Fix round 2, item 9: only show sources the answer actually cites --
+    # a weak match that passed the retrieval threshold (e.g. 56-60%, from
+    # an unrelated subject) but that the model never cited is dropped from
+    # what's shown, instead of listing every retrieved chunk regardless of
+    # whether the answer used it. Falls back to showing everything that
+    # passed the threshold if the model didn't cite anything recognizable
+    # (rather than showing nothing for a real answer).
+    cited_indices = {int(n) for n in _CITATION_PATTERN.findall(answer)}
+    if cited_indices:
+        sources = [source for idx, source in enumerate(sources, start=1) if idx in cited_indices]
+
+    logger.info(
+        "Chat answer: parts=%d sources=%d retrieval=%.2fs generate=%.2fs total=%.2fs",
+        len(parts), len(sources), retrieval_seconds, generate_seconds, retrieval_seconds + generate_seconds
+    )
     _log_activity(db, current_user.id, "query", meta={"answered": True})
     _save_chat_turn(db, current_user.id, conversation_id, question, answer, sources)
     return {
@@ -2087,7 +2219,7 @@ def summarize_notes(
         result = llm.generate_json(
             "Summarize the following text in 5 to 10 clear, concise bullet points. "
             "Use ONLY information from this text -- do not add anything that isn't "
-            f"there.\n\nText:\n{text}",
+            f"there. {MATH_PLAIN_TEXT_RULE}\n\nText:\n{text}",
             schema=SUMMARIZE_SCHEMA
         )
         bullets = result.get("bullets", []) if isinstance(result, dict) else []
@@ -2134,7 +2266,7 @@ def generate_flashcards(
             f"Based ONLY on the numbered source chunks below about '{topic}', create up "
             "to 10 flashcards. Each flashcard needs a short 'term', a 'definition' "
             "grounded only in the sources, and a 'source_index' -- the number of the "
-            f"chunk the definition came from.\n\nSources:\n{numbered_sources}",
+            f"chunk the definition came from. {MATH_PLAIN_TEXT_RULE}\n\nSources:\n{numbered_sources}",
             schema=FLASHCARDS_SCHEMA
         )
         raw_cards = result.get("cards", []) if isinstance(result, dict) else []

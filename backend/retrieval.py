@@ -167,3 +167,45 @@ def retrieve(
                 break
 
     return top_pages
+
+
+def expand_with_neighbor_chunks(
+    db: Session, top_pages: list[tuple[float, Page]]
+) -> list[tuple[float, Page]]:
+    """
+    Fix round 2, item 8: the single best-matching chunk sometimes only
+    covers part of the answer because the document's own text continues
+    into the next chunk (e.g. "...placed just behind the perimeter
+    firewall" ends one chunk, and the SPAN/mirror-port detail the retrieval
+    actually scored on starts the next). Pulls in the chunk immediately
+    before and after the TOP hit only -- not every retrieved chunk, so the
+    added context stays small -- by chunk_number within the same book
+    (chunk_number is assigned in document order when a book is indexed,
+    see jobs.py's _chunk_embed_and_save). A higher top_k was the other
+    option considered, but that pulls in more *unrelated* chunks too
+    (worsening item 9's "unrelated sources" problem); expanding only the
+    neighbors of the best hit targets the actual failure instead.
+
+    Neighbors are given a score just under the top hit's own score, so
+    they still sort below genuine matches. Already-selected pages (by id)
+    are never duplicated.
+    """
+    if not top_pages:
+        return top_pages
+
+    top_score, top_page = top_pages[0]
+    existing_ids = {page.id for _, page in top_pages}
+
+    neighbors = db.query(Page).filter(
+        Page.book_id == top_page.book_id,
+        Page.chunk_number.in_([top_page.chunk_number - 1, top_page.chunk_number + 1])
+    ).all()
+
+    expanded = list(top_pages)
+    for neighbor in neighbors:
+        if neighbor.id in existing_ids:
+            continue
+        expanded.append((top_score - 0.01, neighbor))
+        existing_ids.add(neighbor.id)
+
+    return expanded

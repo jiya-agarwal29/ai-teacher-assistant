@@ -1,8 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { api, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
-import { useDraftPersistence } from '../hooks/useDraftPersistence';
+import { api, PENDING_DOCUMENTS_MESSAGE, userScopedKey } from '../services/api';
 import MessageWithDocsLink from '../components/MessageWithDocsLink';
+import MarkdownRenderer from '../components/MarkdownRenderer';
+import { cleanSnippetText } from '../utils/textCleanup';
+import { draftKeyFor, shouldRetryChatError } from './chatHelpers';
 import {
   Send,
   Plus,
@@ -32,15 +34,26 @@ export default function Chat() {
   const [conversationsError, setConversationsError] = useState('');
 
   const [activeConvId, setActiveConvId] = useState(null);
-  const [activeTitle, setActiveTitle] = useState('New chat');
-  const [messages, setMessages] = useState([]);
+  // Fix round 2, item 12: messages are cached per conversation (not one
+  // flat array for "whatever's on screen"), so a question sent from a
+  // brand-new chat stays visible in THAT chat even if the teacher clicks
+  // "New Chat" or switches to another conversation while the answer is
+  // still loading in the background.
+  const [messagesByConv, setMessagesByConv] = useState({});
   const [loadingMessages, setLoadingMessages] = useState(false);
+
+  // Which conversation(s) currently have an answer loading in the
+  // background -- keyed by id, not a single global flag, for the same
+  // reason as messagesByConv above.
+  const [loadingConvIds, setLoadingConvIds] = useState(() => new Set());
+  // Per conversation: 'working' (shown after ~10s of silence) or 'busy'
+  // (the AI was rate-limited and is being retried) -- Fix round 2, item 13.
+  const [statusByConv, setStatusByConv] = useState({});
 
   const [renamingId, setRenamingId] = useState(null);
   const [renameValue, setRenameValue] = useState('');
 
   const [question, setQuestion] = useState('');
-  const [isTyping, setIsTyping] = useState(false);
   const [error, setError] = useState('');
 
   // Citations side panel
@@ -63,11 +76,52 @@ export default function Chat() {
     return () => { ignore = true; };
   }, []);
 
-  // Don't lose an unsent question to a session-expiry (or manual) logout --
-  // saved right before the token is cleared, restored once on the next
-  // visit. Phase 6C: the conversations themselves now live on the server;
-  // only this in-progress draft stays in localStorage.
-  useDraftPersistence('chat_draft_input', question, setQuestion);
+  // Fix round 2, item 11: restored once on mount (a page refresh, or
+  // coming back from another page -- this component unmounts on page
+  // navigation, so only something written to localStorage, not component
+  // state, survives that) and written back on every change -- not just on
+  // logout/unload like the old single, unkeyed draft slot did, since
+  // switching pages inside the app never fires beforeunload.
+  const draftsStorageKey = userScopedKey('chat_drafts_by_conversation');
+  const [draftsByConv, setDraftsByConv] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(draftsStorageKey)) || {};
+    } catch {
+      return {};
+    }
+  });
+  const draftsByConvRef = useRef(draftsByConv);
+  useEffect(() => {
+    draftsByConvRef.current = draftsByConv;
+    try {
+      localStorage.setItem(draftsStorageKey, JSON.stringify(draftsByConv));
+    } catch {
+      // Storage full/unavailable -- the draft just won't survive a
+      // refresh this time; nothing else depends on this write succeeding.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftsByConv]);
+
+  const setDraftForConv = (convId, text) => {
+    const key = draftKeyFor(convId);
+    setDraftsByConv((prev) => {
+      if (!text) {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return { ...prev, [key]: text };
+    });
+  };
+
+  // Lets an async handler check, once it resolves, whether the teacher is
+  // still even looking at the chat it was sent from -- `activeConvId`
+  // itself is captured stale inside a closure started before a navigation.
+  const activeConvIdRef = useRef(activeConvId);
+  useEffect(() => { activeConvIdRef.current = activeConvId; }, [activeConvId]);
+
+  const stillWorkingTimers = useRef({});
 
   const messagesEndRef = useRef(null);
 
@@ -86,19 +140,29 @@ export default function Chat() {
 
   const openConversation = useCallback(async (id) => {
     setActiveConvId(id);
+    setQuestion(draftsByConvRef.current[draftKeyFor(id)] || '');
     setError('');
+
+    if (loadingConvIds.has(id)) {
+      // An answer for this chat is still being generated in the
+      // background -- the server has nothing saved for it yet (it only
+      // saves once the answer is ready), so trust the local cache (the
+      // question, and the loading indicator) instead of refetching and
+      // briefly showing it as empty.
+      return;
+    }
+
     setLoadingMessages(true);
     try {
       const detail = await api.conversations.get(id);
-      setMessages(detail.messages);
-      setActiveTitle(detail.title);
+      setMessagesByConv((prev) => ({ ...prev, [id]: detail.messages }));
     } catch (err) {
       setError(err.message || 'Could not load this conversation.');
-      setMessages([]);
+      setMessagesByConv((prev) => ({ ...prev, [id]: [] }));
     } finally {
       setLoadingMessages(false);
     }
-  }, []);
+  }, [loadingConvIds]);
 
   // Load the conversation list once, from the server -- and open the most
   // recently active one automatically, the same "always something on
@@ -118,6 +182,17 @@ export default function Chat() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Memoized so the scroll effect below doesn't refire on every render
+  // just because an empty/new chat's fallback `[]` is a new array each time.
+  const messages = useMemo(
+    () => (activeConvId != null ? (messagesByConv[activeConvId] || []) : []),
+    [activeConvId, messagesByConv]
+  );
+  const isTyping = activeConvId != null && loadingConvIds.has(activeConvId);
+  const activeTitle = activeConvId == null
+    ? 'New chat'
+    : (conversations.find((c) => c.id === activeConvId)?.title ?? 'New chat');
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -128,8 +203,7 @@ export default function Chat() {
 
   const handleNewChat = () => {
     setActiveConvId(null);
-    setActiveTitle('New chat');
-    setMessages([]);
+    setQuestion(draftsByConvRef.current[draftKeyFor(null)] || '');
     setError('');
   };
 
@@ -140,6 +214,12 @@ export default function Chat() {
       await api.conversations.remove(id);
       const remaining = conversations.filter((c) => c.id !== id);
       setConversations(remaining);
+      setMessagesByConv((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setDraftForConv(id, '');
       if (activeConvId === id) {
         if (remaining.length > 0) {
           openConversation(remaining[0].id);
@@ -165,64 +245,122 @@ export default function Chat() {
     try {
       await api.conversations.rename(id, title);
       setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, title } : c)));
-      if (activeConvId === id) setActiveTitle(title);
     } catch (err) {
       setError(err.message || 'Could not rename this conversation.');
     }
   };
 
+  // Fix round 2, item 13: retries a rate-limited (503) chat request itself
+  // instead of surfacing a failure for something that usually succeeds a
+  // few seconds later -- the backend's own retry/backoff (llm.py) is what
+  // runs *within* one such attempt; this is the outer, whole-request retry
+  // for when even that gave up. Marks `convId` as "busy" so the UI can say
+  // so instead of just sitting there silently.
+  const sendChatWithRetry = async (queryText, convId) => {
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await api.chat.send(queryText, convId);
+      } catch (err) {
+        if (!shouldRetryChatError(err, attempt, maxAttempts)) throw err;
+        setStatusByConv((prev) => ({ ...prev, [convId]: 'busy' }));
+        await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+      }
+    }
+    return undefined; // unreachable -- the loop above always returns or throws
+  };
+
   const handleSendMessage = async (textToSend) => {
     const queryText = (textToSend || question).trim();
-    if (!queryText || isTyping) return;
+    const sendingConvId = activeConvId;
+    if (!queryText || (sendingConvId != null && loadingConvIds.has(sendingConvId))) return;
 
-    const isFirstMessage = messages.length === 0;
     const optimisticUserMessage = { role: 'user', content: queryText };
 
     setQuestion('');
+    setDraftForConv(sendingConvId, '');
     setError('');
-    setIsTyping(true);
-    setMessages((prev) => [...prev, optimisticUserMessage]);
 
-    let convId = activeConvId;
+    let convId = sendingConvId;
     let justCreated = false;
 
     try {
       // Conversations are created lazily, on the first message sent while
       // none is selected -- never on a plain page visit, so "New Chat"
-      // never litters the account with empty conversations.
+      // never litters the account with empty conversations. Fix round 2,
+      // item 12: created (and added to the sidebar) the moment the
+      // question is sent, not after the answer comes back -- so clicking
+      // "New Chat" (or any other chat) while this one is still loading
+      // doesn't hide the question; it's already saved under this chat's
+      // own id, independent of whatever conversation happens to be open.
       if (convId == null) {
         const created = await api.conversations.create();
         convId = created.id;
         justCreated = true;
         setActiveConvId(convId);
+        setConversations((prev) => [{ ...created, title: autoTitleFromQuestion(queryText) }, ...prev]);
       }
 
-      const res = await api.chat.send(queryText, convId);
+      setMessagesByConv((prev) => ({
+        ...prev,
+        [convId]: [...(prev[convId] || []), optimisticUserMessage],
+      }));
+      setLoadingConvIds((prev) => new Set(prev).add(convId));
+      stillWorkingTimers.current[convId] = setTimeout(() => {
+        setStatusByConv((prev) => (prev[convId] ? prev : { ...prev, [convId]: 'working' }));
+      }, 10000);
+
+      const res = await sendChatWithRetry(queryText, convId);
 
       const assistantMessage = {
         role: 'assistant',
         content: res.answer || res.message || 'No response returned.',
         sources: res.sources || []
       };
-      setMessages((prev) => [...prev, assistantMessage]);
+      setMessagesByConv((prev) => ({
+        ...prev,
+        [convId]: [...(prev[convId] || []), assistantMessage],
+      }));
 
-      if (isFirstMessage) {
-        setActiveTitle(autoTitleFromQuestion(queryText));
-      }
       refreshConversations();
     } catch (err) {
-      setError(err.message || 'Failed to get response from AI. Please make sure the backend is active.');
+      const stillOnThisChat = activeConvIdRef.current === convId;
+      if (stillOnThisChat) {
+        setError(err.message || 'Failed to get response from AI. Please make sure the backend is active.');
+      }
       // Roll back the optimistic message -- the server saved nothing
-      // either, on any answer error -- and hand the question back so it
-      // isn't lost.
-      setMessages((prev) => prev.filter((m) => m !== optimisticUserMessage));
-      setQuestion(queryText);
+      // either, on any answer error -- and hand the question back as a
+      // draft so it isn't lost.
+      setMessagesByConv((prev) => ({
+        ...prev,
+        [convId]: (prev[convId] || []).filter((m) => m !== optimisticUserMessage),
+      }));
+      setDraftForConv(sendingConvId, queryText);
+      if (stillOnThisChat) setQuestion(queryText);
       if (justCreated) {
-        setActiveConvId(null);
+        setConversations((prev) => prev.filter((c) => c.id !== convId));
+        setMessagesByConv((prev) => {
+          const next = { ...prev };
+          delete next[convId];
+          return next;
+        });
+        if (activeConvIdRef.current === convId) setActiveConvId(null);
         api.conversations.remove(convId).catch(() => {});
       }
     } finally {
-      setIsTyping(false);
+      clearTimeout(stillWorkingTimers.current[convId]);
+      delete stillWorkingTimers.current[convId];
+      setLoadingConvIds((prev) => {
+        const next = new Set(prev);
+        next.delete(convId);
+        return next;
+      });
+      setStatusByConv((prev) => {
+        if (!(convId in prev)) return prev;
+        const next = { ...prev };
+        delete next[convId];
+        return next;
+      });
     }
   };
 
@@ -232,159 +370,7 @@ export default function Chat() {
     setSelectedCitation(source);
   };
 
-  // Simple, high-fidelity markdown parser
-  const renderMessageContent = (content) => {
-    // 1. Split code blocks (which should remain preformatted blocks)
-    const blocks = content.split(/(```[\s\S]*?```)/g);
-
-    return blocks.map((block, blockIdx) => {
-      if (block.startsWith('```')) {
-        // Code Block
-        const match = block.match(/```(\w*)\n?([\s\S]*?)```/);
-        const lang = match ? match[1] : '';
-        const code = match ? match[2].trim() : block.replace(/```/g, '').trim();
-        return (
-          <div key={blockIdx} className="my-3 rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden">
-            {lang && (
-              <div className="bg-slate-100 dark:bg-slate-900 px-4 py-1.5 text-[9px] font-mono text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-800 flex justify-between items-center">
-                <span>{lang.toUpperCase()}</span>
-              </div>
-            )}
-            <pre className="p-4 bg-slate-950 text-slate-200 overflow-x-auto text-[11px] font-mono leading-relaxed">
-              <code>{code}</code>
-            </pre>
-          </div>
-        );
-      }
-
-      // 2. For non-code blocks, split into lines and parse block elements (headings, list items, paragraphs, horizontal rules)
-      const lines = block.split('\n');
-      const elements = [];
-      let currentList = null; // { type: 'ul' | 'ol', items: [] }
-
-      const flushList = (key) => {
-        if (currentList) {
-          const ListTag = currentList.type;
-          const listClass = currentList.type === 'ul' ? 'list-disc ml-5 my-2 space-y-1.5' : 'list-decimal ml-5 my-2 space-y-1.5';
-          elements.push(
-            <ListTag key={key} className={listClass}>
-              {currentList.items.map((item, idx) => (
-                <li key={idx} className="text-slate-700 dark:text-slate-200">
-                  {parseInline(item)}
-                </li>
-              ))}
-            </ListTag>
-          );
-          currentList = null;
-        }
-      };
-
-      // Inline formatter for bold, italic, inline code
-      const parseInline = (text) => {
-        if (!text) return '';
-        // Parse bold (**bold**) and inline code (`code`) and italic (*italic*)
-        const tokens = text.split(/(\*\*.*?\*\*|`.*?`|\*.*?\*)/g);
-        return tokens.map((token, tIdx) => {
-          if (token.startsWith('**') && token.endsWith('**')) {
-            return (
-              <strong key={tIdx} className="font-bold text-slate-900 dark:text-white">
-                {token.slice(2, -2)}
-              </strong>
-            );
-          }
-          if (token.startsWith('`') && token.endsWith('`')) {
-            return (
-              <code key={tIdx} className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-900/60 text-slate-800 dark:text-slate-200 font-mono text-[10px] border border-slate-200/30 dark:border-slate-800/60">
-                {token.slice(1, -1)}
-              </code>
-            );
-          }
-          if (token.startsWith('*') && token.endsWith('*')) {
-            return (
-              <em key={tIdx} className="italic text-slate-500 dark:text-slate-400">
-                {token.slice(1, -1)}
-              </em>
-            );
-          }
-          return token;
-        });
-      };
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const trimmed = line.trim();
-
-        // Horizontal Rule
-        if (trimmed === '---') {
-          flushList(`list-flush-${blockIdx}-${i}`);
-          elements.push(
-            <hr key={`hr-${blockIdx}-${i}`} className="my-4 border-slate-200 dark:border-slate-800/80" />
-          );
-          continue;
-        }
-
-        // Headings
-        if (trimmed.startsWith('#')) {
-          flushList(`list-flush-${blockIdx}-${i}`);
-          const match = trimmed.match(/^(#{1,6})\s+(.*)$/);
-          if (match) {
-            const level = match[1].length;
-            const headingText = match[2];
-            if (level === 1) {
-              elements.push(<h1 key={`h1-${blockIdx}-${i}`} className="text-base font-extrabold text-slate-900 dark:text-white mt-4 mb-2">{parseInline(headingText)}</h1>);
-            } else if (level === 2) {
-              elements.push(<h2 key={`h2-${blockIdx}-${i}`} className="text-sm font-bold text-slate-900 dark:text-white mt-3.5 mb-2">{parseInline(headingText)}</h2>);
-            } else if (level === 3) {
-              elements.push(<h3 key={`h3-${blockIdx}-${i}`} className="text-xs font-bold text-slate-900 dark:text-white mt-3 mb-1.5">{parseInline(headingText)}</h3>);
-            } else {
-              elements.push(<h4 key={`h4-${blockIdx}-${i}`} className="text-[11px] font-bold text-slate-800 dark:text-slate-200 mt-2.5 mb-1">{parseInline(headingText)}</h4>);
-            }
-            continue;
-          }
-        }
-
-        // Bullet Lists (- or * or • or +)
-        const bulletMatch = trimmed.match(/^[-*•+]\s+(.*)$/);
-        if (bulletMatch) {
-          if (!currentList || currentList.type !== 'ul') {
-            flushList(`list-flush-${blockIdx}-${i}`);
-            currentList = { type: 'ul', items: [] };
-          }
-          currentList.items.push(bulletMatch[1]);
-          continue;
-        }
-
-        // Numbered Lists (1. or 2. etc.)
-        const numberedMatch = trimmed.match(/^\d+[.)]\s+(.*)$/);
-        if (numberedMatch) {
-          if (!currentList || currentList.type !== 'ol') {
-            flushList(`list-flush-${blockIdx}-${i}`);
-            currentList = { type: 'ol', items: [] };
-          }
-          currentList.items.push(numberedMatch[1]);
-          continue;
-        }
-
-        // Empty line
-        if (trimmed === '') {
-          flushList(`list-flush-${blockIdx}-${i}`);
-          elements.push(<div key={`br-${blockIdx}-${i}`} className="h-2.5" />);
-          continue;
-        }
-
-        // Regular Paragraph text
-        flushList(`list-flush-${blockIdx}-${i}`);
-        elements.push(
-          <p key={`p-${blockIdx}-${i}`} className="my-1.5 text-slate-700 dark:text-slate-200 leading-relaxed text-xs">
-            {parseInline(line)}
-          </p>
-        );
-      }
-
-      flushList(`list-flush-final-${blockIdx}`);
-      return <div key={blockIdx} className="space-y-1">{elements}</div>;
-    });
-  };
+  const renderMessageContent = (content) => <MarkdownRenderer content={content} />;
 
   // Personalized welcome-screen suggestions, built from the user's own
   // ready (searchable) documents -- up to 2 documents x 2 question
@@ -584,13 +570,24 @@ export default function Chat() {
             </div>
           ))}
 
-          {/* Typing Indicator */}
+          {/* Typing Indicator -- Fix round 2, item 13: after ~10s of
+              silence this adds "Still working…", or "The AI is busy,
+              retrying…" instead if a rate limit is what's actually slowing
+              this one down, rather than a plain silent wait either way. */}
           {isTyping && (
             <div className="flex justify-start">
-              <div className="rounded-[24px] px-5 py-4 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-800 text-slate-400 flex items-center gap-1.5 shadow-sm">
-                <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
-                <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
-                <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+              <div className="rounded-[24px] px-5 py-4 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-800 text-slate-400 flex items-center gap-2 shadow-sm">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                  <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                  <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                </span>
+                {statusByConv[activeConvId] === 'busy' && (
+                  <span className="text-[10px] font-semibold text-amber-500">The AI is busy, retrying…</span>
+                )}
+                {statusByConv[activeConvId] === 'working' && (
+                  <span className="text-[10px] font-semibold text-slate-400">Still working…</span>
+                )}
               </div>
             </div>
           )}
@@ -617,7 +614,10 @@ export default function Chat() {
             <input
               type="text"
               value={question}
-              onChange={(e) => setQuestion(e.target.value)}
+              onChange={(e) => {
+                setQuestion(e.target.value);
+                setDraftForConv(activeConvId, e.target.value);
+              }}
               placeholder={isTyping ? 'Generating answer...' : 'Ask assistant about operating systems...'}
               disabled={isTyping}
               className="flex-1 bg-transparent border-none outline-none py-2 text-xs text-slate-800 dark:text-slate-100 placeholder-slate-400"
@@ -666,7 +666,9 @@ export default function Chat() {
               <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider block">Cited Context Text Segment</span>
 
               <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/30 text-[11px] leading-relaxed text-slate-600 dark:text-slate-300 whitespace-pre-wrap select-all border border-slate-200/30 dark:border-slate-800/50">
-                {selectedCitation?.content || "Exact context block could not be fetched, but the chunk reference is valid."}
+                {selectedCitation?.content
+                  ? cleanSnippetText(selectedCitation.content)
+                  : "Exact context block could not be fetched, but the chunk reference is valid."}
               </div>
             </div>
           </div>

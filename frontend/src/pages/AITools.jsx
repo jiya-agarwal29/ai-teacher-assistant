@@ -4,7 +4,9 @@ import { api, userScopedKey, PENDING_DOCUMENTS_MESSAGE } from '../services/api';
 import useBloomLevels from '../hooks/useBloomLevels';
 import { getBloomColor } from '../utils/bloomColors';
 import MessageWithDocsLink from '../components/MessageWithDocsLink';
+import MarkdownRenderer from '../components/MarkdownRenderer';
 import BloomBadge from '../components/BloomBadge';
+import { cleanSnippetText } from '../utils/textCleanup';
 import {
   Brain, 
   Search, 
@@ -902,7 +904,7 @@ export default function AITools() {
                                   <span className="font-bold text-slate-800 dark:text-slate-200">
                                     {isCorrect ? "✅ Correct" : `❌ Incorrect (Correct: Option ${q.correctAnswer})`}
                                   </span>
-                                  <p className="text-slate-500 dark:text-slate-400">{q.explanation}</p>
+                                  <MarkdownRenderer content={q.explanation} className="text-slate-500 dark:text-slate-400" />
                                 </div>
                               )}
 
@@ -915,7 +917,7 @@ export default function AITools() {
                                   <p className="text-slate-500 dark:text-slate-400">
                                     Your response: <span className="font-mono text-slate-800 dark:text-slate-200 bg-slate-200/50 dark:bg-slate-800/80 px-2 py-0.5 rounded font-bold">{fillBlankAnswers[q.id] || '(Empty)'}</span>
                                   </p>
-                                  <p className="text-slate-500 dark:text-slate-400">{q.explanation}</p>
+                                  <MarkdownRenderer content={q.explanation} className="text-slate-500 dark:text-slate-400" />
                                 </div>
                               )}
 
@@ -929,7 +931,7 @@ export default function AITools() {
                                     </div>
                                     <div className="pt-2 border-t border-slate-200/50 dark:border-slate-800/50">
                                       <span className="font-bold text-slate-800 dark:text-slate-200">🔍 Explanation:</span>
-                                      <p className="text-slate-500 dark:text-slate-400 mt-1">{q.explanation}</p>
+                                      <MarkdownRenderer content={q.explanation} className="text-slate-500 dark:text-slate-400 mt-1" />
                                     </div>
                                   </div>
 
@@ -1044,7 +1046,7 @@ export default function AITools() {
                         </div>
 
                         <p className="text-[11px] leading-relaxed text-slate-600 dark:text-slate-300 bg-slate-50/50 dark:bg-slate-950/20 p-4 rounded-xl border border-slate-200/20 whitespace-pre-wrap select-all font-sans">
-                          {res.content}
+                          {cleanSnippetText(res.content)}
                         </p>
 
                         <div className="flex gap-4 text-[9px] font-semibold text-slate-400 dark:text-slate-500">
@@ -1108,7 +1110,9 @@ export default function AITools() {
                   {summarizerResult.length > 0 ? (
                     <ul className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/20 text-xs text-slate-600 dark:text-slate-300 leading-relaxed border space-y-2 list-disc pl-8 font-sans">
                       {summarizerResult.map((bullet, idx) => (
-                        <li key={idx} className="select-all">{bullet}</li>
+                        <li key={idx} className="select-all">
+                          <MarkdownRenderer content={bullet} className="inline [&>p]:inline [&>p]:my-0" />
+                        </li>
                       ))}
                     </ul>
                   ) : (
@@ -1164,7 +1168,9 @@ export default function AITools() {
                         {/* Front Side */}
                         <div className="absolute inset-0 backface-hidden p-6 rounded-[28px] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col justify-between items-center group-hover:border-violet-500/30 transition-all duration-300">
                           <div className="text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">Concept Term</div>
-                          <h3 className="text-sm font-bold text-slate-800 dark:text-white px-2 break-all">{card.front}</h3>
+                          <div className="px-2 break-all">
+                            <MarkdownRenderer content={card.front} className="inline [&>p]:inline [&>p]:my-0 [&>p]:text-sm [&>p]:font-bold [&>p]:text-slate-800 dark:[&>p]:text-white" />
+                          </div>
                           <div className="text-[9px] font-semibold text-violet-500 flex items-center gap-1">
                             <span>Click to Flip</span>
                             <ChevronRight size={10} className="rotate-90" />
@@ -1174,7 +1180,9 @@ export default function AITools() {
                         {/* Back Side */}
                         <div className="absolute inset-0 backface-hidden rotate-y-180 p-6 rounded-[28px] bg-slate-950 text-white border border-slate-800 flex flex-col justify-between items-center">
                           <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Explanation</div>
-                          <p className="text-[11px] leading-relaxed text-slate-300 px-2 font-medium">{card.back}</p>
+                          <div className="px-2 overflow-y-auto max-h-24">
+                            <MarkdownRenderer content={card.back} className="text-[11px] leading-relaxed text-slate-300 font-medium [&>p]:text-slate-300 [&>p]:text-[11px]" />
+                          </div>
                           <div className="text-[9px] font-semibold text-violet-400">Click to Flip Back</div>
                         </div>
 
@@ -1219,8 +1227,10 @@ export default function AITools() {
                     <BookMarked size={14} className="text-violet-500 animate-pulse" />
                     AI Professor Explanation
                   </h4>
-                  <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/20 text-xs text-slate-600 dark:text-slate-300 leading-relaxed border whitespace-pre-wrap select-all font-sans">
-                    <MessageWithDocsLink message={tutorResult} />
+                  <div className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/20 text-xs text-slate-600 dark:text-slate-300 leading-relaxed border select-all font-sans">
+                    {tutorResult === PENDING_DOCUMENTS_MESSAGE
+                      ? <MessageWithDocsLink message={tutorResult} />
+                      : <MarkdownRenderer content={tutorResult} />}
                   </div>
                 </div>
               )}
