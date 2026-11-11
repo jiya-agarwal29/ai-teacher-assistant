@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import numpy as np
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -377,6 +378,22 @@ MAX_OCR_PAGES = int(get_env("MAX_OCR_PAGES", "50"))
 
 MAX_SUMMARIZE_CHARS = 20000
 
+# Fix round 3, item 4: under this many words, pasted text is too short to
+# meaningfully summarize -- rejected before any AI call, not after a
+# wasted (and often useless) one.
+MIN_SUMMARIZE_WORDS = 40
+
+# Fix round 3, item 3: a selected document longer than this (in
+# characters) is summarized in parts, then combined, rather than risking
+# one oversized prompt. A document that fits in one part costs exactly one
+# AI call, same as pasting text directly -- see _summarize_in_parts.
+DOCUMENT_SUMMARIZE_PART_CHARS = 12000
+
+# How many of a document's own chunks are kept when a topic/unit narrows
+# it (Fix round 3, item 3) -- generous enough to cover a real unit/chapter
+# without pulling in the whole book when only part of it was asked for.
+DOCUMENT_SUMMARIZE_TOPIC_TOP_K = 15
+
 AI_BUSY_DETAIL = "AI service is busy. Please try again in a minute."
 
 PENDING_DOCUMENTS_MESSAGE = "Your documents are still being processed or waiting for review."
@@ -418,6 +435,55 @@ CHAT_SYSTEM_INSTRUCTION = (
     "question.' Use short headings and bullet points where helpful. Explain simply "
     f"for students. {MATH_PLAIN_TEXT_RULE}"
 )
+
+# Fix round 3, item 1 (option B, decided by the teacher): unlike /chat and
+# /tools/quiz -- which stay strict, notes-only, via CHAT_SYSTEM_INSTRUCTION
+# and QUIZ_PROMPT_RULES, both unchanged -- the Tutor answers from the
+# student's notes first, but never flatly refuses just because the notes
+# don't cover the question. It always returns two clearly separate parts
+# instead (see TUTOR_RESPONSE_SCHEMA): grounded notes, and an optional,
+# visibly-labelled "general knowledge" addition.
+TUTOR_LEVEL_WORDING = {
+    "beginner": (
+        "Explain in simple, beginner-friendly terms. Avoid jargon, and "
+        "define any technical word you must use."
+    ),
+    "intermediate": (
+        "Explain at an intermediate level, assuming the student already "
+        "knows the basics of this subject."
+    ),
+    "advanced": (
+        "Explain at an advanced level, with full technical depth, precise "
+        "terminology, and step-by-step derivations or proofs where relevant."
+    ),
+}
+
+
+def _tutor_system_instruction(level: str) -> str:
+    depth = TUTOR_LEVEL_WORDING.get(level, TUTOR_LEVEL_WORDING[DEFAULT_TUTOR_LEVEL])
+    return (
+        "You are a patient AI tutor helping a student understand a topic. "
+        f"{depth} Respond with two separate parts. For 'from_notes': answer "
+        "using ONLY the numbered sources below (the student's own notes), "
+        "citing them inline like [1]. If the sources do not cover this "
+        "question at all, set 'from_notes' to exactly \"Your notes don't "
+        "cover this.\" and nothing else. For 'general_knowledge': you may "
+        "go beyond the notes with your own knowledge of the subject -- "
+        "extra depth, context, or whatever the notes don't cover. Leave it "
+        "as an empty string only if you truly have nothing useful to add "
+        "beyond 'from_notes'. Keep the two parts separate -- never put "
+        f"general knowledge into 'from_notes'. {MATH_PLAIN_TEXT_RULE}"
+    )
+
+
+TUTOR_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "from_notes": {"type": "string"},
+        "general_knowledge": {"type": "string"}
+    },
+    "required": ["from_notes", "general_knowledge"]
+}
 
 SUMMARIZE_SCHEMA = {
     "type": "object",
@@ -1080,15 +1146,31 @@ class RegisterRequest(BaseModel):
 
 
 class SummarizeRequest(BaseModel):
-    text: str
+    # Fix round 3, item 3: exactly one of these two modes is used --
+    # `book_id` set means "Choose a document" (optional `topic` narrows it
+    # to a unit/topic within that document); otherwise `text` is the
+    # "Paste text" mode. Both optional at the model level so a request
+    # missing one isn't rejected before the handler can give the right
+    # "please paste/choose" message instead of a generic 422.
+    text: str | None = None
+    book_id: int | None = None
+    topic: str | None = None
 
 
 class FlashcardsRequest(BaseModel):
     topic: str
 
 
+# Fix round 3, item 2: Beginner / Intermediate / Advanced, default
+# Intermediate -- changes the depth and wording of the Tutor's
+# explanation (see _tutor_system_instruction). Nothing else reads this.
+TUTOR_LEVELS = ["beginner", "intermediate", "advanced"]
+DEFAULT_TUTOR_LEVEL = "intermediate"
+
+
 class TutorRequest(BaseModel):
     question: str
+    level: str = DEFAULT_TUTOR_LEVEL
 
 
 # -----------------------------
@@ -1911,6 +1993,12 @@ def semantic_search(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    query = query.strip()
+    if not query:
+        # Fix round 3, item 5: empty/space-only input is rejected with a
+        # friendly message before any retrieval -- matching every other
+        # AI tool, instead of silently returning nothing.
+        raise HTTPException(status_code=422, detail="Please enter a search term.")
 
     if not user_has_documents(db, current_user.id):
 
@@ -1969,34 +2057,104 @@ def _retrieve_relevant_pages(db: Session, user_id: int, text: str, top_k: int):
     return pages, is_relevant
 
 
+def _retrieve_sources_for_question(db: Session, user_id: int, question: str):
+    """
+    Shared by /chat and /tools/tutor: splits a long, multi-part question
+    (split_question_parts, Fix round 2, item 7) and retrieves each part
+    separately, merging the unique chunks found -- rather than embedding
+    the whole question as a single query, which tends to match nothing
+    well enough to pass the relevance check even when every individual
+    part has an answer in the notes.
+
+    Returns (top_pages, parts, uncovered_parts, retrieval_seconds).
+    top_pages is empty when nothing relevant was found for ANY part.
+    Callers decide what that means for them: /chat refuses outright
+    (_answer_question); /tools/tutor instead says so and still offers a
+    general-knowledge answer (_answer_tutor_question, Fix round 3, item 1).
+
+    Timed (Fix round 2, item 13) -- never logs the question/part text
+    itself, or anything from the documents -- just how long retrieval
+    took and how many parts/sources were involved, so a slow answer can
+    be explained from Render logs afterward instead of guessed at.
+    """
+    parts = split_question_parts(question)
+    uncovered_parts = []
+    retrieval_started_at = time.perf_counter()
+
+    if len(parts) == 1:
+        top_pages, is_relevant = _retrieve_relevant_pages(db, user_id, question, top_k=5)
+        if not is_relevant:
+            top_pages = []
+    else:
+        merged_pages = []
+        merged_ids = set()
+        for part in parts:
+            part_pages, part_is_relevant = _retrieve_relevant_pages(db, user_id, part, top_k=_PART_TOP_K)
+            if not part_is_relevant:
+                uncovered_parts.append(part)
+                continue
+            for score, page in part_pages:
+                if page.id in merged_ids:
+                    continue
+                merged_pages.append((score, page))
+                merged_ids.add(page.id)
+
+        merged_pages.sort(key=lambda scored_page: scored_page[0], reverse=True)
+        top_pages = merged_pages[:_MAX_MERGED_SOURCES]
+
+    retrieval_seconds = time.perf_counter() - retrieval_started_at
+    return top_pages, parts, uncovered_parts, retrieval_seconds
+
+
+def _build_numbered_sources(db: Session, top_pages):
+    """
+    Shared by /chat and /tools/tutor: turns retrieved (score, Page) pairs
+    into the `sources` array the frontend renders and the "[1] (book,
+    page N): ..." numbered list the LLM is given to cite from -- same
+    top_pages, so citation numbers line up with their position in
+    `sources`.
+    """
+    sources = []
+    numbered_sources = []
+
+    # Defensive: a page can be None here if it was deleted after being
+    # retrieved -- dropped rather than crashing the whole request.
+    top_pages = [(score, page) for score, page in top_pages if page is not None]
+
+    for idx, (score, page) in enumerate(top_pages, start=1):
+        book = db.query(Book).filter(Book.id == page.book_id).first()
+        if not book:
+            continue
+
+        sources.append({
+            "book_name": book.name,
+            "page_number": page.page_number,
+            "chunk_number": page.chunk_number,
+            "similarity_score": round(float(score), 4),
+            "page_id": page.id,
+            "content": page.content
+        })
+        numbered_sources.append(f"[{idx}] ({book.name}, page {page.page_number}): {page.content}")
+
+    return sources, numbered_sources
+
+
 def _answer_question(question: str, current_user: User, db: Session, conversation_id: int = None):
     """
-    Shared retrieval + grounded-answer pipeline used by both /chat and
-    /tools/tutor — same behaviour, just two different entry points for the
-    same plain question (no prefix is added anywhere in this pipeline).
+    Shared retrieval + grounded-answer pipeline for /chat -- strictly
+    notes-only (Fix round 3, item 1: /tools/tutor no longer shares this
+    function; see _answer_tutor_question for its own, more generous
+    pipeline).
 
-    `conversation_id` (Phase 6C, /chat only -- /tools/tutor never passes
-    one) saves this question and the answer into that conversation --
-    including on every "couldn't answer" bounce-back (no documents, still
-    processing, or not enough information), not just a real answer, so a
-    conversation's history always shows what the user actually saw. Every
-    outcome also logs a "query" ActivityEvent with meta {"answered": bool,
-    "reason": ...} on a bounce-back, {"answered": true} on a real answer --
-    Fix item 5 -- so /analytics/summary's queries/queries_answered totals
-    agree with what was actually shown, and never on a 503 (no outcome to
-    record yet).
-
-    Fix round 2, item 7: a long question covering several distinct topics
-    (split_question_parts) is retrieved separately FOR EACH PART, and the
-    unique chunks found are merged into one prompt -- rather than
-    embedding the whole question as a single query, which tends to match
-    nothing well enough to pass the relevance check even when every
-    individual part has an answer in the notes. Still only one extra LLM
-    call total (never one per part): the merge happens before generate()
-    is called, not after. Refuses completely only when NOT ONE part found
-    anything relevant; otherwise the model is told which parts (if any)
-    had no sources, and asked to say so plainly instead of refusing
-    everything.
+    `conversation_id` (Phase 6C) saves this question and the answer into
+    that conversation -- including on every "couldn't answer" bounce-back
+    (no documents, still processing, or not enough information), not just
+    a real answer, so a conversation's history always shows what the user
+    actually saw. Every outcome also logs a "query" ActivityEvent with
+    meta {"answered": bool, "reason": ...} on a bounce-back, {"answered":
+    true} on a real answer -- Fix item 5 -- so /analytics/summary's
+    queries/queries_answered totals agree with what was actually shown,
+    and never on a 503 (no outcome to record yet).
     """
     pending_message = _pending_documents_message_or_none(db, current_user.id)
     if not user_has_documents(db, current_user.id):
@@ -2012,37 +2170,9 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
         _save_chat_turn(db, current_user.id, conversation_id, question, answer, [])
         return {"message": answer}
 
-    parts = split_question_parts(question)
-    uncovered_parts = []
-
-    # Fix round 2, item 13: timed (never logs the question/part text
-    # itself, or anything from the documents -- just how long each step
-    # took and how many parts/sources were involved) so a slow chat answer
-    # can be explained from Render logs afterward instead of guessed at.
-    retrieval_started_at = time.perf_counter()
-
-    if len(parts) == 1:
-        top_pages, is_relevant = _retrieve_relevant_pages(db, current_user.id, question, top_k=5)
-        if not is_relevant:
-            top_pages = []
-    else:
-        merged_pages = []
-        merged_ids = set()
-        for part in parts:
-            part_pages, part_is_relevant = _retrieve_relevant_pages(db, current_user.id, part, top_k=_PART_TOP_K)
-            if not part_is_relevant:
-                uncovered_parts.append(part)
-                continue
-            for score, page in part_pages:
-                if page.id in merged_ids:
-                    continue
-                merged_pages.append((score, page))
-                merged_ids.add(page.id)
-
-        merged_pages.sort(key=lambda scored_page: scored_page[0], reverse=True)
-        top_pages = merged_pages[:_MAX_MERGED_SOURCES]
-
-    retrieval_seconds = time.perf_counter() - retrieval_started_at
+    top_pages, parts, uncovered_parts, retrieval_seconds = _retrieve_sources_for_question(
+        db, current_user.id, question
+    )
 
     if not top_pages:
         # Nothing relevant for the question (single-part) or for ANY of
@@ -2059,30 +2189,7 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
             "sources": []
         }
 
-    # Build the numbered source list ([1], [2], ...) the LLM cites inline,
-    # and the sources array the frontend renders -- same top_pages, so the
-    # citation numbers line up with their position in "sources".
-    sources = []
-    numbered_sources = []
-
-    for idx, (score, page) in enumerate(top_pages, start=1):
-
-        book = db.query(Book).filter(
-            Book.id == page.book_id
-        ).first()
-
-        if not book:
-            continue
-
-        sources.append({
-            "book_name": book.name,
-            "page_number": page.page_number,
-            "chunk_number": page.chunk_number,
-            "similarity_score": round(float(score), 4),
-            "page_id": page.id,
-            "content": page.content
-        })
-        numbered_sources.append(f"[{idx}] ({book.name}, page {page.page_number}): {page.content}")
+    sources, numbered_sources = _build_numbered_sources(db, top_pages)
 
     if len(parts) == 1:
         prompt = f"Question: {question}\n\nSources:\n" + "\n\n".join(numbered_sources)
@@ -2151,6 +2258,76 @@ def _answer_question(question: str, current_user: User, db: Session, conversatio
     }
 
 
+def _answer_tutor_question(question: str, level: str, current_user: User, db: Session):
+    """
+    Fix round 3, item 1 (option B, decided by the teacher): /tools/tutor's
+    own pipeline -- /chat, /tools/quiz and question papers are untouched
+    and stay strict, notes-only (see _answer_question/CHAT_SYSTEM_INSTRUCTION
+    and QUIZ_PROMPT_RULES, neither of which this function touches or calls).
+
+    Reuses /chat's retrieval (_retrieve_sources_for_question, including
+    the multi-part split and neighbor-chunk expansion), but never refuses
+    outright just because the notes don't cover the question: the model
+    is asked for two separate parts every time (TUTOR_RESPONSE_SCHEMA) --
+    "from_notes" (grounded in the sources, or "Your notes don't cover
+    this." if there's nothing relevant) and an optional, separately
+    labelled "general_knowledge" addition. Still only one AI call either
+    way -- same cost as /chat's single generate() call.
+    """
+    pending_message = _pending_documents_message_or_none(db, current_user.id)
+    if not user_has_documents(db, current_user.id):
+        return {"message": pending_message or "No documents uploaded"}
+
+    if needs_reembedding(db, current_user.id):
+        return {"message": "Your documents need re-indexing"}
+
+    top_pages, _parts, _uncovered_parts, _retrieval_seconds = _retrieve_sources_for_question(
+        db, current_user.id, question
+    )
+    sources, numbered_sources = _build_numbered_sources(db, top_pages)
+
+    if numbered_sources:
+        prompt = f"Question: {question}\n\nSources:\n" + "\n\n".join(numbered_sources)
+    else:
+        prompt = f"Question: {question}\n\n(No matching sources were found in the student's notes.)"
+
+    try:
+        result = llm.generate_json(
+            prompt, schema=TUTOR_RESPONSE_SCHEMA, system=_tutor_system_instruction(level)
+        )
+    except NotImplementedError:
+        # LLM_PROVIDER=local has no structured JSON output -- fall back to
+        # the plain strict pipeline rather than fail outright.
+        return _answer_question(question, current_user, db)
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+    raw_from_notes = ((result.get("from_notes") if isinstance(result, dict) else None) or "").strip()
+    from_notes = raw_from_notes or "Your notes don't cover this."
+    general_knowledge = result.get("general_knowledge") if isinstance(result, dict) else None
+    general_knowledge = (general_knowledge or "").strip()
+
+    # Fix round 2, item 9's same reasoning applied here: only show sources
+    # the "from_notes" part actually cites. Nothing to show when there
+    # were no sources to begin with, or the model left "from_notes" empty
+    # (i.e. it's the "Your notes don't cover this." fallback) -- showing
+    # sources next to that would be incoherent.
+    if numbered_sources and raw_from_notes:
+        cited_indices = {int(n) for n in _CITATION_PATTERN.findall(from_notes)}
+        if cited_indices:
+            sources = [source for idx, source in enumerate(sources, start=1) if idx in cited_indices]
+    else:
+        sources = []
+
+    _log_activity(db, current_user.id, "query", meta={"answered": True})
+    return {
+        "question": question,
+        "answer": from_notes,
+        "general_knowledge": general_knowledge or None,
+        "sources": sources
+    }
+
+
 class ChatRequest(BaseModel):
     question: str
     conversation_id: int | None = None
@@ -2196,6 +2373,134 @@ def chat_with_pdf(
 # -----------------------------
 # AI TOOLS: SUMMARIZER, FLASHCARDS, TUTOR
 # -----------------------------
+def _summarize_bullets(text: str) -> list:
+    """
+    One already-small-enough piece of text -> a 5-to-10-bullet summary,
+    via Gemini JSON mode, with the existing local-model fallback. Shared
+    by the "paste text" path and each map step of a document's
+    map-reduce summarization (Fix round 3, item 3).
+    """
+    try:
+        result = llm.generate_json(
+            "Summarize the following text in 5 to 10 clear, concise bullet points. "
+            "Use ONLY information from this text -- do not add anything that isn't "
+            f"there. {MATH_PLAIN_TEXT_RULE}\n\nText:\n{text}",
+            schema=SUMMARIZE_SCHEMA
+        )
+        return result.get("bullets", []) if isinstance(result, dict) else []
+    except NotImplementedError:
+        # LLM_PROVIDER=local has no structured JSON output -- fall back to
+        # the local Flan-T5 bullet-by-bullet summarizer.
+        return summarize_text_in_bullets(text)
+
+
+def _summarize_in_parts(full_text: str) -> list:
+    """
+    Splits `full_text` into ~DOCUMENT_SUMMARIZE_PART_CHARS-sized parts,
+    never mid-word, for map-reduce summarization of a long document (Fix
+    round 3, item 3). A short document that already fits in one part
+    returns a single-element list, so the caller makes exactly one AI
+    call instead of an unnecessary map-then-combine round trip.
+    """
+    words = full_text.split()
+    parts = []
+    current_words = []
+    current_len = 0
+    for word in words:
+        current_words.append(word)
+        current_len += len(word) + 1
+        if current_len >= DOCUMENT_SUMMARIZE_PART_CHARS:
+            parts.append(" ".join(current_words))
+            current_words = []
+            current_len = 0
+    if current_words:
+        parts.append(" ".join(current_words))
+    return parts or [full_text]
+
+
+def _summarize_document_text(full_text: str) -> tuple:
+    """
+    Map-reduce summary of a whole document's worth of text (Fix round 3,
+    item 3). A document short enough to fit in one part costs exactly one
+    AI call (same as pasting text directly); a longer one costs
+    len(parts) "map" calls plus exactly one final "reduce" call that
+    merges every part's bullets into one combined summary -- never one
+    call per bullet, and never a single oversized prompt. Returns
+    (bullets, parts_used) so the caller can tell the student how it was
+    summarized.
+    """
+    parts = _summarize_in_parts(full_text)
+    if len(parts) == 1:
+        return _summarize_bullets(parts[0]), 1
+
+    partial_bullets = []
+    for part in parts:
+        partial_bullets.extend(_summarize_bullets(part))
+
+    if not partial_bullets:
+        return [], len(parts)
+
+    combined_input = "\n".join(f"- {b}" for b in partial_bullets)
+    try:
+        result = llm.generate_json(
+            "The bullet points below were each summarized from a different "
+            "part of the same document, in order. Merge them into ONE "
+            "combined summary of 5 to 10 clear, concise bullet points -- "
+            "remove duplicates, keep the most important points, and "
+            f"preserve their meaning. Do not add anything new. {MATH_PLAIN_TEXT_RULE}"
+            f"\n\nPart summaries:\n{combined_input}",
+            schema=SUMMARIZE_SCHEMA
+        )
+        bullets = result.get("bullets", []) if isinstance(result, dict) else []
+    except NotImplementedError:
+        bullets = partial_bullets[:10]
+
+    return bullets, len(parts)
+
+
+def _summarize_document(book_id: int, topic: str | None, current_user: User, db: Session):
+    """
+    Fix round 3, item 3: "Choose a document" mode -- summarizes one of
+    the user's own Ready documents (optionally narrowed to a topic/unit
+    within it) instead of pasted text.
+    """
+    book = _get_owned_book_or_404(db, book_id, current_user.id)
+    if book.status != "ready":
+        raise HTTPException(status_code=400, detail="This document isn't ready yet.")
+
+    pages = db.query(Page).filter(Page.book_id == book_id).order_by(Page.chunk_number).all()
+    if not pages:
+        raise HTTPException(status_code=422, detail="This document has no indexed content to summarize.")
+
+    if topic:
+        query_vector = embeddings.embed_query(topic)
+        active_model = embeddings.active_model_name()
+        scored = []
+        for page in pages:
+            if page.embedding_model != active_model or not page.embedding:
+                continue
+            try:
+                vector = np.array(json.loads(page.embedding))
+            except (TypeError, ValueError):
+                continue
+            scored.append((float(vector @ query_vector), page))
+        scored.sort(key=lambda scored_page: scored_page[0], reverse=True)
+        selected_pages = [page for _, page in scored[:DOCUMENT_SUMMARIZE_TOPIC_TOP_K]] or pages
+        selected_pages.sort(key=lambda page: page.chunk_number)
+    else:
+        selected_pages = pages
+
+    full_text = "\n\n".join(page.content for page in selected_pages)
+
+    try:
+        bullets, parts_used = _summarize_document_text(full_text)
+    except llm.LLMUnavailableError:
+        raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
+
+    _log_activity(db, current_user.id, "tool", meta={"tool": "summarize"})
+    return {"bullets": bullets, "parts": parts_used}
+
+
 @app.post("/tools/summarize")
 @limiter.limit("10/minute", key_func=_user_rate_limit_key)
 def summarize_notes(
@@ -2204,10 +2509,19 @@ def summarize_notes(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    text = payload.text.strip()
+    if payload.book_id is not None:
+        topic = (payload.topic or "").strip() or None
+        return _summarize_document(payload.book_id, topic, current_user, db)
+
+    text = (payload.text or "").strip()
 
     if not text:
-        raise HTTPException(status_code=400, detail="Please provide some text to summarize.")
+        raise HTTPException(status_code=422, detail="Please paste some text first.")
+
+    # Fix round 3, item 4: too short to meaningfully summarize -- rejected
+    # before any AI call, not after a wasted (and often useless) one.
+    if len(text.split()) < MIN_SUMMARIZE_WORDS:
+        raise HTTPException(status_code=422, detail="Please paste at least a paragraph to summarize.")
 
     if len(text) > MAX_SUMMARIZE_CHARS:
         raise HTTPException(
@@ -2216,17 +2530,7 @@ def summarize_notes(
         )
 
     try:
-        result = llm.generate_json(
-            "Summarize the following text in 5 to 10 clear, concise bullet points. "
-            "Use ONLY information from this text -- do not add anything that isn't "
-            f"there. {MATH_PLAIN_TEXT_RULE}\n\nText:\n{text}",
-            schema=SUMMARIZE_SCHEMA
-        )
-        bullets = result.get("bullets", []) if isinstance(result, dict) else []
-    except NotImplementedError:
-        # LLM_PROVIDER=local has no structured JSON output -- fall back to
-        # the local Flan-T5 bullet-by-bullet summarizer.
-        bullets = summarize_text_in_bullets(text)
+        bullets = _summarize_bullets(text)
     except llm.LLMUnavailableError:
         raise HTTPException(status_code=503, detail=AI_BUSY_DETAIL)
 
@@ -2245,7 +2549,7 @@ def generate_flashcards(
     topic = payload.topic.strip()
 
     if not topic:
-        raise HTTPException(status_code=400, detail="Please provide a topic.")
+        raise HTTPException(status_code=422, detail="Please provide a topic.")
 
     if not user_has_documents(db, current_user.id):
         return {"cards": [], "message": _pending_documents_message_or_none(db, current_user.id) or "No documents uploaded yet."}
@@ -2346,7 +2650,18 @@ def ai_tutor(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    return _answer_question(payload.question, current_user, db)
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="Please enter a question.")
+
+    level = (payload.level or DEFAULT_TUTOR_LEVEL).strip().lower()
+    if level not in TUTOR_LEVELS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown level '{payload.level}'. Use one of: {', '.join(TUTOR_LEVELS)}."
+        )
+
+    return _answer_tutor_question(question, level, current_user, db)
 
 
 def _validate_quiz_questions(

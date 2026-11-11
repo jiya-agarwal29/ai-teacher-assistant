@@ -30,6 +30,12 @@ __pycache__/
 # source code, and may contain users' own study materials)
 backend/uploads/
 
+# Test-run output -- recreated by the test suite itself every time it
+# runs (backend/tests/test_api.py's TEST_UPLOAD_DIR / on-disk sqlite
+# fallback db), never source code and never meant to be committed.
+backend/tests/test_uploads/
+backend/tests/*.db
+
 # Zip files
 *.zip
 

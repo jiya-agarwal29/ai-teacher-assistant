@@ -414,6 +414,26 @@ def test_upload_processing_fails_when_embedding_service_stays_rate_limited(clien
 
 BEES_CONTENT = b"Bees pollinate flowering plants and are essential for many food crops around the world."
 
+# Fix round 3, item 4: /tools/summarize now rejects pasted text under
+# MIN_SUMMARIZE_WORDS (40) words before ever calling the AI -- these two
+# paragraphs are deliberately long enough to clear that floor, for tests
+# that are about something else (prompt wording, bullet pass-through,
+# event logging) and don't want to trip over it.
+_LONG_ENOUGH_SUMMARIZE_TEXT = (
+    "Photosynthesis is the process by which green plants and some other "
+    "organisms use sunlight to synthesize nutrients from carbon dioxide "
+    "and water. It occurs in the chloroplasts of plant cells and produces "
+    "oxygen as a byproduct. This process is essential for most life on "
+    "Earth because it forms the base of almost every food chain."
+)
+_LONG_ENOUGH_SUMMARIZE_TEXT_2 = (
+    "Cellular respiration is the process by which cells break down "
+    "glucose molecules in the presence of oxygen to release energy "
+    "stored in chemical bonds. This energy is captured in the form of "
+    "adenosine triphosphate, which the cell then uses to power nearly "
+    "every biological activity it performs each day."
+)
+
 
 def _upload_bees_doc(client, headers, filename="bees.txt"):
     res = client.post(
@@ -676,7 +696,7 @@ def test_math_plain_text_rule_reaches_summarize_prompt(client, llm_mock_headers,
 
     res = client.post(
         "/tools/summarize", headers=headers,
-        json={"text": "Some pasted paragraph about photosynthesis and plant biology."}
+        json={"text": _LONG_ENOUGH_SUMMARIZE_TEXT}
     )
     assert res.status_code == 200
     assert main.MATH_PLAIN_TEXT_RULE in captured["prompt"]
@@ -762,7 +782,7 @@ def test_summarize_returns_bullets(client, llm_mock_headers, monkeypatch):
     res = client.post(
         "/tools/summarize",
         headers=headers,
-        json={"text": "Some pasted paragraph about photosynthesis and plant biology."}
+        json={"text": _LONG_ENOUGH_SUMMARIZE_TEXT}
     )
     assert res.status_code == 200
     assert res.json()["bullets"] == ["Point one.", "Point two.", "Point three."]
@@ -820,6 +840,481 @@ def test_semantic_search_returns_503_when_query_embedding_stays_rate_limited(cli
     res = client.get("/semantic-search", headers=headers, params={"query": "bees"})
     assert res.status_code == 503
     assert res.json()["detail"] == "AI service is busy. Please try again in a minute."
+
+
+# --- Fix round 3, item 5: Summarizer, Flashcards, AI Tutor and Semantic
+# search all reject empty/space-only input with a friendly 422, no AI
+# call -- matching Quiz Builder's existing behaviour. ---
+def test_semantic_search_rejects_empty_query(client, llm_mock_headers):
+    res = client.get("/semantic-search", headers=llm_mock_headers, params={"query": ""})
+    assert res.status_code == 422
+    assert "search term" in res.json()["detail"].lower()
+
+
+def test_semantic_search_rejects_whitespace_only_query(client, llm_mock_headers):
+    res = client.get("/semantic-search", headers=llm_mock_headers, params={"query": "   "})
+    assert res.status_code == 422
+
+
+def test_flashcards_rejects_whitespace_only_topic(client, llm_mock_headers):
+    res = client.post("/tools/flashcards", headers=llm_mock_headers, json={"topic": "   "})
+    assert res.status_code == 422
+    assert "topic" in res.json()["detail"].lower()
+
+
+def test_tutor_rejects_empty_question(client, llm_mock_headers):
+    res = client.post("/tools/tutor", headers=llm_mock_headers, json={"question": ""})
+    assert res.status_code == 422
+    assert "question" in res.json()["detail"].lower()
+
+
+def test_tutor_rejects_whitespace_only_question(client, llm_mock_headers):
+    res = client.post("/tools/tutor", headers=llm_mock_headers, json={"question": "   "})
+    assert res.status_code == 422
+
+
+def test_tutor_rejects_unknown_level(client, llm_mock_headers):
+    res = client.post(
+        "/tools/tutor", headers=llm_mock_headers,
+        json={"question": "Explain RSA.", "level": "expert"}
+    )
+    assert res.status_code == 422
+    assert "level" in res.json()["detail"].lower()
+
+
+# --- Fix round 3, item 4: pasted text under MIN_SUMMARIZE_WORDS is
+# rejected before any AI call. ---
+def test_summarize_rejects_empty_text(client, llm_mock_headers):
+    res = client.post("/tools/summarize", headers=llm_mock_headers, json={"text": ""})
+    assert res.status_code == 422
+    assert res.json()["detail"] == "Please paste some text first."
+
+
+def test_summarize_rejects_whitespace_only_text(client, llm_mock_headers):
+    res = client.post("/tools/summarize", headers=llm_mock_headers, json={"text": "    "})
+    assert res.status_code == 422
+    assert res.json()["detail"] == "Please paste some text first."
+
+
+def test_summarize_rejects_text_under_the_word_floor(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    def _forbid_generate_json(*a, **kw):
+        raise AssertionError("the AI must not be called for text under the word floor")
+    monkeypatch.setattr(llm_module, "generate_json", _forbid_generate_json)
+
+    res = client.post(
+        "/tools/summarize", headers=llm_mock_headers,
+        json={"text": "Too short to summarize meaningfully."}
+    )
+    assert res.status_code == 422
+    assert res.json()["detail"] == "Please paste at least a paragraph to summarize."
+
+
+def test_summarize_accepts_text_right_at_the_word_floor(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    text = " ".join(["word"] * main.MIN_SUMMARIZE_WORDS)
+    monkeypatch.setattr(llm_module, "generate_json", lambda prompt, schema, system=None: {"bullets": ["A point."]})
+
+    res = client.post("/tools/summarize", headers=llm_mock_headers, json={"text": text})
+    assert res.status_code == 200, res.text
+
+
+# --- Fix round 3, item 3: Summarizer "Choose a document" mode. ---
+def test_summarize_document_mode_rejects_someone_elses_book(client, llm_mock_headers):
+    headers = llm_mock_headers
+    _, other_headers = _fresh_phase6c_user(client)
+    other_book_id = _upload_bees_doc(client, other_headers, "other_user_summarize_doc.txt")
+
+    res = client.post("/tools/summarize", headers=headers, json={"book_id": other_book_id})
+    assert res.status_code == 404
+
+    client.delete(f"/books/{other_book_id}", headers=other_headers)
+
+
+def test_summarize_document_mode_rejects_a_book_that_isnt_ready(client, llm_mock_headers):
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+
+    db = TestSessionLocal()
+    try:
+        book = main.Book(name="not_ready_for_summary.txt", user_id=user_id, status="needs_review")
+        db.add(book)
+        db.commit()
+        book_id = book.id
+    finally:
+        db.close()
+
+    res = client.post("/tools/summarize", headers=headers, json={"book_id": book_id})
+    assert res.status_code == 400
+
+    db = TestSessionLocal()
+    try:
+        db.query(main.Book).filter(main.Book.id == book_id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_summarize_document_mode_short_document_uses_exactly_one_ai_call(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+
+    db = TestSessionLocal()
+    try:
+        book = main.Book(name="short_summary_doc.txt", user_id=user_id, status="ready")
+        db.add(book)
+        db.commit()
+        db.add(Page(book_id=book.id, page_number=1, chunk_number=1, content="A short document about bees."))
+        db.commit()
+        book_id = book.id
+    finally:
+        db.close()
+
+    call_count = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        call_count["n"] += 1
+        return {"bullets": ["Bees are pollinators."]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post("/tools/summarize", headers=headers, json={"book_id": book_id})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["parts"] == 1
+    assert call_count["n"] == 1
+    assert data["bullets"] == ["Bees are pollinators."]
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_summarize_document_mode_long_document_uses_map_reduce_with_few_ai_calls(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+
+    # Comfortably over DOCUMENT_SUMMARIZE_PART_CHARS (12000) so this is
+    # split into more than one part.
+    chunk_text = ("lorem ipsum dolor sit amet " * 50).strip()
+
+    db = TestSessionLocal()
+    try:
+        book = main.Book(name="long_summary_doc.txt", user_id=user_id, status="ready")
+        db.add(book)
+        db.commit()
+        for i in range(10):
+            db.add(Page(book_id=book.id, page_number=1, chunk_number=i + 1, content=chunk_text))
+        db.commit()
+        book_id = book.id
+    finally:
+        db.close()
+
+    call_count = {"n": 0}
+
+    def fake_generate_json(prompt, schema, system=None):
+        call_count["n"] += 1
+        return {"bullets": [f"Summary bullet {call_count['n']}."]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post("/tools/summarize", headers=headers, json={"book_id": book_id})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["parts"] > 1
+    # One AI call per part ("map"), plus exactly one final call that
+    # combines them ("reduce") -- never one call per bullet, and never
+    # unbounded as the document grows.
+    assert call_count["n"] == data["parts"] + 1
+    assert len(data["bullets"]) > 0
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_summarize_document_mode_with_topic_narrows_to_relevant_chunks(client, llm_mock_headers, monkeypatch):
+    import numpy as np
+    import embeddings
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    user_id = _user_id("llm_mock_test_user")
+    active_model = embeddings.active_model_name()
+
+    db = TestSessionLocal()
+    try:
+        book = main.Book(name="mixed_topics_doc.txt", user_id=user_id, status="ready")
+        db.add(book)
+        db.commit()
+        num_fillers = main.DOCUMENT_SUMMARIZE_TOPIC_TOP_K + 5
+        for i in range(num_fillers):
+            db.add(Page(
+                book_id=book.id, page_number=1, chunk_number=i + 1,
+                content=f"Irrelevant filler chunk number {i}.",
+                embedding=json.dumps([0.0, 1.0]), embedding_model=active_model
+            ))
+        db.add(Page(
+            book_id=book.id, page_number=2, chunk_number=num_fillers + 1,
+            content="The only chunk about databases and relational tables.",
+            embedding=json.dumps([1.0, 0.0]), embedding_model=active_model
+        ))
+        db.commit()
+        book_id = book.id
+    finally:
+        db.close()
+
+    monkeypatch.setattr(embeddings, "embed_query", lambda text: np.array([1.0, 0.0]))
+
+    captured = {}
+
+    def fake_generate_json(prompt, schema, system=None):
+        captured["prompt"] = prompt
+        return {"bullets": ["A summary point."]}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post("/tools/summarize", headers=headers, json={"book_id": book_id, "topic": "databases"})
+    assert res.status_code == 200, res.text
+
+    assert "databases and relational tables" in captured["prompt"]
+    filler_mentions = captured["prompt"].count("Irrelevant filler chunk")
+    assert filler_mentions < num_fillers  # the topic ranking excluded some fillers
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+# --- Fix round 3, item 1 (option B) + item 2 (level selector): the Tutor
+# answers from notes first, but adds a separately-labelled general
+# knowledge section instead of flatly refusing. ---
+def test_tutor_returns_from_notes_and_general_knowledge_as_separate_fields(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "tutor_two_part_bees.txt")
+
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {
+            "from_notes": "Bees pollinate plants [1].",
+            "general_knowledge": "Bees also communicate via a 'waggle dance'."
+        }
+    )
+
+    res = client.post("/tools/tutor", headers=headers, json={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["answer"] == "Bees pollinate plants [1]."
+    assert data["general_knowledge"] == "Bees also communicate via a 'waggle dance'."
+    assert len(data["sources"]) == 1
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_tutor_says_notes_dont_cover_this_when_nothing_relevant_found(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "tutor_rsa_bees.txt")
+
+    monkeypatch.setattr(main, "retrieve", lambda *a, **kw: [])
+
+    captured = {}
+
+    def fake_generate_json(prompt, schema, system=None):
+        captured["prompt"] = prompt
+        # No sources were given -- the model has nothing to ground
+        # "from_notes" in, so it leaves it empty and explains generally.
+        return {
+            "from_notes": "",
+            "general_knowledge": "RSA relies on the difficulty of factoring large primes..."
+        }
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post(
+        "/tools/tutor", headers=headers,
+        json={"question": "Explain RSA at an advanced level with the mathematical steps.", "level": "advanced"}
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["answer"] == "Your notes don't cover this."
+    assert data["general_knowledge"] == "RSA relies on the difficulty of factoring large primes..."
+    assert data["sources"] == []
+    # No sources were ever offered to the model for this question.
+    assert "No matching sources" in captured["prompt"]
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_tutor_defaults_to_intermediate_level(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "tutor_default_level_bees.txt")
+    captured = {}
+
+    def fake_generate_json(prompt, schema, system=None):
+        captured["system"] = system
+        return {"from_notes": "Bees pollinate plants [1].", "general_knowledge": ""}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post("/tools/tutor", headers=headers, json={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    assert captured["system"] == main._tutor_system_instruction("intermediate")
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_tutor_level_changes_the_system_instruction_wording(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "tutor_level_wording_bees.txt")
+    captured = {}
+
+    def fake_generate_json(prompt, schema, system=None):
+        captured["system"] = system
+        return {"from_notes": "Bees pollinate plants [1].", "general_knowledge": ""}
+
+    monkeypatch.setattr(llm_module, "generate_json", fake_generate_json)
+
+    res = client.post("/tools/tutor", headers=headers, json={"question": "What do bees do?", "level": "beginner"})
+    assert res.status_code == 200, res.text
+    assert captured["system"] == main._tutor_system_instruction("beginner")
+    assert captured["system"] != main._tutor_system_instruction("advanced")
+    assert "beginner-friendly" in captured["system"]
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_tutor_only_shows_sources_the_from_notes_part_actually_cites(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    bees_book_id = _upload_bees_doc(client, headers, "tutor_cited_bees.txt")
+    other_res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": (
+            "tutor_unrelated_subject.txt",
+            b"Relational databases use primary and foreign keys for integrity.",
+            "text/plain"
+        )}
+    )
+    assert other_res.status_code == 202
+    other_book_id = other_res.json()["book_id"]
+
+    db = TestSessionLocal()
+    try:
+        bees_page = db.query(Page).filter(Page.book_id == bees_book_id).first()
+        other_page = db.query(Page).filter(Page.book_id == other_book_id).first()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(main, "retrieve", lambda *a, **kw: [(0.9, bees_page), (0.58, other_page)])
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {"from_notes": "Bees pollinate plants [1].", "general_knowledge": ""}
+    )
+
+    res = client.post("/tools/tutor", headers=headers, json={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert len(data["sources"]) == 1
+    assert data["sources"][0]["book_name"] == "tutor_cited_bees.txt"
+
+    client.delete(f"/books/{bees_book_id}", headers=headers)
+    client.delete(f"/books/{other_book_id}", headers=headers)
+
+
+# --- Resume round 3, item 2: a chunk whose Page row was deleted (e.g. by
+# a re-index) between being looked up and being used must never 500 the
+# whole chat/tutor request -- it's just dropped. ---
+def test_chat_does_not_500_when_a_retrieved_page_was_deleted(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_deleted_page_bees.txt")
+
+    db = TestSessionLocal()
+    try:
+        real_page = db.query(Page).filter(Page.book_id == book_id).first()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(main, "retrieve", lambda *a, **kw: [(0.9, real_page), (0.8, None)])
+    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    assert len(res.json()["sources"]) == 1
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_tutor_does_not_500_when_a_retrieved_page_was_deleted(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "tutor_deleted_page_bees.txt")
+
+    db = TestSessionLocal()
+    try:
+        real_page = db.query(Page).filter(Page.book_id == book_id).first()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(main, "retrieve", lambda *a, **kw: [(0.9, real_page), (0.8, None)])
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {"from_notes": "Bees pollinate plants [1].", "general_knowledge": ""}
+    )
+
+    res = client.post("/tools/tutor", headers=headers, json={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    assert len(res.json()["sources"]) == 1
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+# --- Fix round 3, item 1: Chat, quizzes and question papers must stay
+# strict/notes-only -- unaffected by the Tutor's option-B changes. ---
+def test_chat_and_quiz_prompts_are_unchanged_by_the_tutor_changes():
+    assert main.CHAT_SYSTEM_INSTRUCTION == (
+        "You are a helpful teaching assistant. Answer ONLY from the provided sources. "
+        "Cite sources inline like [1]. If the sources do not contain the answer, reply "
+        "exactly: 'The uploaded documents do not contain enough information for this "
+        "question.' Use short headings and bullet points where helpful. Explain simply "
+        f"for students. {main.MATH_PLAIN_TEXT_RULE}"
+    )
+    assert "general knowledge" not in main.CHAT_SYSTEM_INSTRUCTION.lower()
+    assert "general knowledge" not in main.QUIZ_PROMPT_RULES.lower()
+    # The Tutor's own system instruction is a genuinely different prompt --
+    # proves /chat and /tools/tutor no longer share one instruction.
+    assert main._tutor_system_instruction("intermediate") != main.CHAT_SYSTEM_INSTRUCTION
+
+
+def test_chat_still_uses_its_own_unchanged_system_instruction(client, llm_mock_headers, monkeypatch):
+    import llm as llm_module
+
+    headers = llm_mock_headers
+    book_id = _upload_bees_doc(client, headers, "chat_unchanged_prompt_bees.txt")
+    captured = {}
+
+    def fake_generate(prompt, system=None, temperature=0.3, max_tokens=1024):
+        captured["system"] = system
+        return "Bees pollinate plants [1]."
+
+    monkeypatch.setattr(llm_module, "generate", fake_generate)
+
+    res = client.get("/chat", headers=headers, params={"question": "What do bees do?"})
+    assert res.status_code == 200, res.text
+    assert captured["system"] == main.CHAT_SYSTEM_INSTRUCTION
+
+    client.delete(f"/books/{book_id}", headers=headers)
 
 
 WATER_CYCLE_CONTENT = b"""The Water Cycle
@@ -4951,7 +5446,10 @@ def test_tutor_logs_query_event_on_success(client, llm_mock_headers, monkeypatch
     book_id = _upload_bees_doc(client, headers, "analytics_tutor_bees.txt")
     before = _count_events(user_id, "query")
 
-    monkeypatch.setattr(llm_module, "generate", lambda *a, **kw: "Bees pollinate plants [1].")
+    monkeypatch.setattr(
+        llm_module, "generate_json",
+        lambda prompt, schema, system=None: {"from_notes": "Bees pollinate plants [1].", "general_knowledge": ""}
+    )
     res = client.post("/tools/tutor", headers=headers, json={"question": "What do bees do?"})
     assert res.status_code == 200
     assert _count_events(user_id, "query") == before + 1
@@ -5116,14 +5614,14 @@ def test_summarize_logs_tool_event_on_success_not_on_failure(client, llm_mock_he
         llm_module, "generate_json",
         lambda prompt, schema, system=None: {"bullets": ["Point one.", "Point two."]}
     )
-    res = client.post("/tools/summarize", headers=headers, json={"text": "Some text about photosynthesis."})
+    res = client.post("/tools/summarize", headers=headers, json={"text": _LONG_ENOUGH_SUMMARIZE_TEXT})
     assert res.status_code == 200
     assert _count_events(user_id, "tool") == before + 1
 
     def raise_unavailable(*a, **kw):
         raise llm_module.LLMUnavailableError("boom")
     monkeypatch.setattr(llm_module, "generate_json", raise_unavailable)
-    res2 = client.post("/tools/summarize", headers=headers, json={"text": "Some other text here."})
+    res2 = client.post("/tools/summarize", headers=headers, json={"text": _LONG_ENOUGH_SUMMARIZE_TEXT_2})
     assert res2.status_code == 503
     assert _count_events(user_id, "tool") == before + 1  # unchanged on failure
 

@@ -870,13 +870,23 @@ export const api = {
 
   tools: {
     /**
-     * POST /tools/summarize {text} — summarizes pasted text only, no retrieval.
+     * POST /tools/summarize {text} — summarizes pasted text only, no
+     * retrieval. Fix round 3, item 3: pass { bookId, topic? } instead to
+     * summarize one of the user's own Ready documents (optionally
+     * narrowed to a topic/unit within it) -- a long document is
+     * summarized in parts then combined server-side; the response's
+     * `parts` says how many.
      */
-    summarize: (text) => request('/tools/summarize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    }),
+    summarize: (textOrOptions) => {
+      const body = typeof textOrOptions === 'string' || textOrOptions == null
+        ? { text: textOrOptions }
+        : { book_id: textOrOptions.bookId, topic: textOrOptions.topic };
+      return request('/tools/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    },
 
     /**
      * POST /tools/flashcards {topic} — builds cards from the user's own documents.
@@ -888,12 +898,16 @@ export const api = {
     }),
 
     /**
-     * POST /tools/tutor {question} — same grounded pipeline as /chat, plain question.
+     * POST /tools/tutor {question, level?} — level is one of 'beginner'
+     * /'intermediate'/'advanced' (defaults to 'intermediate' server-side
+     * if omitted). Fix round 3, item 1: answers from the user's notes
+     * first (`answer`), and may add a separately-labelled
+     * `general_knowledge` section the notes don't cover.
      */
-    tutor: (question) => request('/tools/tutor', {
+    tutor: (question, level) => request('/tools/tutor', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify(level ? { question, level } : { question }),
     }),
   }
 };

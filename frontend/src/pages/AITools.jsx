@@ -7,6 +7,7 @@ import MessageWithDocsLink from '../components/MessageWithDocsLink';
 import MarkdownRenderer from '../components/MarkdownRenderer';
 import BloomBadge from '../components/BloomBadge';
 import { cleanSnippetText } from '../utils/textCleanup';
+import { validateNonEmpty, validateSummarizerInput } from './aiToolsValidation';
 import {
   Brain, 
   Search, 
@@ -44,6 +45,15 @@ const BLOOM_LEVELS_STORAGE_KEY = 'quiz_bloom_levels';
 const BLOOM_COUNT_STORAGE_KEY = 'quiz_bloom_count';
 const QUESTION_COUNT_OPTIONS = [6, 9, 12];
 
+// Fix round 3, item 2: Beginner / Intermediate / Advanced, default
+// Intermediate -- mirrors the backend's TUTOR_LEVELS/DEFAULT_TUTOR_LEVEL.
+const TUTOR_LEVELS = [
+  { key: 'beginner', label: 'Beginner' },
+  { key: 'intermediate', label: 'Intermediate' },
+  { key: 'advanced', label: 'Advanced' },
+];
+const DEFAULT_TUTOR_LEVEL = 'intermediate';
+
 // sessionStorage key for the in-progress quiz itself (topic, questions,
 // answers, submitted state) -- survives a refresh but not a tab close,
 // and is cleared on logout/"New Quiz"/generating a different quiz.
@@ -77,13 +87,34 @@ export default function AITools() {
     setQuizWarnings([]);
     setSemanticResult(null);
     setSummarizerResult(null);
+    setSummarizerParts(null);
     setFlashcardMessage('');
     setTutorResult('');
+    setTutorGeneralKnowledge(null);
     setError('');
   };
 
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Fix round 3, item 3: powers the Summarizer's "Choose a document"
+  // dropdown -- only the user's own Ready (searchable) documents. A
+  // failure here just means that mode has nothing to offer, not a
+  // page-level error, so it's swallowed rather than surfaced.
+  const [books, setBooks] = useState([]);
+  useEffect(() => {
+    let ignore = false;
+    (async () => {
+      try {
+        const data = await api.books.getAll();
+        if (!ignore) setBooks(data || []);
+      } catch {
+        // Ignored -- see comment above.
+      }
+    })();
+    return () => { ignore = true; };
+  }, []);
+  const readyBooksForSummarizer = books.filter((b) => b.status === 'ready');
 
   // -----------------------------
   // TOOL 1: QUIZ GENERATOR STATE
@@ -369,7 +400,11 @@ export default function AITools() {
 
   const handleSemanticSearch = async (e) => {
     e.preventDefault();
-    if (!semanticQuery.trim()) return;
+    const validationError = validateNonEmpty(semanticQuery, 'Please enter a search term.');
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
 
     setIsLoading(true);
     setSemanticResult(null);
@@ -388,20 +423,38 @@ export default function AITools() {
   // -----------------------------
   // TOOL 3: NOTES SUMMARIZER STATE
   // -----------------------------
+  // Fix round 3, item 3: two modes -- 'paste' (existing behaviour) and
+  // 'document' (choose one of the user's own Ready documents, with an
+  // optional topic/unit to narrow it).
+  const [summarizerMode, setSummarizerMode] = useState('paste');
   const [summarizerText, setSummarizerText] = useState('');
+  const [summarizerBookId, setSummarizerBookId] = useState('');
+  const [summarizerTopic, setSummarizerTopic] = useState('');
   const [summarizerResult, setSummarizerResult] = useState(null);
+  const [summarizerParts, setSummarizerParts] = useState(null);
 
   const handleSummarize = async (e) => {
     e.preventDefault();
-    if (!summarizerText.trim()) return;
+
+    const validationError = validateSummarizerInput({
+      mode: summarizerMode, text: summarizerText, bookId: summarizerBookId
+    });
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
 
     setIsLoading(true);
     setSummarizerResult(null);
+    setSummarizerParts(null);
     setError('');
 
     try {
-      const res = await api.tools.summarize(summarizerText);
+      const res = summarizerMode === 'document'
+        ? await api.tools.summarize({ bookId: summarizerBookId, topic: summarizerTopic })
+        : await api.tools.summarize(summarizerText);
       setSummarizerResult(res.bullets || []);
+      setSummarizerParts(res.parts || null);
     } catch (err) {
       setError(err.message || 'Summarization failed.');
     } finally {
@@ -432,7 +485,11 @@ export default function AITools() {
 
   const handleGenerateFlashcards = async (e) => {
     e.preventDefault();
-    if (!flashcardTopic.trim()) return;
+    const validationError = validateNonEmpty(flashcardTopic, 'Please enter a topic.');
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
 
     setIsLoading(true);
     setError('');
@@ -461,19 +518,29 @@ export default function AITools() {
   // TOOL 5: AI TUTOR STATE
   // -----------------------------
   const [tutorPrompt, setTutorPrompt] = useState('');
+  const [tutorLevel, setTutorLevel] = useState(DEFAULT_TUTOR_LEVEL);
   const [tutorResult, setTutorResult] = useState('');
+  // Fix round 3, item 1 (option B): the Tutor's optional, separately
+  // labelled "beyond your notes" addition -- null when there isn't one.
+  const [tutorGeneralKnowledge, setTutorGeneralKnowledge] = useState(null);
 
   const handleTutorSubmit = async (e) => {
     e.preventDefault();
-    if (!tutorPrompt.trim()) return;
+    const validationError = validateNonEmpty(tutorPrompt, 'Please enter a question.');
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
 
     setIsLoading(true);
     setTutorResult('');
+    setTutorGeneralKnowledge(null);
     setError('');
 
     try {
-      const res = await api.tools.tutor(tutorPrompt);
+      const res = await api.tools.tutor(tutorPrompt, tutorLevel);
       setTutorResult(res.answer || res.message);
+      setTutorGeneralKnowledge(res.general_knowledge || null);
     } catch (err) {
       setError(err.message || 'Tutor session failed.');
     } finally {
@@ -532,6 +599,15 @@ export default function AITools() {
         <div className="flex flex-col items-center justify-center py-20">
           <div className="w-10 h-10 border-4 border-violet-500 border-t-transparent rounded-full animate-spin mb-4"></div>
           <span className="text-xs font-bold text-slate-700 dark:text-slate-300">Generating AI feedback...</span>
+          {/* Fix round 3, item 3's "show progress": a document is
+              summarized server-side in parts then combined, which can
+              take noticeably longer than a short pasted paragraph, so
+              say so instead of a plain silent wait. */}
+          {activeTab === 'summarize' && summarizerMode === 'document' && (
+            <span className="text-[10px] font-semibold text-violet-500 mt-2 text-center max-w-xs">
+              Long documents are processed in parts, then combined -- this may take a little longer…
+            </span>
+          )}
         </div>
       )}
 
@@ -1080,22 +1156,72 @@ export default function AITools() {
               <div className="p-6 rounded-[28px] bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-sm space-y-4">
                 <div>
                   <h3 className="text-xs font-bold text-slate-900 dark:text-white">Bulletpoint Notes Summarizer</h3>
-                  <p className="text-[9px] text-slate-400 dark:text-slate-500 mt-1">Paste study paragraphs, and the AI will condense them into bite-sized summaries.</p>
+                  <p className="text-[9px] text-slate-400 dark:text-slate-500 mt-1">Paste study paragraphs, or pick one of your own documents, and the AI will condense it into a bite-sized summary.</p>
                 </div>
+
+                {/* Fix round 3, item 3: Paste text / Choose a document */}
+                <div className="flex gap-1.5">
+                  {[
+                    { key: 'paste', label: 'Paste text' },
+                    { key: 'document', label: 'Choose a document' },
+                  ].map((mode) => (
+                    <button
+                      key={mode.key}
+                      type="button"
+                      onClick={() => { setSummarizerMode(mode.key); setError(''); }}
+                      className={`px-3 py-1.5 rounded-xl text-[10px] font-bold border transition-all ${
+                        summarizerMode === mode.key
+                          ? 'bg-violet-600 text-white border-violet-600'
+                          : 'border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/30'
+                      }`}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+
                 <form onSubmit={handleSummarize} className="space-y-3">
-                  <textarea 
-                    rows={6}
-                    placeholder="Paste any notes or text here..."
-                    value={summarizerText}
-                    onChange={(e) => setSummarizerText(e.target.value)}
-                    className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all resize-none"
-                  />
+                  {summarizerMode === 'paste' ? (
+                    <textarea
+                      rows={6}
+                      placeholder="Paste any notes or text here..."
+                      value={summarizerText}
+                      onChange={(e) => setSummarizerText(e.target.value)}
+                      className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all resize-none"
+                    />
+                  ) : (
+                    <div className="space-y-3">
+                      {readyBooksForSummarizer.length === 0 ? (
+                        <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                          No ready documents yet -- upload one on the Documents page first.
+                        </p>
+                      ) : (
+                        <select
+                          value={summarizerBookId}
+                          onChange={(e) => setSummarizerBookId(e.target.value)}
+                          className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
+                        >
+                          <option value="">Select a document…</option>
+                          {readyBooksForSummarizer.map((book) => (
+                            <option key={book.id} value={book.id}>{book.name}</option>
+                          ))}
+                        </select>
+                      )}
+                      <input
+                        type="text"
+                        placeholder="Optional: narrow it to a topic or unit (e.g. Chapter 3)"
+                        value={summarizerTopic}
+                        onChange={(e) => setSummarizerTopic(e.target.value)}
+                        className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
+                      />
+                    </div>
+                  )}
                   <div className="flex justify-end">
-                    <button 
+                    <button
                       type="submit"
                       className="px-5 py-3 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-500 text-white font-semibold text-xs tracking-tight hover:scale-[1.01] transition-all"
                     >
-                      Summarize Text
+                      Summarize {summarizerMode === 'document' ? 'Document' : 'Text'}
                     </button>
                   </div>
                 </form>
@@ -1106,6 +1232,11 @@ export default function AITools() {
                   <h4 className="text-xs font-bold text-slate-950 dark:text-white flex items-center gap-2">
                     <Sparkles size={14} className="text-violet-500" />
                     AI Summary Results
+                    {summarizerParts > 1 && (
+                      <span className="text-[9px] font-semibold text-slate-400 dark:text-slate-500 normal-case">
+                        (combined from {summarizerParts} parts)
+                      </span>
+                    )}
                   </h4>
                   {summarizerResult.length > 0 ? (
                     <ul className="p-4 rounded-xl bg-slate-50/50 dark:bg-slate-950/20 text-xs text-slate-600 dark:text-slate-300 leading-relaxed border space-y-2 list-disc pl-8 font-sans">
@@ -1203,15 +1334,39 @@ export default function AITools() {
                   <p className="text-[9px] text-slate-400 dark:text-slate-500 mt-1">Prompt the AI professor to explain complex coding topics, proofs, or math formulas.</p>
                 </div>
                 <form onSubmit={handleTutorSubmit} className="space-y-3">
-                  <input 
+                  <input
                     type="text"
                     placeholder="e.g. Explain photosynthesis in simple terms."
                     value={tutorPrompt}
                     onChange={(e) => setTutorPrompt(e.target.value)}
                     className="w-full px-4 py-3 rounded-2xl text-xs bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500/10 focus:border-violet-500 transition-all"
                   />
+
+                  {/* Fix round 3, item 2: Beginner / Intermediate / Advanced */}
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
+                      Level
+                    </span>
+                    <div className="flex gap-1.5">
+                      {TUTOR_LEVELS.map((lvl) => (
+                        <button
+                          key={lvl.key}
+                          type="button"
+                          onClick={() => setTutorLevel(lvl.key)}
+                          className={`px-3 py-1.5 rounded-lg text-[10px] font-bold border transition-all ${
+                            tutorLevel === lvl.key
+                              ? 'bg-violet-600 text-white border-violet-600'
+                              : 'border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/30'
+                          }`}
+                        >
+                          {lvl.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
                   <div className="flex justify-end">
-                    <button 
+                    <button
                       type="submit"
                       className="px-5 py-3 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-500 text-white font-semibold text-xs tracking-tight hover:scale-[1.01] transition-all"
                     >
@@ -1232,6 +1387,20 @@ export default function AITools() {
                       ? <MessageWithDocsLink message={tutorResult} />
                       : <MarkdownRenderer content={tutorResult} />}
                   </div>
+
+                  {/* Fix round 3, item 1 (option B): visibly separate from
+                      the notes-grounded answer above, so it's never
+                      mistaken for something the notes actually said. */}
+                  {tutorGeneralKnowledge && (
+                    <div className="p-4 rounded-xl bg-amber-500/5 dark:bg-amber-500/10 border border-amber-500/20 space-y-1.5">
+                      <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 uppercase tracking-wider">
+                        Not from your notes
+                      </span>
+                      <div className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed select-all font-sans">
+                        <MarkdownRenderer content={tutorGeneralKnowledge} />
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

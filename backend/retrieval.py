@@ -189,7 +189,13 @@ def expand_with_neighbor_chunks(
     Neighbors are given a score just under the top hit's own score, so
     they still sort below genuine matches. Already-selected pages (by id)
     are never duplicated.
+
+    Defensive: a (score, page) entry with page=None is dropped rather
+    than crashing -- a chunk can end up missing (e.g. its Page row was
+    deleted by a re-index that ran between it being looked up and used)
+    and a chat/tutor answer must never 500 over one bad chunk.
     """
+    top_pages = [(score, page) for score, page in top_pages if page is not None]
     if not top_pages:
         return top_pages
 

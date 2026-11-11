@@ -95,3 +95,22 @@ def test_expand_with_neighbor_chunks_never_duplicates_an_already_selected_page(d
 
 def test_expand_with_neighbor_chunks_returns_empty_list_unchanged(db_session):
     assert retrieval.expand_with_neighbor_chunks(db_session, []) == []
+
+
+# --- Resume round 3, item 2: a deleted/missing chunk must never crash
+# the whole chat/tutor request. ---
+def test_expand_with_neighbor_chunks_skips_a_none_page_instead_of_crashing(db_session):
+    _, book = _make_user_with_book(db_session, "neighbor_none_page_user")
+    real_page = Page(book_id=book.id, page_number=1, chunk_number=1, content="a real chunk")
+    db_session.add(real_page)
+    db_session.commit()
+
+    # (score, None) simulates a chunk whose Page row was deleted (e.g. by
+    # a re-index) between being looked up and being used here.
+    expanded = retrieval.expand_with_neighbor_chunks(db_session, [(0.9, real_page), (0.8, None)])
+
+    assert [page.id for _, page in expanded] == [real_page.id]
+
+
+def test_expand_with_neighbor_chunks_returns_empty_when_only_a_none_page_is_given(db_session):
+    assert retrieval.expand_with_neighbor_chunks(db_session, [(0.9, None)]) == []
