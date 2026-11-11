@@ -453,9 +453,11 @@ export default function DocumentReview() {
         URL.revokeObjectURL(freshUrl); // the user navigated away while this was in flight
       }
 
-      if (window.confirm('Re-read this page now?')) {
-        await performReread(pageNumber);
-      }
+      // No confirmation popup here -- rotating a page always invalidates
+      // its existing transcription (it was read in the old orientation),
+      // so a fresh OCR pass always runs right after, same as the
+      // "Re-read page" button's own call to performReread.
+      await performReread(pageNumber);
     } catch (err) {
       setActionError(err.message || 'Failed to rotate this page.');
     } finally {

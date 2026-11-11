@@ -124,3 +124,45 @@ def test_provider_status_gemini_not_configured(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     status = llm.provider_status()
     assert status["configured"] is False
+
+
+# --- clean_ocr_text (Problem log row 24: OCR reads printed notebook text) ---
+
+def test_clean_ocr_text_drops_bare_page_no_label():
+    text = "SPELLAR\nPage No.:\nSome handwritten line.\n"
+    assert "Page No.:" not in llm.clean_ocr_text(text)
+
+
+def test_clean_ocr_text_drops_bare_date_label():
+    text = "Date:\nSome handwritten line.\n"
+    assert llm.clean_ocr_text(text) == "Some handwritten line.\n"
+
+
+def test_clean_ocr_text_drops_bare_label_variants():
+    for label in ["Page No.", "Page No:", "Page No", "PAGE NO.:", "date", "Date :", "DATE."]:
+        text = f"{label}\nReal content line.\n"
+        cleaned = llm.clean_ocr_text(text)
+        assert label not in cleaned.split("\n"), f"{label!r} should have been dropped, got: {cleaned!r}"
+        assert "Real content line." in cleaned
+
+
+def test_clean_ocr_text_keeps_filled_in_page_no_and_date():
+    text = "Page No.: 5\nDate: 12/03/2024\nSome handwritten line.\n"
+    cleaned = llm.clean_ocr_text(text)
+    assert "Page No.: 5" in cleaned
+    assert "Date: 12/03/2024" in cleaned
+    assert "Some handwritten line." in cleaned
+
+
+def test_clean_ocr_text_keeps_a_handwritten_date_value_only():
+    """A page number/date handwritten right after the label (no colon in between) must survive -- only a truly bare label line is dropped."""
+    text = "Date 12/03/2024\n"
+    assert llm.clean_ocr_text(text) == text
+
+
+def test_clean_ocr_text_handles_empty_string():
+    assert llm.clean_ocr_text("") == ""
+
+
+def test_clean_ocr_text_handles_none():
+    assert llm.clean_ocr_text(None) is None

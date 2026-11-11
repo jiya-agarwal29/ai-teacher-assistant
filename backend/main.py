@@ -3436,7 +3436,7 @@ def _extract_text_for_pattern_import(file_bytes: bytes, filename: str) -> str:
 
     if ext in ALLOWED_IMAGE_EXTENSIONS:
         prepared = ocr.prepare_image_for_ocr(file_bytes)
-        return llm.read_image(prepared, mime_type="image/jpeg")
+        return llm.clean_ocr_text(llm.read_image(prepared, mime_type="image/jpeg"))
 
     if ext == ".pdf":
         pages_data = document_parsers.parse_pdf(io.BytesIO(file_bytes))
@@ -3456,7 +3456,7 @@ def _extract_text_for_pattern_import(file_bytes: bytes, filename: str) -> str:
                 continue
             rendered = ocr.render_pdf_page_to_png(file_bytes, page_index=page["page_number"] - 1)
             prepared = ocr.prepare_image_for_ocr(rendered)
-            texts.append(llm.read_image(prepared, mime_type="image/jpeg"))
+            texts.append(llm.clean_ocr_text(llm.read_image(prepared, mime_type="image/jpeg")))
         return "\n\n".join(texts)
 
     pages_data = document_parsers.parse_document(io.BytesIO(file_bytes), filename)

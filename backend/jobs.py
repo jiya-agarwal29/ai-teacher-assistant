@@ -178,6 +178,7 @@ def _extract_pdf_as_pages(db, book, pdf_bytes: bytes, review_ocr: bool) -> list:
             extracted_text = llm.read_image(
                 prepared, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
             )
+            extracted_text = llm.clean_ocr_text(extracted_text)
             del prepared
 
             records.append({
@@ -219,6 +220,7 @@ def _extract_images_as_pages(db, book, image_keys: list, review_ocr: bool) -> li
         extracted_text = llm.read_image(
             prepared, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
         )
+        extracted_text = llm.clean_ocr_text(extracted_text)
 
         records.append({
             "page_number": index,
@@ -536,9 +538,10 @@ def _reread_page(book_id: int, page_number: int):
 
         try:
             image_bytes = storage.storage.read(page.image_path)
-            page.extracted_text = llm.read_image(
+            extracted_text = llm.read_image(
                 image_bytes, mime_type="image/jpeg", max_wait_seconds=EMBED_JOB_MAX_WAIT_SECONDS
             )
+            page.extracted_text = llm.clean_ocr_text(extracted_text)
             db.commit()
         except Exception:
             # Best-effort: the page already sits at review_status="needs_review"

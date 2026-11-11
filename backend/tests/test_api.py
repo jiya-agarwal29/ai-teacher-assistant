@@ -1082,6 +1082,92 @@ def test_pdf_ocr_processes_pages_one_by_one_not_all_at_once(client, phase3a_head
     client.delete(f"/books/{res.json()['book_id']}", headers=headers)
 
 
+def test_typed_pdf_with_headers_code_and_table_goes_straight_to_ready_no_ocr(client, phase3a_headers, monkeypatch):
+    """
+    Problem log row 1 (SERIOUS): a typed PDF with a real text layer --
+    plus a running header/footer, code blocks, bullets and a table -- was
+    going through Gemini vision OCR and landing on "needs_review" instead
+    of using its own text layer straight to "ready". Builds a REAL PDF
+    with reportlab (not a mocked parse_pdf) so this exercises document_
+    parsers.parse_pdf's actual text extraction, not just the orchestration
+    around it. llm.read_image/ocr.render_pdf_page_to_png are mocked only
+    to fail the test loudly if either is ever called -- neither should be.
+    """
+    import llm as llm_module
+    import ocr as ocr_module
+    from test_document_parsers import _build_typed_notes_pdf, HEADER_TEXT
+
+    headers = phase3a_headers
+
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("OCR should never run for a fully typed PDF")
+
+    monkeypatch.setattr(llm_module, "read_image", fail_if_called)
+    monkeypatch.setattr(ocr_module, "render_pdf_page_to_png", fail_if_called)
+
+    pdf_bytes = _build_typed_notes_pdf()
+    res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": ("typed_notes.pdf", pdf_bytes, "application/pdf")}
+    )
+    assert res.status_code == 202, res.text
+    book_id = res.json()["book_id"]
+    assert res.json()["status"] == "ready", res.text
+
+    status_data = client.get(f"/books/{book_id}/status", headers=headers).json()
+    assert status_data["status"] == "ready"
+    assert status_data["source_type"] == "text"
+
+    doc_pages = _get_document_pages(book_id)
+    assert doc_pages, "expected at least one DocumentPage row"
+    assert all(p["method"] == "text" for p in doc_pages)
+    assert all(p["review_status"] == "auto_approved" for p in doc_pages)
+    assert all(HEADER_TEXT not in (p["extracted_text"] or "") for p in doc_pages)
+
+    pages = _get_pages(book_id)
+    assert any("Concept | Example | Notes" in p.content for p in pages), (
+        "expected the table's pipe-joined rows to be present in the indexed text"
+    )
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
+def test_mixed_pdf_image_only_page_triggers_ocr_for_that_page_only(client, phase3a_headers, monkeypatch):
+    """A typed page plus one page with no text layer at all: only the text-free page should be sent to OCR."""
+    import llm as llm_module
+    import ocr as ocr_module
+    from test_document_parsers import _build_pdf_with_blank_last_page
+
+    headers = phase3a_headers
+
+    ocr_calls = []
+
+    def spy_render(path, page_index, dpi=ocr_module.OCR_RENDER_DPI):
+        ocr_calls.append(page_index)
+        return _make_test_image_bytes()
+
+    monkeypatch.setattr(ocr_module, "render_pdf_page_to_png", spy_render)
+    monkeypatch.setattr(llm_module, "read_image", lambda image_bytes, mime_type, max_wait_seconds=None: "OCR'd text.")
+
+    pdf_bytes = _build_pdf_with_blank_last_page()
+    res = client.post(
+        "/upload-book", headers=headers,
+        files={"file": ("mixed.pdf", pdf_bytes, "application/pdf")}
+    )
+    assert res.status_code == 202, res.text
+    book_id = res.json()["book_id"]
+
+    assert len(ocr_calls) == 1, f"expected OCR for exactly one page, got calls for pages: {ocr_calls}"
+
+    doc_pages = _get_document_pages(book_id)
+    assert len(doc_pages) == 2
+    assert doc_pages[0]["method"] == "text"
+    assert doc_pages[1]["method"] == "ocr"
+    assert doc_pages[1]["extracted_text"] == "OCR'd text."
+
+    client.delete(f"/books/{book_id}", headers=headers)
+
+
 def test_multiple_images_become_one_book_in_order(client, phase3a_headers, monkeypatch):
     import llm as llm_module
 

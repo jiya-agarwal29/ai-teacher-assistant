@@ -16,6 +16,7 @@ building a second one.
 """
 import json
 import logging
+import re
 import time
 
 from env_utils import get_env
@@ -226,8 +227,33 @@ OCR_INSTRUCTION = (
     "Keep the original order, headings, bullet points and line breaks. Write "
     "equations in plain text. Do not summarise, explain or add anything. If a "
     "word is unreadable write [illegible]. If the page has no text, return an "
-    "empty string."
+    "empty string. "
+    "Ignore pre-printed notebook stationery that carries no content of its own: "
+    "brand names or logos printed on the page (e.g. \"SPELLAR\", \"YOUVA\"), ruled "
+    "lines, margins and borders, and printed labels such as \"Page No.\" or "
+    "\"Date\" that were left blank. Always keep every handwritten word, "
+    "including a handwritten date or page number written into one of those "
+    "labels."
 )
+
+# Backstop for OCR_INSTRUCTION above -- Gemini sometimes transcribes a
+# pre-printed "Page No.:" / "Date:" label anyway even though nothing was
+# ever filled in next to it. A label WITH a value after it (a real page
+# number, a handwritten date) is left alone; only a bare, valueless label
+# line is dropped. Kept deterministic (not another AI call) since it's a
+# pure text clean-up, not a judgment call.
+_EMPTY_LABEL_LINE_PATTERN = re.compile(r'^(page\s*no\.?|date)\s*[:.\-]*\s*$', re.IGNORECASE)
+
+
+def clean_ocr_text(text: str) -> str:
+    """Drops lines that are nothing but an unfilled printed notebook label ("Page No.:", "Date:") with no value after it. See _EMPTY_LABEL_LINE_PATTERN."""
+    if not text:
+        return text
+    kept_lines = [
+        line for line in text.split("\n")
+        if not _EMPTY_LABEL_LINE_PATTERN.match(line.strip())
+    ]
+    return "\n".join(kept_lines)
 
 _OCR_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60.0
 _OCR_MAX_WAIT_DEFAULT_SECONDS = 300.0
